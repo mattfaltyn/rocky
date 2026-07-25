@@ -1195,7 +1195,7 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
     let store = rocky_core::state::StateStore::open(state_path)?;
     let mut swept = 0;
     for job in store.list_jobs()? {
-        if matches!(job.state.as_str(), "succeeded" | "failed") {
+        if job.is_terminal() {
             continue;
         }
         let mut done = job;
@@ -1320,14 +1320,27 @@ async fn submit_job(
     // honest status on restart (the durability done-criterion). Persistence is
     // best-effort under lock contention — the in-memory registry is authoritative
     // for the live session, and embedders reconcile via /runs.
-    state.jobs.upsert(record.clone()).await;
+    //
+    // Order matters for cancellation, not just durability. Axum drops this future
+    // if the client disconnects, so every `.await` here is a point the handler can
+    // simply stop at. The job cache never evicts an in-flight record, so caching
+    // `running` before an await that might not return would strand a slot for the
+    // life of the process — and a client that disconnects mid-submission in a loop
+    // would rebuild the unbounded growth the cache bound exists to stop. Persisting
+    // first and caching last leaves no await between the cache write and the spawn
+    // below, so the record is cached only once its terminal owner is guaranteed:
+    // either both happen or neither does. (A durable record briefly visible with no
+    // cache entry is fine — a concurrent read serves it and declines to cache it,
+    // exactly as it would for any in-flight record it did not launch.)
     if let Err(e) = persist_job(state_path.clone(), record.clone()).await {
         tracing::warn!(error = %e, job_id = %job_id,
             "could not persist initial job record; in-memory only until it settles");
     }
 
     // Background task: run the subprocess, then record the terminal state. The
-    // permit is moved in and released when the task ends.
+    // permit is moved in and released when the task ends. Nothing between the
+    // cache write and `tokio::spawn` may await.
+    state.jobs.upsert(record.clone()).await;
     let task_state = state.clone();
     tokio::spawn(async move {
         let _permit = permit;
@@ -1463,8 +1476,25 @@ async fn get_job(
 
     match record {
         Some(record) => {
-            // Warm the cache so subsequent reads are hot.
-            state.jobs.upsert(record.clone()).await;
+            // Warm the cache so subsequent reads are hot — but only for a
+            // finished record.
+            //
+            // Reaching here with a record that still reads as in flight means it
+            // is not one this process is running: every job launched here is
+            // cached from submission until it finishes, so a live job's read is
+            // a cache hit and never falls through. Whatever else it is — most
+            // likely a terminal write that lost to lock contention, since
+            // persistence is best-effort — this process will never observe it
+            // transition. That is the decisive part, and it holds whether the
+            // record is stale or genuinely live somewhere else: the job cache
+            // never evicts an in-flight record, so caching one whose completion
+            // we will never see parks a slot for the life of the process, and
+            // repeating that rebuilds the unbounded growth the capacity bound
+            // exists to stop. Re-reading instead also lets the answer improve if
+            // a later write settles, rather than pinning `running` in memory.
+            if !record.is_in_flight() {
+                state.jobs.upsert(record.clone()).await;
+            }
             Ok(PrettyJson(job_status_from(record)))
         }
         None => Err(ApiError::job_not_found(&id)),
@@ -2307,6 +2337,11 @@ mod tests {
 
         // A brand-new server (empty in-memory registry) reads the durable record.
         let state = pinned_server(models_dir, None, &state_path);
+        assert!(
+            state.jobs.get("job_inflight").await.is_none(),
+            "the sweep is registry-independent: it reconciles the durable table, \
+             and a restarted server starts with a cold cache"
+        );
         let base = spawn_router(state).await;
 
         // This GET misses the in-memory registry and falls through to a durable
@@ -2486,6 +2521,212 @@ mod tests {
             body.state
         );
         assert!(body.error.is_none());
+    }
+
+    /// The correctness leg of the job cache's capacity bound: a record the
+    /// cache has evicted is still served, byte for byte, from the durable
+    /// `jobs` table. Bounding the cache may cost a redb read — it must never
+    /// cost an answer, and a miss must not answer differently from a hit.
+    #[tokio::test]
+    async fn evicted_job_is_served_identically_from_the_durable_table() {
+        use rocky_core::state::StateStore;
+        use rocky_server::jobs::DEFAULT_JOB_CACHE_CAPACITY;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = pinned_state_path(&models_dir);
+
+        // A finished job recorded the way the job paths do it: durable record
+        // first, then the in-memory cache.
+        let mut record = persisted_job("job_evicted", "succeeded");
+        record.finished_at = Some("2026-07-07T00:00:10Z".to_string());
+        record.result = Some(serde_json::json!({ "status": "success" }));
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store.record_job(&record).unwrap();
+        }
+
+        let state = pinned_server(models_dir, None, &state_path);
+        state.jobs.upsert(record).await;
+        let base = spawn_router(state.clone()).await;
+
+        // The hot answer, straight from the cache.
+        let hot = reqwest::get(format!("{base}/api/v1/jobs/job_evicted"))
+            .await
+            .unwrap();
+        assert_eq!(hot.status(), 200);
+        let hot = hot.text().await.unwrap();
+
+        // Exactly one capacity's worth of newer finished jobs displaces it.
+        for i in 0..DEFAULT_JOB_CACHE_CAPACITY {
+            state
+                .jobs
+                .upsert(persisted_job(&format!("filler{i}"), "succeeded"))
+                .await;
+        }
+        assert!(
+            state.jobs.get("job_evicted").await.is_none(),
+            "the record under test must actually have been evicted"
+        );
+
+        // The cold answer, through the durable fallback. This read opens the
+        // store and so races the server's spawned `recompile()` — the same
+        // contention `job_interrupted_by_restart_is_swept_to_failed` documents.
+        let cold = get_retrying_on_busy(&format!("{base}/api/v1/jobs/job_evicted")).await;
+        assert_eq!(cold.status(), 200);
+        assert_eq!(
+            cold.text().await.unwrap(),
+            hot,
+            "a cache miss must return exactly what the hit returned"
+        );
+    }
+
+    /// A submission abandoned mid-flight must leave nothing behind in the job
+    /// cache.
+    ///
+    /// Axum drops the handler future when a client disconnects, so submission
+    /// can stop at any `.await`. Because the cache never evicts an in-flight
+    /// record, caching `running` before an await that may never return would
+    /// strand a slot for the life of the process, and a client looping
+    /// submit-then-disconnect would rebuild the unbounded growth the capacity
+    /// bound exists to stop.
+    ///
+    /// Driven by polling the future directly and dropping it at its first
+    /// suspension — which is the durable write, the same point a disconnect
+    /// would realistically land on. Under the previous ordering (cache, then
+    /// persist, then spawn) that first poll had already cached `running` and
+    /// this assertion fails.
+    #[tokio::test]
+    async fn a_submission_abandoned_mid_flight_caches_nothing() {
+        use std::task::{Context, Waker};
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = pinned_state_path(&models_dir);
+        let state = pinned_server(models_dir, None, &state_path);
+
+        let headers = HeaderMap::new();
+        let body = Bytes::new();
+        {
+            let future = submit_job(JobKind::Plan, state.clone(), &headers, &body);
+            let mut future = std::pin::pin!(future);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                future.as_mut().poll(&mut cx).is_pending(),
+                "submission must suspend on the durable write before it is cached"
+            );
+            // The disconnect: the handler future is dropped where it suspended.
+        }
+
+        assert_eq!(
+            state.jobs.entry_count().await,
+            0,
+            "an abandoned submission must cache nothing: the cache never evicts \
+             an in-flight record, so a `running` entry with no terminal owner \
+             would hold a slot for the life of the process"
+        );
+
+        // The permit is released by the dropped guard, so the slot is reusable.
+        assert_eq!(
+            state.mutation_permit.running_job(),
+            None,
+            "an abandoned submission must not hold the mutation permit"
+        );
+    }
+
+    /// The cross-crate stand-in for enum exhaustiveness.
+    ///
+    /// `rocky-core` classifies a job's lifecycle from the persisted **string**,
+    /// because it cannot see this crate's [`JobState`]. So adding a variant
+    /// there compiles cleanly while `is_in_flight` silently reads it as
+    /// finished — and therefore evictable from the job cache, even if the new
+    /// state means live work. This test can see both sides, and its exhaustive
+    /// `match` stops compiling the moment a variant is added, forcing the new
+    /// state to be classified deliberately on both predicates.
+    ///
+    /// It also pins the asymmetry: the two predicates are complements for the
+    /// four known states and deliberately are NOT for anything else — an
+    /// unrecognized string is neither in flight (so it can never defeat the
+    /// cache's capacity bound) nor terminal (so the restart sweep reconciles it).
+    #[test]
+    fn every_job_state_is_classified_for_both_the_cache_and_the_sweep() {
+        for state in [
+            JobState::Queued,
+            JobState::Running,
+            JobState::Succeeded,
+            JobState::Failed,
+        ] {
+            // Exhaustive on purpose: a new variant breaks compilation here.
+            let (in_flight, terminal) = match state {
+                JobState::Queued | JobState::Running => (true, false),
+                JobState::Succeeded | JobState::Failed => (false, true),
+            };
+            let job = persisted_job("j", job_state_str(state));
+            assert_eq!(
+                job.is_in_flight(),
+                in_flight,
+                "{state:?} must classify as in_flight={in_flight}"
+            );
+            assert_eq!(
+                job.is_terminal(),
+                terminal,
+                "{state:?} must classify as terminal={terminal}"
+            );
+        }
+
+        // The deliberate asymmetry, which no `JobState` variant can express.
+        let unknown = persisted_job("j", "cancelled");
+        assert!(
+            !unknown.is_in_flight(),
+            "an unrecognized state must be evictable, or it could defeat the cache bound"
+        );
+        assert!(
+            !unknown.is_terminal(),
+            "an unrecognized state must still be swept, or an embedder polls it forever"
+        );
+    }
+
+    /// A durable record that still reads as in flight must be served but NOT
+    /// cached. Persisting is best-effort, so a job whose terminal write lost to
+    /// lock contention leaves `running` behind durably; caching that on a miss
+    /// would park a record the cache is never allowed to evict, and repeating it
+    /// would rebuild the very unbounded growth the capacity bound exists to stop.
+    #[tokio::test]
+    async fn a_stale_in_flight_durable_record_is_served_but_not_cached() {
+        use rocky_core::state::StateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = pinned_state_path(&models_dir);
+
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_job(&persisted_job("job_zombie", "running"))
+                .unwrap();
+        }
+
+        let state = pinned_server(models_dir, None, &state_path);
+        let base = spawn_router(state.clone()).await;
+
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/jobs/job_zombie")).await;
+        assert_eq!(resp.status(), 200);
+        let body: JobStatus = resp.json().await.unwrap();
+        assert!(
+            matches!(body.state, JobState::Running),
+            "the durable record is still reported honestly, got {:?}",
+            body.state
+        );
+
+        assert!(
+            state.jobs.get("job_zombie").await.is_none(),
+            "an in-flight record read from the durable table must not be cached: \
+             the cache never evicts in-flight records, so caching it would strand \
+             a slot for the life of the process"
+        );
     }
 
     // --- Route-table ↔ router anti-drift probes (FIX for silent drift) ---
