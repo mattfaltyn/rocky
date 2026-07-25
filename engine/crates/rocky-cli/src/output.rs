@@ -1979,13 +1979,67 @@ impl CiDiffOutput {
     }
 
     /// Attach semantic breaking-change findings to this output.
+    ///
+    /// Also folds them into [`Self::markdown`]. That field is the pre-rendered
+    /// PR comment, and a semantic finding can exist with **no** structural rows
+    /// at all — a `groups/*.toml` or `_defaults.toml` edit retargets models
+    /// without touching a model file. Leaving the Markdown to the structural
+    /// summary alone would post "No data changes detected" over a breaking
+    /// change.
     pub fn with_breaking_findings(
         mut self,
         findings: Vec<rocky_core::breaking_change::BreakingFinding>,
     ) -> Self {
+        if !findings.is_empty() {
+            self.markdown =
+                markdown_with_findings(&self.markdown, self.models.is_empty(), &findings);
+        }
         self.breaking_findings = findings;
         self
     }
+}
+
+/// Render the semantic findings into the pre-rendered Markdown report.
+///
+/// When there are no structural rows the structural renderer has already
+/// emitted its "No data changes detected" verdict; replace that line rather
+/// than contradicting it two paragraphs later.
+fn markdown_with_findings(
+    structural: &str,
+    structural_is_empty: bool,
+    findings: &[rocky_core::breaking_change::BreakingFinding],
+) -> String {
+    use rocky_core::breaking_change::BreakingSeverity;
+
+    let breaking = findings.iter().filter(|f| f.is_breaking()).count();
+    let mut out = if structural_is_empty {
+        let verdict = if breaking > 0 {
+            format!(
+                "No model files changed, but **{breaking} breaking change(s)** were detected in the compiled project.\n"
+            )
+        } else {
+            "No model files changed. Semantic findings below are informational.\n".to_string()
+        };
+        structural.replace("No data changes detected.\n", &verdict)
+    } else {
+        structural.to_string()
+    };
+
+    out.push_str(&format!(
+        "\n### Semantic findings ({} total, {breaking} breaking)\n\n",
+        findings.len()
+    ));
+    out.push_str("| Severity | Change |\n|----------|--------|\n");
+    for finding in findings {
+        let severity = match finding.severity {
+            BreakingSeverity::Breaking => "**BREAKING**",
+            BreakingSeverity::Warning => "warning",
+            BreakingSeverity::Info => "info",
+        };
+        out.push_str(&format!("| {severity} | `{:?}` |\n", finding.change));
+    }
+    out.push('\n');
+    out
 }
 
 /// JSON output for `rocky optimize`.
@@ -9477,6 +9531,68 @@ pub struct JobStatus {
     /// shape is the `run` / `plan` / `apply` schema selected by
     /// [`kind`](Self::kind).
     pub result: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod ci_diff_markdown_tests {
+    //! [`CiDiffOutput::markdown`] is the pre-rendered PR comment. A semantic
+    //! finding can exist with no structural rows — shared config such as
+    //! `groups/*.toml` retargets models without touching a model file — so the
+    //! Markdown must not report a clean run in that state.
+    use super::*;
+    use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+    use rocky_core::ci_diff::DiffSummary;
+
+    fn empty_output() -> CiDiffOutput {
+        CiDiffOutput::new(
+            "main".to_string(),
+            "HEAD".to_string(),
+            DiffSummary {
+                total_models: 0,
+                unchanged: 0,
+                modified: 0,
+                added: 0,
+                removed: 0,
+            },
+            vec![],
+        )
+    }
+
+    fn model_removed() -> BreakingFinding {
+        BreakingFinding {
+            change: BreakingChange::ModelRemoved {
+                model: "poc.marts.orders".to_string(),
+            },
+            severity: BreakingSeverity::Breaking,
+        }
+    }
+
+    #[test]
+    fn no_structural_rows_still_reports_a_breaking_finding() {
+        let clean = empty_output();
+        assert!(
+            clean.markdown.contains("No data changes detected"),
+            "precondition: the structural renderer reports clean"
+        );
+
+        let output = empty_output().with_breaking_findings(vec![model_removed()]);
+        assert!(
+            !output.markdown.contains("No data changes detected"),
+            "a breaking finding must not be posted as a clean report:\n{}",
+            output.markdown
+        );
+        assert!(output.markdown.contains("breaking change(s)"));
+        assert!(output.markdown.contains("BREAKING"));
+        assert!(output.markdown.contains("poc.marts.orders"));
+    }
+
+    #[test]
+    fn no_findings_leaves_the_structural_markdown_untouched() {
+        let baseline = empty_output();
+        let output = empty_output().with_breaking_findings(vec![]);
+        assert_eq!(output.markdown, baseline.markdown);
+        assert!(output.breaking_findings.is_empty());
+    }
 }
 
 #[cfg(test)]
