@@ -1,6 +1,6 @@
 //! `rocky ci-diff` — detect changed models between git refs and generate a structural diff report.
 //!
-//! Shells out to `git diff --name-only` to find `.sql`, `.rocky`, and `.toml`
+//! Shells out to `git diff --name-status` to find `.sql`, `.rocky`, and `.toml`
 //! sidecar files that changed between a base ref (default: `main`) and HEAD.
 //! Compiles the current working tree to extract model schemas, then classifies
 //! each changed model as added, modified, or removed and generates a structured
@@ -18,6 +18,7 @@ use rocky_core::ci_diff::{
     ColumnChangeType, ColumnDiff, DiffResult, DiffSummary, ModelDiffStatus, format_diff_markdown,
     format_diff_table,
 };
+use rocky_core::models::Model;
 
 use crate::output::{CiDiffOutput, print_json};
 
@@ -30,8 +31,36 @@ use crate::output::{CiDiffOutput, print_json};
 struct ChangedFile {
     /// Path relative to the repository root.
     path: String,
+    /// Previous path for a Git rename or copy record.
+    old_path: Option<String>,
     /// Git diff status: A (added), D (deleted), M (modified), R (renamed), etc.
     status: char,
+}
+
+/// A changed model keyed internally by its resolved target when both refs
+/// compile, or by filename stem as a best-effort fallback.
+#[derive(Debug, Default)]
+struct ModelChange {
+    /// Internal model name shown in the structural report.
+    model_name: String,
+    /// Schema-map key on the base ref.
+    base_schema_name: Option<String>,
+    /// Schema-map key on HEAD.
+    head_schema_name: Option<String>,
+}
+
+impl ModelChange {
+    fn status(&self) -> ModelDiffStatus {
+        match (
+            self.base_schema_name.is_some(),
+            self.head_schema_name.is_some(),
+        ) {
+            (true, true) => ModelDiffStatus::Modified,
+            (true, false) => ModelDiffStatus::Removed,
+            (false, true) => ModelDiffStatus::Added,
+            (false, false) => ModelDiffStatus::Unchanged,
+        }
+    }
 }
 
 /// Reject a `base_ref` that git would interpret as an option rather than a
@@ -103,15 +132,18 @@ fn parse_name_status(raw: &[u8]) -> Result<Vec<ChangedFile>> {
         // Format: "<status>\t<path>" (or "<status>\t<old>\t<new>" for renames)
         let mut parts = line.splitn(3, '\t');
         let status_str = parts.next().unwrap_or("");
-        let path = parts.next().unwrap_or("");
-
-        // For renames (R100), use the new path
-        let effective_path = parts.next().unwrap_or(path);
+        let first_path = parts.next().unwrap_or("");
         let status = status_str.chars().next().unwrap_or('M');
+        let second_path = parts.next();
+        let (path, old_path) = match (status, second_path) {
+            ('R' | 'C', Some(new_path)) => (new_path, Some(first_path.to_string())),
+            _ => (first_path, None),
+        };
 
-        if !effective_path.is_empty() {
+        if !path.is_empty() {
             files.push(ChangedFile {
-                path: effective_path.to_string(),
+                path: path.to_string(),
+                old_path,
                 status,
             });
         }
@@ -120,53 +152,130 @@ fn parse_name_status(raw: &[u8]) -> Result<Vec<ChangedFile>> {
     Ok(files)
 }
 
-/// Filter changed files to model files (.sql, .rocky) and their sidecars (.toml).
+/// Return the model stem for a changed path under the configured models root.
 ///
-/// Returns a map from model stem (filename without extension) to its change status.
-fn classify_model_changes(files: &[ChangedFile]) -> HashMap<String, ModelDiffStatus> {
-    let mut models: HashMap<String, ModelDiffStatus> = HashMap::new();
+/// Model loading is flat, so nested config files such as `groups/*.toml` are
+/// not model sidecars. Contract sidecars use `<stem>.contract.toml`.
+fn model_stem(path: &str, models_rel: Option<&str>) -> Option<String> {
+    let path = Path::new(path);
+    let relative = match models_rel {
+        Some(root) => path.strip_prefix(root).ok()?,
+        None => path,
+    };
+    if models_rel.is_some() && relative.components().count() != 1 {
+        return None;
+    }
 
-    for file in files {
-        let path = Path::new(&file.path);
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-        // Only care about model files and their sidecars
-        if ext != "sql" && ext != "rocky" && ext != "toml" {
-            continue;
+    let file_name = relative.file_name()?.to_str()?;
+    let stem = if let Some(stem) = file_name.strip_suffix(".contract.toml") {
+        stem
+    } else {
+        match relative.extension().and_then(|ext| ext.to_str()) {
+            Some("sql" | "rocky" | "toml") => relative.file_stem()?.to_str()?,
+            _ => return None,
         }
+    };
 
-        // Skip non-model TOML files (e.g., rocky.toml, Cargo.toml)
-        // Model sidecars live next to .sql/.rocky files in a models/ directory
-        if ext == "toml" {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            // _defaults.toml is a directory-level config, not a model sidecar
-            if stem == "_defaults" || stem == "rocky" || stem == "Cargo" {
-                continue;
+    (!stem.is_empty() && stem != "_defaults" && stem != "rocky" && stem != "Cargo")
+        .then(|| stem.to_string())
+}
+
+fn model_matches_path(model: &Model, path: &str, models_rel: Option<&str>) -> bool {
+    let Some(stem) = model_stem(path, models_rel) else {
+        return false;
+    };
+    let source_path = Path::new(&model.file_path);
+    if source_path.file_stem().and_then(|value| value.to_str()) != Some(stem.as_str()) {
+        return false;
+    }
+
+    match Path::new(path).extension().and_then(|ext| ext.to_str()) {
+        Some("sql" | "rocky") => source_path.extension() == Path::new(path).extension(),
+        Some("toml") => true,
+        _ => false,
+    }
+}
+
+fn record_model_side(
+    changes: &mut HashMap<String, ModelChange>,
+    key: String,
+    model_name: &str,
+    is_base: bool,
+) {
+    let change = changes.entry(key).or_default();
+    if is_base {
+        change.base_schema_name = Some(model_name.to_string());
+        if change.model_name.is_empty() {
+            change.model_name = model_name.to_string();
+        }
+    } else {
+        change.head_schema_name = Some(model_name.to_string());
+        change.model_name = model_name.to_string();
+    }
+}
+
+fn record_resolved_side(
+    changes: &mut HashMap<String, ModelChange>,
+    models: &[Model],
+    path: &str,
+    models_rel: Option<&str>,
+    is_base: bool,
+) {
+    for model in models
+        .iter()
+        .filter(|model| model_matches_path(model, path, models_rel))
+    {
+        let target = &model.config.target;
+        let key = format!("{}.{}.{}", target.catalog, target.schema, target.table);
+        record_model_side(changes, key, &model.config.name, is_base);
+    }
+}
+
+/// Classify changed model files by their externally visible target identity.
+///
+/// Resolved pairing is only safe when both refs compiled. Otherwise the
+/// classifier preserves the previous filename-based, conservative behavior.
+fn classify_model_changes(
+    files: &[ChangedFile],
+    models_rel: Option<&str>,
+    base_models: Option<&[Model]>,
+    head_models: Option<&[Model]>,
+) -> HashMap<String, ModelChange> {
+    let mut changes = HashMap::new();
+
+    if let (Some(base), Some(head)) = (base_models, head_models) {
+        for file in files {
+            if file.status == 'R'
+                && let Some(old_path) = file.old_path.as_deref()
+            {
+                record_resolved_side(&mut changes, base, old_path, models_rel, true);
+                record_resolved_side(&mut changes, head, old_path, models_rel, false);
             }
+            record_resolved_side(&mut changes, base, &file.path, models_rel, true);
+            record_resolved_side(&mut changes, head, &file.path, models_rel, false);
         }
+        return changes;
+    }
 
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        if stem.is_empty() {
+    let mut statuses = HashMap::new();
+    for file in files {
+        let Some(stem) = model_stem(&file.path, models_rel).or_else(|| {
+            file.old_path
+                .as_deref()
+                .and_then(|path| model_stem(path, models_rel))
+        }) else {
             continue;
-        }
-
+        };
         let status = match file.status {
-            'A' => ModelDiffStatus::Added,
+            'A' | 'C' => ModelDiffStatus::Added,
             'D' => ModelDiffStatus::Removed,
+            // Keep the prior conservative result when either ref could not
+            // compile: a rename is one modification at its new path.
             _ => ModelDiffStatus::Modified,
         };
-
-        // If we already classified this model (e.g. both .sql and .toml changed),
-        // prefer the more significant status
-        models
+        statuses
             .entry(stem)
             .and_modify(|existing| {
-                // Added/Removed take priority over Modified
                 if *existing == ModelDiffStatus::Modified {
                     *existing = status;
                 }
@@ -174,7 +283,24 @@ fn classify_model_changes(files: &[ChangedFile]) -> HashMap<String, ModelDiffSta
             .or_insert(status);
     }
 
-    models
+    for (name, status) in statuses {
+        let (base_schema_name, head_schema_name) = match status {
+            ModelDiffStatus::Added => (None, Some(name.clone())),
+            ModelDiffStatus::Removed => (Some(name.clone()), None),
+            ModelDiffStatus::Modified => (Some(name.clone()), Some(name.clone())),
+            ModelDiffStatus::Unchanged => (None, None),
+        };
+        changes.insert(
+            name.clone(),
+            ModelChange {
+                model_name: name,
+                base_schema_name,
+                head_schema_name,
+            },
+        );
+    }
+
+    changes
 }
 
 // ---------------------------------------------------------------------------
@@ -397,17 +523,24 @@ fn diff_columns(base_cols: &[TypedColumn], head_cols: &[TypedColumn]) -> Vec<Col
 
 /// Build the full diff report from git changes and compiled schemas.
 fn build_diff_results(
-    model_changes: &HashMap<String, ModelDiffStatus>,
+    model_changes: &HashMap<String, ModelChange>,
     head_schemas: &HashMap<String, Vec<TypedColumn>>,
     base_schemas: &HashMap<String, Vec<TypedColumn>>,
 ) -> Vec<DiffResult> {
     let mut results: Vec<DiffResult> = model_changes
-        .iter()
-        .map(|(name, status)| {
+        .values()
+        .map(|change| {
+            let status = change.status();
             let column_changes = match status {
                 ModelDiffStatus::Modified => {
-                    let base_cols = base_schemas.get(name);
-                    let head_cols = head_schemas.get(name);
+                    let base_cols = change
+                        .base_schema_name
+                        .as_ref()
+                        .and_then(|name| base_schemas.get(name));
+                    let head_cols = change
+                        .head_schema_name
+                        .as_ref()
+                        .and_then(|name| head_schemas.get(name));
                     match (base_cols, head_cols) {
                         (Some(base), Some(head)) => diff_columns(base, head),
                         _ => vec![],
@@ -415,8 +548,10 @@ fn build_diff_results(
                 }
                 ModelDiffStatus::Added => {
                     // Show all columns as added for new models
-                    head_schemas
-                        .get(name)
+                    change
+                        .head_schema_name
+                        .as_ref()
+                        .and_then(|name| head_schemas.get(name))
                         .map(|cols| {
                             cols.iter()
                                 .map(|c| ColumnDiff {
@@ -431,8 +566,10 @@ fn build_diff_results(
                 }
                 ModelDiffStatus::Removed => {
                     // Show all columns as removed for deleted models
-                    base_schemas
-                        .get(name)
+                    change
+                        .base_schema_name
+                        .as_ref()
+                        .and_then(|name| base_schemas.get(name))
                         .map(|cols| {
                             cols.iter()
                                 .map(|c| ColumnDiff {
@@ -449,8 +586,8 @@ fn build_diff_results(
             };
 
             DiffResult {
-                model_name: name.clone(),
-                status: *status,
+                model_name: change.model_name.clone(),
+                status,
                 row_count_before: None,
                 row_count_after: None,
                 column_changes,
@@ -535,8 +672,8 @@ pub(crate) fn compute_ci_diff(
         });
     }
 
-    let model_changes = classify_model_changes(&changed_files);
-    if model_changes.is_empty() {
+    let models_rel = find_models_relative_path(models_dir);
+    if classify_model_changes(&changed_files, models_rel.as_deref(), None, None).is_empty() {
         return Ok(CiDiffData {
             summary: DiffSummary {
                 total_models: 0,
@@ -580,6 +717,16 @@ pub(crate) fn compute_ci_diff(
         .map(typed_columns_from_compile)
         .unwrap_or_default();
 
+    let model_changes = classify_model_changes(
+        &changed_files,
+        models_rel.as_deref(),
+        base_compile
+            .as_ref()
+            .map(|result| result.project.models.as_slice()),
+        head_compile
+            .as_ref()
+            .map(|result| result.project.models.as_slice()),
+    );
     let results = build_diff_results(&model_changes, &head_schemas, &base_schemas);
     let summary = DiffSummary::from_results(&results);
 
@@ -749,6 +896,28 @@ pub fn run_ci_diff(
 mod tests {
     use super::*;
 
+    fn changed(path: &str, status: char) -> ChangedFile {
+        ChangedFile {
+            path: path.to_string(),
+            old_path: None,
+            status,
+        }
+    }
+
+    fn model_change(name: &str, status: ModelDiffStatus) -> ModelChange {
+        let (base_schema_name, head_schema_name) = match status {
+            ModelDiffStatus::Added => (None, Some(name.to_string())),
+            ModelDiffStatus::Removed => (Some(name.to_string()), None),
+            ModelDiffStatus::Modified => (Some(name.to_string()), Some(name.to_string())),
+            ModelDiffStatus::Unchanged => (None, None),
+        };
+        ModelChange {
+            model_name: name.to_string(),
+            base_schema_name,
+            head_schema_name,
+        }
+    }
+
     #[test]
     fn validate_base_ref_rejects_option_injection() {
         // A leading-dash ref would otherwise smuggle flags into the git
@@ -786,12 +955,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_rename_uses_new_path() {
+    fn parse_rename_preserves_both_paths() {
         let raw = b"R100\tmodels/old_name.sql\tmodels/new_name.sql\n";
         let files = parse_name_status(raw).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].status, 'R');
         assert_eq!(files[0].path, "models/new_name.sql");
+        assert_eq!(files[0].old_path.as_deref(), Some("models/old_name.sql"));
     }
 
     #[test]
@@ -808,70 +978,41 @@ mod tests {
     #[test]
     fn classify_sql_files() {
         let files = vec![
-            ChangedFile {
-                path: "models/orders.sql".into(),
-                status: 'A',
-            },
-            ChangedFile {
-                path: "models/customers.sql".into(),
-                status: 'M',
-            },
-            ChangedFile {
-                path: "models/legacy.sql".into(),
-                status: 'D',
-            },
+            changed("models/orders.sql", 'A'),
+            changed("models/customers.sql", 'M'),
+            changed("models/legacy.sql", 'D'),
         ];
-        let changes = classify_model_changes(&files);
-        assert_eq!(changes.get("orders"), Some(&ModelDiffStatus::Added));
-        assert_eq!(changes.get("customers"), Some(&ModelDiffStatus::Modified));
-        assert_eq!(changes.get("legacy"), Some(&ModelDiffStatus::Removed));
+        let changes = classify_model_changes(&files, Some("models"), None, None);
+        assert_eq!(changes["orders"].status(), ModelDiffStatus::Added);
+        assert_eq!(changes["customers"].status(), ModelDiffStatus::Modified);
+        assert_eq!(changes["legacy"].status(), ModelDiffStatus::Removed);
     }
 
     #[test]
     fn classify_rocky_files() {
-        let files = vec![ChangedFile {
-            path: "models/pipeline.rocky".into(),
-            status: 'A',
-        }];
-        let changes = classify_model_changes(&files);
-        assert_eq!(changes.get("pipeline"), Some(&ModelDiffStatus::Added));
+        let files = vec![changed("models/pipeline.rocky", 'A')];
+        let changes = classify_model_changes(&files, Some("models"), None, None);
+        assert_eq!(changes["pipeline"].status(), ModelDiffStatus::Added);
     }
 
     #[test]
     fn classify_toml_sidecars() {
-        let files = vec![ChangedFile {
-            path: "models/orders.toml".into(),
-            status: 'M',
-        }];
-        let changes = classify_model_changes(&files);
-        assert_eq!(changes.get("orders"), Some(&ModelDiffStatus::Modified));
+        let files = vec![changed("models/orders.toml", 'M')];
+        let changes = classify_model_changes(&files, Some("models"), None, None);
+        assert_eq!(changes["orders"].status(), ModelDiffStatus::Modified);
     }
 
     #[test]
     fn classify_ignores_non_model_files() {
         let files = vec![
-            ChangedFile {
-                path: "rocky.toml".into(),
-                status: 'M',
-            },
-            ChangedFile {
-                path: "Cargo.toml".into(),
-                status: 'M',
-            },
-            ChangedFile {
-                path: "models/_defaults.toml".into(),
-                status: 'M',
-            },
-            ChangedFile {
-                path: "README.md".into(),
-                status: 'M',
-            },
-            ChangedFile {
-                path: "src/main.rs".into(),
-                status: 'M',
-            },
+            changed("rocky.toml", 'M'),
+            changed("Cargo.toml", 'M'),
+            changed("models/_defaults.toml", 'M'),
+            changed("models/groups/orders.toml", 'M'),
+            changed("README.md", 'M'),
+            changed("src/main.rs", 'M'),
         ];
-        let changes = classify_model_changes(&files);
+        let changes = classify_model_changes(&files, Some("models"), None, None);
         assert!(changes.is_empty());
     }
 
@@ -880,17 +1021,25 @@ mod tests {
         // When both .sql (Added) and .toml (Modified) change for the same model,
         // the more significant status (Added) should win.
         let files = vec![
-            ChangedFile {
-                path: "models/orders.toml".into(),
-                status: 'M',
-            },
-            ChangedFile {
-                path: "models/orders.sql".into(),
-                status: 'A',
-            },
+            changed("models/orders.toml", 'M'),
+            changed("models/orders.sql", 'A'),
         ];
-        let changes = classify_model_changes(&files);
-        assert_eq!(changes.get("orders"), Some(&ModelDiffStatus::Added));
+        let changes = classify_model_changes(&files, Some("models"), None, None);
+        assert_eq!(changes["orders"].status(), ModelDiffStatus::Added);
+    }
+
+    #[test]
+    fn classify_copy_as_added() {
+        let files = parse_name_status(b"C100\tmodels/orders.sql\tmodels/purchases.sql\n").unwrap();
+        let changes = classify_model_changes(&files, Some("models"), None, None);
+        assert_eq!(changes["purchases"].status(), ModelDiffStatus::Added);
+    }
+
+    #[test]
+    fn classify_rename_out_of_models_uses_old_path() {
+        let files = parse_name_status(b"R100\tmodels/orders.sql\tarchive/orders.sql\n").unwrap();
+        let changes = classify_model_changes(&files, Some("models"), None, None);
+        assert_eq!(changes["orders"].status(), ModelDiffStatus::Modified);
     }
 
     // -----------------------------------------------------------------------
@@ -1038,8 +1187,14 @@ mod tests {
     #[test]
     fn build_results_sorts_by_name() {
         let mut model_changes = HashMap::new();
-        model_changes.insert("zebra".into(), ModelDiffStatus::Added);
-        model_changes.insert("alpha".into(), ModelDiffStatus::Modified);
+        model_changes.insert(
+            "c.s.zebra".into(),
+            model_change("zebra", ModelDiffStatus::Added),
+        );
+        model_changes.insert(
+            "c.s.alpha".into(),
+            model_change("alpha", ModelDiffStatus::Modified),
+        );
 
         let results = build_diff_results(&model_changes, &HashMap::new(), &HashMap::new());
         assert_eq!(results[0].model_name, "alpha");
@@ -1049,7 +1204,10 @@ mod tests {
     #[test]
     fn build_results_with_schemas() {
         let mut model_changes = HashMap::new();
-        model_changes.insert("orders".into(), ModelDiffStatus::Modified);
+        model_changes.insert(
+            "c.s.orders".into(),
+            model_change("orders", ModelDiffStatus::Modified),
+        );
 
         let mut base_schemas = HashMap::new();
         base_schemas.insert(
@@ -1095,7 +1253,10 @@ mod tests {
     #[test]
     fn build_results_added_model_shows_all_columns() {
         let mut model_changes = HashMap::new();
-        model_changes.insert("new_model".into(), ModelDiffStatus::Added);
+        model_changes.insert(
+            "c.s.new_model".into(),
+            model_change("new_model", ModelDiffStatus::Added),
+        );
 
         let mut head_schemas = HashMap::new();
         head_schemas.insert(
@@ -1126,7 +1287,10 @@ mod tests {
     #[test]
     fn build_results_removed_model_shows_all_columns() {
         let mut model_changes = HashMap::new();
-        model_changes.insert("old_model".into(), ModelDiffStatus::Removed);
+        model_changes.insert(
+            "c.s.old_model".into(),
+            model_change("old_model", ModelDiffStatus::Removed),
+        );
 
         let mut base_schemas = HashMap::new();
         base_schemas.insert(
@@ -1156,14 +1320,33 @@ mod tests {
     /// Write a minimal transformation model: `<name>.sql` + sidecar
     /// `<name>.toml`. Mirrors the test helper in `compile.rs`.
     fn write_model(dir: &Path, name: &str, sql: &str) {
-        let sql_path = dir.join(format!("{name}.sql"));
-        let toml_path = dir.join(format!("{name}.toml"));
+        write_model_with_identity(dir, name, name, name, sql);
+    }
+
+    fn write_model_with_identity(
+        dir: &Path,
+        file_stem: &str,
+        name: &str,
+        target_table: &str,
+        sql: &str,
+    ) {
+        let sql_path = dir.join(format!("{file_stem}.sql"));
+        let toml_path = dir.join(format!("{file_stem}.toml"));
         fs::write(&sql_path, sql).unwrap();
         fs::write(
             &toml_path,
             format!(
-                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{target_table}\"\n"
             ),
+        )
+        .unwrap();
+    }
+
+    fn write_inferred_model(dir: &Path, file_stem: &str, sql: &str) {
+        fs::write(dir.join(format!("{file_stem}.sql")), sql).unwrap();
+        fs::write(
+            dir.join(format!("{file_stem}.toml")),
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\n",
         )
         .unwrap();
     }
@@ -1186,6 +1369,208 @@ mod tests {
                 .collect(),
         );
         map
+    }
+
+    #[test]
+    fn model_stem_normalizes_contract_and_rejects_nested_config() {
+        assert_eq!(
+            model_stem("models/orders.contract.toml", Some("models")).as_deref(),
+            Some("orders")
+        );
+        assert_eq!(
+            model_stem("models/groups/orders.toml", Some("models")),
+            None
+        );
+        assert_eq!(
+            model_stem("models/orders.sql", None).as_deref(),
+            Some("orders")
+        );
+    }
+
+    #[test]
+    fn filename_inferred_rename_is_removed_and_added() {
+        let sources = source_schema(
+            "src_orders",
+            &[
+                ("id", rocky_ir::RockyType::Int64),
+                ("status", rocky_ir::RockyType::String),
+            ],
+        );
+        let base_dir = TempDir::new().unwrap();
+        write_inferred_model(
+            base_dir.path(),
+            "orders",
+            "SELECT id, status FROM src_orders",
+        );
+        let head_dir = TempDir::new().unwrap();
+        write_inferred_model(
+            head_dir.path(),
+            "purchases",
+            "SELECT id, status FROM src_orders",
+        );
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+        let files = parse_name_status(
+            b"R100\tmodels/orders.sql\tmodels/purchases.sql\n\
+              R100\tmodels/orders.toml\tmodels/purchases.toml\n\
+              R100\tmodels/orders.contract.toml\tmodels/purchases.contract.toml\n",
+        )
+        .unwrap();
+
+        let changes = classify_model_changes(
+            &files,
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes["c.s.orders"].status(), ModelDiffStatus::Removed);
+        assert_eq!(changes["c.s.purchases"].status(), ModelDiffStatus::Added);
+
+        let results = build_diff_results(
+            &changes,
+            &typed_columns_from_compile(&head_compile),
+            &typed_columns_from_compile(&base_compile),
+        );
+        let removed = results
+            .iter()
+            .find(|result| result.status == ModelDiffStatus::Removed)
+            .unwrap();
+        assert_eq!(removed.model_name, "orders");
+        assert_eq!(removed.column_changes.len(), 2);
+        assert!(
+            removed
+                .column_changes
+                .iter()
+                .all(|column| column.change_type == ColumnChangeType::Removed)
+        );
+        let added = results
+            .iter()
+            .find(|result| result.status == ModelDiffStatus::Added)
+            .unwrap();
+        assert_eq!(added.model_name, "purchases");
+        assert_eq!(added.column_changes.len(), 2);
+        assert!(
+            added
+                .column_changes
+                .iter()
+                .all(|column| column.change_type == ColumnChangeType::Added)
+        );
+    }
+
+    #[test]
+    fn rename_with_stable_target_is_modified_and_fallback_stays_conservative() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let base_dir = TempDir::new().unwrap();
+        write_model_with_identity(
+            base_dir.path(),
+            "orders_v1",
+            "old_orders",
+            "orders",
+            "SELECT id FROM src_orders",
+        );
+        let head_dir = TempDir::new().unwrap();
+        write_model_with_identity(
+            head_dir.path(),
+            "orders_v2",
+            "new_orders",
+            "orders",
+            "SELECT id FROM src_orders",
+        );
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+        let files = parse_name_status(
+            b"R100\tmodels/orders_v1.sql\tmodels/orders_v2.sql\n\
+              R100\tmodels/orders_v1.toml\tmodels/orders_v2.toml\n",
+        )
+        .unwrap();
+
+        let changes = classify_model_changes(
+            &files,
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+        assert_eq!(changes.len(), 1);
+        let change = &changes["c.s.orders"];
+        assert_eq!(change.status(), ModelDiffStatus::Modified);
+        assert_eq!(change.model_name, "new_orders");
+        assert_eq!(change.base_schema_name.as_deref(), Some("old_orders"));
+        assert_eq!(change.head_schema_name.as_deref(), Some("new_orders"));
+
+        let results = build_diff_results(
+            &changes,
+            &typed_columns_from_compile(&head_compile),
+            &typed_columns_from_compile(&base_compile),
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ModelDiffStatus::Modified);
+        assert!(results[0].column_changes.is_empty());
+
+        let fallback = classify_model_changes(
+            &files,
+            Some("models"),
+            None,
+            Some(&head_compile.project.models),
+        );
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback["orders_v2"].status(), ModelDiffStatus::Modified);
+    }
+
+    #[test]
+    fn contract_sidecar_add_or_delete_keeps_existing_model_modified() {
+        let dir = TempDir::new().unwrap();
+        write_model(
+            dir.path(),
+            "orders",
+            "SELECT id FROM (SELECT 1 AS id) AS src",
+        );
+        let compile = compile_head(dir.path(), HashMap::new()).expect("compile");
+
+        for status in ['A', 'D'] {
+            let files = vec![changed("models/orders.contract.toml", status)];
+            let changes = classify_model_changes(
+                &files,
+                Some("models"),
+                Some(&compile.project.models),
+                Some(&compile.project.models),
+            );
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes["c.s.orders"].status(), ModelDiffStatus::Modified);
+        }
+    }
+
+    #[test]
+    fn added_sql_does_not_match_existing_same_stem_rocky_model() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let base_dir = TempDir::new().unwrap();
+        fs::write(
+            base_dir.path().join("orders.rocky"),
+            "from src_orders\nselect { id }\n",
+        )
+        .unwrap();
+        let head_dir = TempDir::new().unwrap();
+        fs::write(
+            head_dir.path().join("orders.rocky"),
+            "from src_orders\nselect { id }\n",
+        )
+        .unwrap();
+        fs::write(
+            head_dir.path().join("orders.sql"),
+            "---toml\nname = \"orders_sql\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"orders_sql\" }\n---\nSELECT id FROM src_orders\n",
+        )
+        .unwrap();
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+
+        let changes = classify_model_changes(
+            &[changed("models/orders.sql", 'A')],
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes["c.s.orders_sql"].status(), ModelDiffStatus::Added);
     }
 
     #[test]
