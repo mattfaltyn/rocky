@@ -1386,7 +1386,16 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
             };
             (ty, true)
         }
-        "AVG" => (RockyType::Float64, true),
+        "AVG" => {
+            // Exact-numeric AVG is dialect-dependent, and this layer has no
+            // adapter context. Avoid a false concrete type (#1238).
+            let ty = if input_type.is_integer() || input_type.is_float() {
+                RockyType::Float64
+            } else {
+                RockyType::Unknown
+            };
+            (ty, true)
+        }
         "MIN" | "MAX" => (input_type.clone(), true),
         "COUNT_DISTINCT" => (RockyType::Int64, false),
         _ => (RockyType::Unknown, true),
@@ -1630,7 +1639,10 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
             };
             (result, true)
         }
-        "AVG" => (RockyType::Float64, true),
+        "AVG" => {
+            let arg_type = first_arg_type(func, scope);
+            infer_aggregation_type("AVG", &arg_type)
+        }
         "MIN" | "MAX" => {
             let arg_type = first_arg_type(func, scope);
             (arg_type, true)
@@ -2467,6 +2479,95 @@ mod tests {
     }
 
     #[test]
+    fn test_avg_type_is_conservative_for_dialect_dependent_decimal() {
+        let models = vec![make_model(
+            "averages",
+            "SELECT AVG(amount) AS avg_amount, AVG(quantity) AS avg_quantity \
+             FROM source.raw.orders",
+        )];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.orders".to_string(),
+            vec![
+                rocky_ir::ColumnInfo {
+                    name: "amount".to_string(),
+                    data_type: "DECIMAL(10,2)".to_string(),
+                    nullable: false,
+                },
+                rocky_ir::ColumnInfo {
+                    name: "quantity".to_string(),
+                    data_type: "BIGINT".to_string(),
+                    nullable: false,
+                },
+            ],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        let mut sources = HashMap::new();
+        sources.insert(
+            "source.raw.orders".to_string(),
+            source_schema(&[
+                (
+                    "amount",
+                    RockyType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    false,
+                ),
+                ("quantity", RockyType::Int64, false),
+            ]),
+        );
+
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let columns = &result.typed_models["averages"];
+        let avg_amount = columns.iter().find(|col| col.name == "avg_amount").unwrap();
+        let avg_quantity = columns
+            .iter()
+            .find(|col| col.name == "avg_quantity")
+            .unwrap();
+
+        assert_eq!(avg_amount.data_type, RockyType::Unknown);
+        assert_eq!(avg_quantity.data_type, RockyType::Float64);
+        assert!(avg_amount.nullable);
+        assert!(avg_quantity.nullable);
+
+        let contract = CompilerContract {
+            columns: vec![
+                ContractColumn {
+                    name: "avg_amount".to_string(),
+                    type_name: Some("Decimal".to_string()),
+                    nullable: Some(true),
+                    description: None,
+                },
+                ContractColumn {
+                    name: "avg_quantity".to_string(),
+                    type_name: Some("Decimal".to_string()),
+                    nullable: Some(true),
+                    description: None,
+                },
+            ],
+            rules: ContractRules::default(),
+        };
+        let diagnostics = validate_contract("averages", columns, &contract);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| &*diagnostic.code == "E011"
+                    && diagnostic.message.contains("avg_quantity")),
+            "known Float64 AVG should reject a Decimal contract: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("avg_amount")),
+            "dialect-dependent Decimal AVG should not produce a false mismatch: {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn test_cast_alias_uses_cast_type_not_source_type() {
         let models = vec![make_model(
             "cast_id",
@@ -2917,9 +3018,26 @@ mod tests {
 
     #[test]
     fn test_infer_expr_avg() {
-        let scope = TypeScope::new();
+        let mut scope = TypeScope::new();
         let expr = parse_expr("AVG(x)");
+        assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Unknown);
+
+        scope
+            .columns
+            .insert(CiKey::owned("x".to_string()), (RockyType::Int64, false));
         assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Float64);
+
+        scope.columns.insert(
+            CiKey::owned("x".to_string()),
+            (
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                false,
+            ),
+        );
+        assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Unknown);
     }
 
     #[test]
@@ -3161,7 +3279,11 @@ mod tests {
 
     #[test]
     fn test_infer_window_avg_over() {
-        let scope = TypeScope::new();
+        let mut scope = TypeScope::new();
+        scope.columns.insert(
+            CiKey::owned("amount".to_string()),
+            (RockyType::Int64, false),
+        );
         let expr = parse_expr("AVG(amount) OVER (ORDER BY id)");
         assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Float64);
     }
