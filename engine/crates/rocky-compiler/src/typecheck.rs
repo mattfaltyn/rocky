@@ -1387,12 +1387,16 @@ fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, boo
             (ty, true)
         }
         "AVG" => {
-            // Exact-numeric AVG is dialect-dependent, and this layer has no
-            // adapter context. Avoid a false concrete type (#1238).
-            let ty = if input_type.is_integer() || input_type.is_float() {
-                RockyType::Float64
-            } else {
+            // `AVG` of an exact-numeric input is dialect-dependent and this layer
+            // has no adapter context: DuckDB returns DOUBLE, Databricks returns
+            // DECIMAL(p + 4, s + 4), BigQuery preserves NUMERIC/BIGNUMERIC. Only
+            // `Decimal` degrades to `Unknown` (#1238) — every other input keeps
+            // `Float64`, so an argument Rocky simply failed to resolve does not
+            // silently drop out of contract validation.
+            let ty = if matches!(input_type, RockyType::Decimal { .. }) {
                 RockyType::Unknown
+            } else {
+                RockyType::Float64
             };
             (ty, true)
         }
@@ -2567,6 +2571,50 @@ mod tests {
         );
     }
 
+    /// The `Decimal` carve-out must not widen into "any input Rocky failed to
+    /// resolve". `validate_contract` skips type validation when the inferred
+    /// type is `Unknown`, so an over-broad withhold would turn E011 into
+    /// silence for every `AVG` in a project compiled without source schemas —
+    /// a fail-open at a gate, not conservative inference.
+    #[test]
+    fn test_avg_over_unresolved_input_still_validates_contracts() {
+        let models = vec![make_model(
+            "averages",
+            "SELECT AVG(amount) AS avg_amount FROM source.raw.orders",
+        )];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert("source.raw.orders".to_string(), vec![]);
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        // No source schema for the referenced table — the `AVG` argument does
+        // not resolve, exactly as with a cold schema cache or a fresh clone.
+        let sources = HashMap::new();
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let columns = &result.typed_models["averages"];
+        let avg_amount = columns.iter().find(|col| col.name == "avg_amount").unwrap();
+        assert_eq!(avg_amount.data_type, RockyType::Float64);
+
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "avg_amount".to_string(),
+                type_name: Some("Boolean".to_string()),
+                nullable: Some(true),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let diagnostics = validate_contract("averages", columns, &contract);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| &*diagnostic.code == "E011"
+                    && diagnostic.message.contains("avg_amount")),
+            "an unresolved AVG argument must not silence the contract check: {diagnostics:?}"
+        );
+    }
+
     #[test]
     fn test_cast_alias_uses_cast_type_not_source_type() {
         let models = vec![make_model(
@@ -3020,13 +3068,24 @@ mod tests {
     fn test_infer_expr_avg() {
         let mut scope = TypeScope::new();
         let expr = parse_expr("AVG(x)");
-        assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Unknown);
+
+        // An argument Rocky cannot resolve keeps `Float64`. Degrading it to
+        // `Unknown` would silently disable the column's E011 contract check
+        // (`contracts.rs` skips type validation for `Unknown`), which is a
+        // fail-open at a gate rather than conservative inference.
+        assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Float64);
 
         scope
             .columns
             .insert(CiKey::owned("x".to_string()), (RockyType::Int64, false));
         assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Float64);
 
+        scope
+            .columns
+            .insert(CiKey::owned("x".to_string()), (RockyType::Float32, false));
+        assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Float64);
+
+        // Only an exact-numeric input is dialect-dependent enough to withhold.
         scope.columns.insert(
             CiKey::owned("x".to_string()),
             (
@@ -3280,12 +3339,21 @@ mod tests {
     #[test]
     fn test_infer_window_avg_over() {
         let mut scope = TypeScope::new();
-        scope.columns.insert(
-            CiKey::owned("amount".to_string()),
-            (RockyType::Int64, false),
-        );
         let expr = parse_expr("AVG(amount) OVER (ORDER BY id)");
         assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Float64);
+
+        // The windowed form routes through the same rule as the aggregate form.
+        scope.columns.insert(
+            CiKey::owned("amount".to_string()),
+            (
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                false,
+            ),
+        );
+        assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Unknown);
     }
 
     #[test]
