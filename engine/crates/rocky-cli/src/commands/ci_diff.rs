@@ -353,9 +353,13 @@ fn classify_model_changes(
 
     let mut statuses = HashMap::new();
     for file in files {
+        // Fall back to the old path only for a rename, where the model really
+        // did move. A copy's source is untouched, so attributing the copy to
+        // that stem would report an existing model as newly Added.
         let Some(stem) = model_stem(&file.path, models_rel).or_else(|| {
             file.old_path
                 .as_deref()
+                .filter(|_| file.status == 'R')
                 .and_then(|path| model_stem(path, models_rel))
         }) else {
             continue;
@@ -1028,8 +1032,17 @@ pub fn run_ci_diff(
         print!("{}", format_diff_table(&data.results));
         println!();
         println!("--- Markdown (for PR comment) ---\n");
-        print!("{}", format_diff_markdown(&data.results));
-        print_semantic_findings(semantic, &findings);
+        // Render the same Markdown the JSON `markdown` field carries. This
+        // block is what a human copies into the PR, so it is exactly the
+        // surface that must not omit a breaking finding.
+        print!(
+            "{}",
+            crate::output::markdown_with_findings(
+                &format_diff_markdown(&data.results),
+                data.summary.is_clean(),
+                &findings,
+            )
+        );
     }
 
     Ok(())
@@ -1203,6 +1216,19 @@ mod tests {
         let files = parse_name_status(b"C100\tmodels/orders.sql\tmodels/purchases.sql\n").unwrap();
         let changes = classify_model_changes(&files, Some("models"), None, None);
         assert_eq!(changes["purchases"].status(), ModelDiffStatus::Added);
+    }
+
+    /// A copy leaves its source untouched, so on the fallback path the old
+    /// path must not lend its stem to a destination outside the models root —
+    /// that would report an existing model as newly Added.
+    #[test]
+    fn classify_copy_out_of_models_ignores_the_untouched_source() {
+        let files = parse_name_status(b"C100\tmodels/orders.sql\tarchive/orders.sql\n").unwrap();
+        let changes = classify_model_changes(&files, Some("models"), None, None);
+        assert!(
+            changes.is_empty(),
+            "copying a model out of the models root changes no model: {changes:?}"
+        );
     }
 
     #[test]

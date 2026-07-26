@@ -1991,8 +1991,13 @@ impl CiDiffOutput {
         findings: Vec<rocky_core::breaking_change::BreakingFinding>,
     ) -> Self {
         if !findings.is_empty() {
+            // Gate on the same predicate the structural renderer branches on
+            // (`DiffSummary::is_clean`), not on `models.is_empty()`. An
+            // all-`Unchanged` rows vec is clean to the renderer but non-empty
+            // here, which would leave "No data changes detected" standing above
+            // a findings table.
             self.markdown =
-                markdown_with_findings(&self.markdown, self.models.is_empty(), &findings);
+                markdown_with_findings(&self.markdown, self.summary.is_clean(), &findings);
         }
         self.breaking_findings = findings;
         self
@@ -2004,12 +2009,19 @@ impl CiDiffOutput {
 /// When there are no structural rows the structural renderer has already
 /// emitted its "No data changes detected" verdict; replace that line rather
 /// than contradicting it two paragraphs later.
-fn markdown_with_findings(
+pub(crate) fn markdown_with_findings(
     structural: &str,
     structural_is_empty: bool,
     findings: &[rocky_core::breaking_change::BreakingFinding],
 ) -> String {
     use rocky_core::breaking_change::BreakingSeverity;
+
+    // Total on purpose: callers that rendered without `--semantic`, or whose
+    // classifier found nothing, get the structural Markdown back untouched
+    // rather than an empty findings table.
+    if findings.is_empty() {
+        return structural.to_string();
+    }
 
     let breaking = findings.iter().filter(|f| f.is_breaking()).count();
     let mut out = if structural_is_empty {
@@ -2036,7 +2048,14 @@ fn markdown_with_findings(
             BreakingSeverity::Warning => "warning",
             BreakingSeverity::Info => "info",
         };
-        out.push_str(&format!("| {severity} | `{:?}` |\n", finding.change));
+        // A model or column name can contain `|` or a backtick — nothing
+        // validates `config.name` as an identifier — and either one breaks the
+        // table row it lands in. `{:?}` escapes quotes and control chars, not
+        // these.
+        let cell = format!("{:?}", finding.change)
+            .replace('|', "\\|")
+            .replace('`', "'");
+        out.push_str(&format!("| {severity} | `{cell}` |\n"));
     }
     out.push('\n');
     out
@@ -9592,6 +9611,50 @@ mod ci_diff_markdown_tests {
         let output = empty_output().with_breaking_findings(vec![]);
         assert_eq!(output.markdown, baseline.markdown);
         assert!(output.breaking_findings.is_empty());
+
+        // Called directly (the human-output path does), an empty findings list
+        // must not append an empty table.
+        assert_eq!(
+            markdown_with_findings(&baseline.markdown, true, &[]),
+            baseline.markdown
+        );
+    }
+
+    /// A clean structural verdict is decided by `DiffSummary::is_clean`, not by
+    /// `models.is_empty()`. Rows that are all `Unchanged` are clean to the
+    /// renderer while leaving the vec non-empty.
+    #[test]
+    fn all_unchanged_rows_still_replace_the_clean_verdict() {
+        let structural = "### Rocky CI Diff\n\nNo data changes detected.\n";
+        let rendered = markdown_with_findings(structural, true, &[model_removed()]);
+        assert!(!rendered.contains("No data changes detected"));
+        assert!(rendered.contains("breaking change(s)"));
+    }
+
+    /// A `|` or backtick in a model name must not break the table row it lands
+    /// in — nothing validates `config.name` as a SQL identifier.
+    #[test]
+    fn findings_table_escapes_pipes_and_backticks() {
+        let finding = BreakingFinding {
+            change: BreakingChange::ModelRemoved {
+                model: "poc.marts.or|ders`x".to_string(),
+            },
+            severity: BreakingSeverity::Breaking,
+        };
+        let rendered = markdown_with_findings("### Rocky CI Diff\n\n", false, &[finding]);
+        let row = rendered
+            .lines()
+            .find(|l| l.contains("BREAKING"))
+            .expect("a findings row");
+        assert!(
+            !row.contains('`') || row.matches('`').count() == 2,
+            "row: {row}"
+        );
+        assert_eq!(
+            row.matches(" | ").count(),
+            1,
+            "an unescaped pipe would split the row into extra cells: {row}"
+        );
     }
 }
 
