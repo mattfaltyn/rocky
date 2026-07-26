@@ -709,26 +709,27 @@ fn state_concurrency_check(
 
     let (status, message) = match (config.state.concurrency_control, cas_supported) {
         // The best configuration available today, and still not Healthy: the
-        // ledger-seam writers bypass CAS on every backend, so a green here
-        // would certify a protection no deployment currently has. This is the
-        // arm that flips to Healthy once the seam half lands.
+        // remaining ledger-seam writers bypass CAS on every backend, so a green
+        // here would certify a protection no deployment currently has. This is
+        // the arm that flips to Healthy once the last seam lands.
         (ConcurrencyControl::Cas, true) => {
             suggestions.push(
-                "state_concurrency: end-of-run uploads are compare-and-swap protected, but \
-                 `rocky gc`, `rocky policy`, and `rocky apply` still write state \
-                 unconditionally — until issue #1228 lands, do not run maintenance or \
-                 governance commands concurrently with a pipeline run"
+                "state_concurrency: end-of-run uploads and the `rocky policy` freeze/unfreeze \
+                 ledger write are compare-and-swap protected, but `rocky gc` and `rocky apply` \
+                 still write state unconditionally — until issue #1228 lands, do not run \
+                 maintenance or governance commands concurrently with a pipeline run"
                     .into(),
             );
             (
                 HealthStatus::Warning,
                 format!(
                     "[state] concurrency_control = \"cas\" protects this writer's end-of-run \
-                     upload on the '{backend}' backend, but ledger-seam writers (`rocky gc`, \
-                     `rocky policy`, `rocky apply`) still upload state unconditionally on every \
-                     backend — a concurrent maintenance or governance command can silently \
-                     overwrite a run's committed state. Avoid running them alongside a pipeline \
-                     run; tracked in issue #1228"
+                     upload and the `rocky policy` freeze/unfreeze ledger write on the \
+                     '{backend}' backend, but the remaining ledger-seam writers (`rocky gc`, \
+                     `rocky apply`) still upload state unconditionally on every backend — a \
+                     concurrent maintenance or governance command can silently overwrite a run's \
+                     committed state. Avoid running them alongside a pipeline run; tracked in \
+                     issue #1228"
                 ),
             )
         }
