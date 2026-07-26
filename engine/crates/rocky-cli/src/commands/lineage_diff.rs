@@ -145,7 +145,7 @@ fn format_lineage_diff_markdown(results: &[LineageDiffResult], summary: &DiffSum
     }
 
     out.push_str(&format!(
-        "**{} model(s) changed** ({} modified, {} added, {} removed, {} unchanged)\n\n",
+        "**{} row(s) changed** ({} modified, {} added, {} removed, {} unchanged)\n\n",
         summary.modified + summary.added + summary.removed,
         summary.modified,
         summary.added,
@@ -216,6 +216,7 @@ mod tests {
     fn enrich_returns_empty_consumers_when_compile_missing() {
         let diff = vec![DiffResult {
             model_name: "orders".into(),
+            resolved_target: None,
             status: ModelDiffStatus::Modified,
             row_count_before: None,
             row_count_after: None,
@@ -238,6 +239,7 @@ mod tests {
         // available, we don't fall back to base.
         let diff = vec![DiffResult {
             model_name: "orders".into(),
+            resolved_target: None,
             status: ModelDiffStatus::Modified,
             row_count_before: None,
             row_count_after: None,
