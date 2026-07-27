@@ -5852,23 +5852,32 @@ fn apply_shadow_rewrite(
         );
     }
 
-    let dependencies: HashMap<String, Vec<String>> = compile_result
-        .project
-        .dag_nodes
-        .iter()
-        .map(|node| (node.name.clone(), node.depends_on.clone()))
-        .collect();
     for model in &mut compile_result.project.models {
         let Some((_, own_shadow)) = routes.get(&model.config.name) else {
             continue;
         };
 
-        let renames: HashMap<String, rocky_sql::defer::DeferTarget> = dependencies
-            .get(&model.config.name)
-            .into_iter()
-            .flatten()
-            .filter_map(|dependency| routes.get(dependency))
-            .cloned()
+        // Redirect a read of ANY *other* selected model's production target,
+        // not just the models named in this one's `depends_on`. The declared
+        // graph is not a complete read set: `resolve::classify_table_ref`
+        // auto-derives a dependency only from a BARE single-part name that
+        // matches a model name, so a model reading an in-run upstream by its
+        // physical `schema.table` (classified `SourceRef`) or
+        // `catalog.schema.table` (`RawRef`) name gets no edge — and would
+        // otherwise keep reading production while writing its shadow target.
+        // `commands::containment` refuses to trust `dag_nodes` for the same
+        // reason. Keyed by the upstream's production identity, which is what
+        // `rewrite_upstream_refs` tail-matches against.
+        //
+        // A model's OWN identity is excluded: a self-read (an incremental
+        // model's `WHERE ts > (SELECT MAX(ts) FROM <own target>)`) must keep
+        // reading the production watermark. That read is read-only, and
+        // pointing it at the not-yet-populated shadow target would change what
+        // the model computes.
+        let renames: HashMap<String, rocky_sql::defer::DeferTarget> = routes
+            .iter()
+            .filter(|(name, _)| name.as_str() != model.config.name.as_str())
+            .map(|(_, route)| route.clone())
             .collect();
         if !renames.is_empty() {
             let outcome = rocky_sql::defer::rewrite_upstream_refs(&model.sql, &renames)
@@ -16416,6 +16425,89 @@ timestamp_column = "ts"
             ),
         )
         .expect("write model toml");
+    }
+
+    /// An in-run upstream read spelled as a physical `schema.table` name must
+    /// be routed to that upstream's shadow target even when the sidecar
+    /// declares no `depends_on`.
+    ///
+    /// The declared graph is not a complete read set:
+    /// `rocky_compiler::resolve::classify_table_ref` auto-derives a dependency
+    /// only from a BARE single-part name matching a model name, so a two-part
+    /// `main.orders` is classified `SourceRef` and produces no DAG edge.
+    /// Routing off `depends_on` alone therefore left such a model writing its
+    /// shadow target while still reading production — the containment ledger
+    /// refuses to trust `dag_nodes` for exactly this reason.
+    ///
+    /// The bare-name model is the control: it proves the rewrite is reached at
+    /// all, so a failure of the qualified assertion isolates the regression.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_routes_undeclared_physical_upstream_reads() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        // Control: a bare-name read auto-derives `depends_on = ["orders"]`.
+        write_model_with_target(
+            &models_dir,
+            "mart_bare",
+            "SELECT id FROM orders",
+            "main",
+            "mart_bare",
+        );
+        // Regression: a two-part physical read declares nothing.
+        write_model_with_target(
+            &models_dir,
+            "mart_qualified",
+            "SELECT id FROM main.orders",
+            "main",
+            "mart_qualified",
+        );
+
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        assert!(
+            compiled
+                .project
+                .dag_nodes
+                .iter()
+                .any(|n| n.name == "mart_qualified" && n.depends_on.is_empty()),
+            "premise: a two-part physical read must not auto-derive a dependency"
+        );
+
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &dialect,
+        )
+        .expect("shadow rewrite must succeed");
+
+        let sql_of = |name: &str| {
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == name)
+                .unwrap_or_else(|| panic!("model {name} missing"))
+                .sql
+                .to_ascii_lowercase()
+        };
+        assert!(
+            sql_of("mart_bare").contains("orders_rocky_shadow"),
+            "control: a declared bare-name upstream read must be routed to the shadow target"
+        );
+        assert!(
+            sql_of("mart_qualified").contains("orders_rocky_shadow"),
+            "an undeclared physical upstream read must not keep reading production"
+        );
     }
 
     #[cfg(feature = "duckdb")]

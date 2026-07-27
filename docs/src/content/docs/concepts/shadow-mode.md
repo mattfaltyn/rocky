@@ -20,6 +20,14 @@ identities that cannot yet be isolated by rewriting only the warehouse target.
 Rocky also rejects a derived shadow target that matches any configured
 production target or another selected shadow target.
 
+A model that reads another selected model's table is routed to that upstream's
+shadow target whether or not it declares the dependency in `depends_on` —
+matching is on the upstream's configured `catalog.schema.table`, so a physical
+read is redirected too. When a reference could resolve to more than one
+selected upstream (two models whose targets share a name in different
+catalogs, read as a bare or partially qualified name), Rocky refuses the run
+rather than guess which one to read.
+
 ## Shadow target rewriting
 
 ### Suffix mode (default)
