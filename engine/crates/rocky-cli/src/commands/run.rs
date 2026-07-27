@@ -5852,6 +5852,16 @@ fn apply_shadow_rewrite(
         );
     }
 
+    // Reverse index of the rename keys, so a key that `rewrite_upstream_refs`
+    // reports as rewritten can be mapped back to the model that produces it.
+    let owner_by_key: HashMap<&str, &str> = routes
+        .iter()
+        .map(|(name, (original_key, _))| (original_key.as_str(), name.as_str()))
+        .collect();
+    // Edges discovered by the rewrite: `(consumer, producer)`. Collected here
+    // and applied to `dag_nodes` after the loop, which holds `models` mutably.
+    let mut derived_edges: Vec<(String, String)> = Vec::new();
+
     for model in &mut compile_result.project.models {
         let Some((_, own_shadow)) = routes.get(&model.config.name) else {
             continue;
@@ -5894,12 +5904,61 @@ fn apply_shadow_rewrite(
                 outcome.ambiguous_refs,
                 model.config.name
             );
+            // Every reference actually redirected is now a read of a table
+            // THIS run produces, so it is a real dependency regardless of what
+            // the sidecar declared. Record it: without the edge the producer
+            // and consumer can share an execution layer and the consumer reads
+            // a shadow target that has not been written yet.
+            for key in &outcome.rewritten_keys {
+                if let Some(producer) = owner_by_key.get(key.as_str())
+                    && *producer != model.config.name.as_str()
+                {
+                    derived_edges.push((model.config.name.clone(), (*producer).to_string()));
+                }
+            }
             model.sql = outcome.sql;
         }
 
         model.config.target.catalog = own_shadow.catalog.clone();
         model.config.target.schema = own_shadow.schema.clone();
         model.config.target.table = own_shadow.table.clone();
+    }
+
+    // Apply the derived edges and re-derive the execution plan. The compile
+    // pass computed `execution_order` / `layers` from the declared graph
+    // before this rewrite existed, so they must be recomputed or the new
+    // dependencies would not be honored. A rewrite that introduces a cycle
+    // (two models physically reading each other's targets) surfaces here as a
+    // `DagError` and fails the run rather than executing in an arbitrary order.
+    if !derived_edges.is_empty() {
+        let mut added = 0usize;
+        for (consumer, producer) in derived_edges {
+            let Some(node) = compile_result
+                .project
+                .dag_nodes
+                .iter_mut()
+                .find(|n| n.name == consumer)
+            else {
+                continue;
+            };
+            if !node.depends_on.contains(&producer) {
+                node.depends_on.push(producer);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            let nodes = &compile_result.project.dag_nodes;
+            let execution_order = rocky_ir::dag::topological_sort(nodes).with_context(|| {
+                "shadow mode redirected an upstream read that introduces a dependency cycle; \
+                 the models cannot be ordered safely"
+            })?;
+            let layers = rocky_ir::dag::execution_layers(nodes).with_context(|| {
+                "shadow mode redirected an upstream read that introduces a dependency cycle; \
+                 the models cannot be layered safely"
+            })?;
+            compile_result.project.execution_order = execution_order;
+            compile_result.project.layers = layers;
+        }
     }
 
     Ok(())

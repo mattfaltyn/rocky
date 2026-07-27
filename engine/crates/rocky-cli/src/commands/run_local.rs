@@ -1508,6 +1508,77 @@ auto_create_schemas = true
         );
     }
 
+    /// Routing an undeclared physical upstream read to the producer's shadow
+    /// target creates a real dependency, so execution must order the producer
+    /// first even though the sidecar declares no `depends_on`. Without the
+    /// derived edge the two models share an execution layer and the consumer
+    /// reads a shadow table its producer has not written yet.
+    #[tokio::test]
+    async fn transformation_shadow_orders_undeclared_physical_upstream() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+
+        write_model(
+            &models_dir,
+            "orders",
+            "SELECT * FROM (VALUES (1)) AS t(id)",
+            &[],
+        );
+        // Seed production with the dependency declared. A project whose
+        // physical read is undeclared cannot build on a FRESH warehouse at all
+        // — the producer and consumer share a layer and the consumer runs
+        // first — which is the separate, pre-existing ordering gap. Declaring
+        // it here establishes the steady state this test is about: production
+        // tables already exist, so the shadow run is the only thing under test.
+        write_model(
+            &models_dir,
+            "mart",
+            "SELECT id FROM main.orders",
+            &["orders"],
+        );
+        write_config(dir, &db, "");
+        let config_path = dir.join("rocky.toml");
+
+        run_full_dag(&config_path, &state_path, false, None, None).await;
+        assert_eq!(count_rows(&db, "orders").await, 1);
+        assert_eq!(count_rows(&db, "mart").await, 1);
+
+        // Now drop the declaration: the read is physical and undeclared.
+        write_model(&models_dir, "mart", "SELECT id FROM main.orders", &[]);
+        write_model(
+            &models_dir,
+            "orders",
+            "SELECT * FROM (VALUES (1), (2)) AS t(id)",
+            &[],
+        );
+        let shadow = rocky_core::shadow::ShadowConfig {
+            cleanup_after: false,
+            ..Default::default()
+        };
+        run_full_dag(&config_path, &state_path, false, Some(&shadow), None).await;
+
+        assert_eq!(
+            count_rows(&db, "orders").await,
+            1,
+            "shadow must not overwrite production"
+        );
+        assert_eq!(
+            count_rows(&db, "orders_rocky_shadow").await,
+            2,
+            "producer must materialize its shadow target"
+        );
+        assert_eq!(
+            count_rows(&db, "mart_rocky_shadow").await,
+            2,
+            "consumer must read the producer's shadow target, which requires the producer to \
+             have run first"
+        );
+    }
+
     /// A transformation shadow run must materialize the rewritten physical
     /// target and leave the production table untouched. Exercise both CLI
     /// routing modes: the default suffix and branch-style schema override.
