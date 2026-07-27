@@ -5720,6 +5720,11 @@ fn apply_shadow_rewrite(
     model_set: Option<&std::collections::BTreeSet<String>>,
     config: &rocky_core::shadow::ShadowConfig,
     dialect: &dyn rocky_core::traits::SqlDialect,
+    // `[resilience] contain_failures`. When on, execution follows the
+    // containment ledger's augmented layers, which own both the ordering and
+    // the cyclic-subgraph recovery — so this function must not recompute or
+    // hard-fail the plan.
+    contain_failures: bool,
 ) -> Result<()> {
     use std::collections::HashMap;
 
@@ -5745,6 +5750,9 @@ fn apply_shadow_rewrite(
     }
     let mut shadow_owners: HashMap<String, String> = HashMap::new();
     let mut routes: HashMap<String, (String, rocky_sql::defer::DeferTarget)> = HashMap::new();
+    // Routed models that materialize nothing, so no reader may be redirected to
+    // their shadow target and no ordering edge may point at them.
+    let mut ephemeral_models: std::collections::HashSet<String> = std::collections::HashSet::new();
     for model in &compile_result.project.models {
         if !is_selected(&model.config.name) {
             continue;
@@ -5764,10 +5772,25 @@ fn apply_shadow_rewrite(
                     model.config.name
                 );
             }
+            // Ephemeral models are inlined as CTEs and never materialized —
+            // `sql_gen::generate_transformation_sql` returns no statements for
+            // them — so their configured target is nominal. They are still
+            // ROUTED (their target is rewritten below) because the governance
+            // snapshot is captured from these same models and its reconcile
+            // loops issue adapter calls against `target_*` without checking
+            // strategy or whether anything was materialized. Leaving an
+            // ephemeral target on production would let a shadow run apply that
+            // model's tags / masks / retention to the PRODUCTION table.
+            //
+            // They are excluded from the reader renames and the edge index
+            // below instead: nothing creates their shadow target, so no reader
+            // may be redirected to it and no ordering edge may depend on it.
+            rocky_core::models::StrategyConfig::Ephemeral => {
+                ephemeral_models.insert(model.config.name.clone());
+            }
             rocky_core::models::StrategyConfig::FullRefresh
             | rocky_core::models::StrategyConfig::Incremental { .. }
             | rocky_core::models::StrategyConfig::Merge { .. }
-            | rocky_core::models::StrategyConfig::Ephemeral
             | rocky_core::models::StrategyConfig::DeleteInsert { .. }
             | rocky_core::models::StrategyConfig::Microbatch { .. }
             | rocky_core::models::StrategyConfig::View
@@ -5854,8 +5877,11 @@ fn apply_shadow_rewrite(
 
     // Reverse index of the rename keys, so a key that `rewrite_upstream_refs`
     // reports as rewritten can be mapped back to the model that produces it.
+    // Ephemeral models are absent: they materialize nothing, so they can never
+    // be the producer an ordering edge should wait on.
     let owner_by_key: HashMap<&str, &str> = routes
         .iter()
+        .filter(|(name, _)| !ephemeral_models.contains(name.as_str()))
         .map(|(name, (original_key, _))| (original_key.as_str(), name.as_str()))
         .collect();
     // Edges discovered by the rewrite: `(consumer, producer)`. Collected here
@@ -5884,9 +5910,16 @@ fn apply_shadow_rewrite(
         // reading the production watermark. That read is read-only, and
         // pointing it at the not-yet-populated shadow target would change what
         // the model computes.
+        //
+        // Ephemeral upstreams are excluded too: they are inlined as CTEs and
+        // materialize nothing, so their shadow target is never created and a
+        // redirected read would resolve to a table that does not exist.
         let renames: HashMap<String, rocky_sql::defer::DeferTarget> = routes
             .iter()
-            .filter(|(name, _)| name.as_str() != model.config.name.as_str())
+            .filter(|(name, _)| {
+                name.as_str() != model.config.name.as_str()
+                    && !ephemeral_models.contains(name.as_str())
+            })
             .map(|(_, route)| route.clone())
             .collect();
         if !renames.is_empty() {
@@ -5946,15 +5979,28 @@ fn apply_shadow_rewrite(
                 added += 1;
             }
         }
-        if added > 0 {
+        // With `[resilience] contain_failures`, execution does not follow
+        // `project.layers` at all — it follows
+        // `ContainmentLedger::augmented_layers`, which derives its own ordering
+        // from the full ref-union-physical edge set (so it already orders a
+        // physical reader after its producer) and, on a cycle, CONTAINS the
+        // stuck set while still layering and running the acyclic remainder.
+        // Recomputing here would be ignored, and hard-failing on a cycle would
+        // preempt that documented recovery — turning "contain A and B, run C"
+        // into "run nothing". Leave the plan to the containment path.
+        if added > 0 && !contain_failures {
             let nodes = &compile_result.project.dag_nodes;
             let execution_order = rocky_ir::dag::topological_sort(nodes).with_context(|| {
                 "shadow mode redirected an upstream read that introduces a dependency cycle; \
-                 the models cannot be ordered safely"
+                 the models cannot be ordered safely. Declare the dependencies via depends_on \
+                 and remove the cycle, or enable `[resilience] contain_failures` to contain the \
+                 cyclic models and run the rest"
             })?;
             let layers = rocky_ir::dag::execution_layers(nodes).with_context(|| {
                 "shadow mode redirected an upstream read that introduces a dependency cycle; \
-                 the models cannot be layered safely"
+                 the models cannot be layered safely. Declare the dependencies via depends_on \
+                 and remove the cycle, or enable `[resilience] contain_failures` to contain the \
+                 cyclic models and run the rest"
             })?;
             compile_result.project.execution_order = execution_order;
             compile_result.project.layers = layers;
@@ -6879,6 +6925,7 @@ pub(crate) async fn execute_models(
             model_set,
             config,
             warehouse.dialect(),
+            resilience.contain_failures,
         )?;
         output.shadow = true;
     }
@@ -16546,6 +16593,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::shadow::ShadowConfig::default(),
             &dialect,
+            false,
         )
         .expect("shadow rewrite must succeed");
 
@@ -16566,6 +16614,93 @@ timestamp_column = "ts"
         assert!(
             sql_of("mart_qualified").contains("orders_rocky_shadow"),
             "an undeclared physical upstream read must not keep reading production"
+        );
+    }
+
+    /// An ephemeral model materializes nothing, so no reader may be redirected
+    /// to its shadow target — but its target must still be rewritten off
+    /// production. `GovernanceSnapshot::capture` reads these same models and
+    /// its reconcile loops issue `apply_column_tags` / `apply_masking_policy` /
+    /// `apply_retention_policy` / `set_tags` against `target_*` without
+    /// consulting the strategy, so an ephemeral target left on production would
+    /// let a shadow run mutate PRODUCTION governance metadata.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_routes_ephemeral_target_but_never_redirects_readers_to_it() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        std::fs::write(models_dir.join("eph.sql"), "SELECT 1 AS id\n").expect("write sql");
+        std::fs::write(
+            models_dir.join("eph.toml"),
+            "[strategy]\ntype = \"ephemeral\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"eph\"\n",
+        )
+        .expect("write toml");
+        // Reads the ephemeral model's nominal target by physical name.
+        write_model_with_target(
+            &models_dir,
+            "consumer",
+            "SELECT id FROM main.eph",
+            "main",
+            "consumer",
+        );
+
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &dialect,
+            false,
+        )
+        .expect("shadow rewrite must succeed");
+
+        let model = |name: &str| {
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == name)
+                .unwrap_or_else(|| panic!("model {name} missing"))
+        };
+
+        // The ephemeral target is rewritten, so nothing downstream of the
+        // governance snapshot can address the production table.
+        assert_eq!(
+            model("eph").config.target.table,
+            "eph_rocky_shadow",
+            "an ephemeral target must not stay on production during a shadow run"
+        );
+        // But no reader is pointed at that never-created table.
+        assert!(
+            model("consumer")
+                .sql
+                .to_ascii_lowercase()
+                .contains("main.eph")
+                && !model("consumer")
+                    .sql
+                    .to_ascii_lowercase()
+                    .contains("eph_rocky_shadow"),
+            "a read of an ephemeral model must not be redirected to its shadow target: {:?}",
+            model("consumer").sql
+        );
+        // And no ordering edge waits on a model that materializes nothing.
+        assert!(
+            compiled
+                .project
+                .dag_nodes
+                .iter()
+                .find(|n| n.name == "consumer")
+                .is_some_and(|n| !n.depends_on.iter().any(|d| d == "eph")),
+            "no derived edge may name an ephemeral producer"
         );
     }
 
@@ -16594,7 +16729,7 @@ timestamp_column = "ts"
         let config = rocky_core::shadow::ShadowConfig::default();
 
         let content_addressed =
-            super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect)
+            super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect, false)
                 .expect_err("content-addressed shadow must fail closed");
         assert!(
             content_addressed
@@ -16611,7 +16746,7 @@ timestamp_column = "ts"
                 first_partition: Some("2026-01-01".to_string()),
             };
         let time_interval =
-            super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect)
+            super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect, false)
                 .expect_err("time-interval shadow must fail closed");
         assert!(
             time_interval
@@ -16656,8 +16791,9 @@ timestamp_column = "ts"
             cleanup_after: false,
             schema_override: None,
         };
-        let err = super::apply_shadow_rewrite(&mut compiled, None, None, &empty_suffix, &dialect)
-            .expect_err("an empty suffix must not route back to production");
+        let err =
+            super::apply_shadow_rewrite(&mut compiled, None, None, &empty_suffix, &dialect, false)
+                .expect_err("an empty suffix must not route back to production");
         assert!(
             err.to_string()
                 .contains("collides with the production target")
@@ -16669,9 +16805,15 @@ timestamp_column = "ts"
             cleanup_after: false,
             ..Default::default()
         };
-        let err =
-            super::apply_shadow_rewrite(&mut compiled, None, None, &production_schema, &dialect)
-                .expect_err("a production schema override must fail closed");
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &production_schema,
+            &dialect,
+            false,
+        )
+        .expect_err("a production schema override must fail closed");
         assert!(
             err.to_string()
                 .contains("collides with the production target")
@@ -16684,6 +16826,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::shadow::ShadowConfig::default(),
             &dialect,
+            false,
         )
         .expect_err("the default suffix must not overwrite another model's production target");
         assert!(
@@ -16697,8 +16840,9 @@ timestamp_column = "ts"
             cleanup_after: false,
             ..Default::default()
         };
-        let err = super::apply_shadow_rewrite(&mut compiled, None, None, &shared_schema, &dialect)
-            .expect_err("selected models must not share a derived shadow target");
+        let err =
+            super::apply_shadow_rewrite(&mut compiled, None, None, &shared_schema, &dialect, false)
+                .expect_err("selected models must not share a derived shadow target");
         assert!(err.to_string().contains("is shared by selected models"));
     }
 
