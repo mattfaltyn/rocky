@@ -54,6 +54,18 @@ depends_on = ["ingest"]
 adapter = "default"
 "#;
 
+const TRANSFORMATION_ONLY_ROCKY_TOML: &str = r#"
+[adapter]
+type = "duckdb"
+path = "fixture.duckdb"
+
+[pipeline.transform]
+type = "transformation"
+
+[pipeline.transform.target]
+adapter = "default"
+"#;
+
 const MODEL_SQL: &str = "SELECT order_id, customer_id, amount FROM raw__orders.orders\n";
 
 const MODEL_TOML: &str = r#"
@@ -132,5 +144,39 @@ fn run_dag_json_stdout_is_a_single_json_document() {
     assert!(
         stderr.contains("Copied"),
         "expected the replication summary on stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn run_dag_fails_when_model_loading_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    fs::write(dir.join("rocky.toml"), TRANSFORMATION_ONLY_ROCKY_TOML).expect("write rocky.toml");
+    let models_dir = dir.join("models");
+    fs::create_dir(&models_dir).expect("mkdir models");
+    fs::write(models_dir.join("broken.sql"), "SELECT 1 AS id\n").expect("write model sql");
+    fs::write(models_dir.join("broken.toml"), "name = [\n").expect("write malformed model toml");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("-c")
+        .arg(dir.join("rocky.toml"))
+        .arg("run")
+        .arg("--dag")
+        .arg("--output")
+        .arg("json")
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("spawn rocky");
+
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert!(
+        !out.status.success(),
+        "malformed models must fail the DAG run\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("failed to load models from"),
+        "expected the model-load error on stderr, got:\n{stderr}"
     );
 }

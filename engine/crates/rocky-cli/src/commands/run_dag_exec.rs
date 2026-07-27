@@ -177,7 +177,7 @@ pub async fn run_with_dag(
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
     let models_dir = config_dir.join("models");
     let models = if models_dir.is_dir() {
-        super::dag::load_all_models(&models_dir).unwrap_or_default()
+        super::dag::load_all_models(&models_dir)?
     } else {
         Vec::new()
     };
