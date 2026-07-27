@@ -419,6 +419,12 @@ rocky run --filter client=acme --shadow
 rocky compare --filter client=acme
 ```
 
+Shadow and branch runs fail closed when the selected transformation set
+contains a `content_addressed` or `time_interval` model because those
+strategies require additional storage or partition-state isolation. They also
+fail closed when the chosen suffix or schema would collide with a production
+target or another selected shadow target.
+
 Or run against a named branch:
 
 ```bash

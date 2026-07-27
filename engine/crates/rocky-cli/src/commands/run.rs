@@ -1629,6 +1629,7 @@ pub async fn run(
             None,
             &schema_cache_cfg,
             auto_create_schemas,
+            shadow_config,
             defer_opts,
             skip_gate,
             // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
@@ -1964,6 +1965,7 @@ pub async fn run(
                 output_json,
                 partition_opts,
                 &schema_cache_cfg,
+                shadow_config,
                 skip_gate,
                 // `--no-reuse` — the force-BUILD escape hatch for the
                 // content-addressed surface (point-to reuse AND the
@@ -4691,7 +4693,8 @@ pub async fn run(
             // fire. Wrap both calls so subscribers see
             // `pipeline_error` before the error reaches the caller.
             // #1093: the block's `Ok` payload is the `GovernanceSnapshot`
-            // `execute_models` captured at the fingerprint gate — threaded out
+            // `execute_models` captured from the fingerprint-gated compile —
+            // after execution-only target routing — and threaded out
             // so the governance reconcile below applies the gated set, never a
             // fresh disk compile.
             let exec_result: Result<GovernanceSnapshot> = async {
@@ -4709,6 +4712,7 @@ pub async fn run(
                     Some(pipeline_name),
                     &schema_cache_cfg,
                     pipeline.target.governance.auto_create_schemas,
+                    shadow_config,
                     // No `--model` selection on the full-pipeline path, so
                     // `apply_defer_rewrite` is a no-op even when `--defer` is
                     // set (a full run builds every model).
@@ -4802,7 +4806,8 @@ pub async fn run(
             // mirroring the `apply_grants` semantics earlier in this path.
             //
             // #1093: the reconcile iterates the `GovernanceSnapshot` that
-            // `execute_models` captured at the fingerprint gate — the fresh
+            // `execute_models` captured from the fingerprint-gated compile —
+            // after execution-only target routing — and the fresh
             // disk compile that used to run here is gone, so a post-execution
             // sidecar edit cannot change what governance is applied. The
             // env-resolved mask mapping is deliberately NOT part of the
@@ -5706,6 +5711,191 @@ fn apply_defer_rewrite(
     Ok(())
 }
 
+/// Route the models built by this invocation and their in-run dependency reads
+/// to shadow targets. Deferred or otherwise unselected upstreams stay on their
+/// production targets.
+fn apply_shadow_rewrite(
+    compile_result: &mut rocky_compiler::compile::CompileResult,
+    model_name_filter: Option<&str>,
+    model_set: Option<&std::collections::BTreeSet<String>>,
+    config: &rocky_core::shadow::ShadowConfig,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    let is_selected = |name: &str| {
+        model_name_filter.is_none_or(|selected| selected == name)
+            && model_set.is_none_or(|set| set.contains(name))
+    };
+    let target_identity = |catalog: &str, schema: &str, table: &str| {
+        format!("{catalog}.{schema}.{table}").to_ascii_lowercase()
+    };
+
+    let quote_style = (dialect.name() == "bigquery").then_some('`');
+    let mut production_targets: HashMap<String, Vec<String>> = HashMap::new();
+    for model in &compile_result.project.models {
+        production_targets
+            .entry(target_identity(
+                &model.config.target.catalog,
+                &model.config.target.schema,
+                &model.config.target.table,
+            ))
+            .or_default()
+            .push(model.config.name.clone());
+    }
+    let mut shadow_owners: HashMap<String, String> = HashMap::new();
+    let mut routes: HashMap<String, (String, rocky_sql::defer::DeferTarget)> = HashMap::new();
+    for model in &compile_result.project.models {
+        if !is_selected(&model.config.name) {
+            continue;
+        }
+        match &model.config.strategy {
+            rocky_core::models::StrategyConfig::ContentAddressed { .. } => {
+                anyhow::bail!(
+                    "shadow/branch execution is not supported for content-addressed model '{}': \
+                     its object-storage prefix cannot yet be isolated safely",
+                    model.config.name
+                );
+            }
+            rocky_core::models::StrategyConfig::TimeInterval { .. } => {
+                anyhow::bail!(
+                    "shadow/branch execution is not supported for time-interval model '{}': \
+                     its partition state cannot yet be isolated safely",
+                    model.config.name
+                );
+            }
+            rocky_core::models::StrategyConfig::FullRefresh
+            | rocky_core::models::StrategyConfig::Incremental { .. }
+            | rocky_core::models::StrategyConfig::Merge { .. }
+            | rocky_core::models::StrategyConfig::Ephemeral
+            | rocky_core::models::StrategyConfig::DeleteInsert { .. }
+            | rocky_core::models::StrategyConfig::Microbatch { .. }
+            | rocky_core::models::StrategyConfig::View
+            | rocky_core::models::StrategyConfig::MaterializedView
+            | rocky_core::models::StrategyConfig::DynamicTable { .. } => {}
+        }
+
+        let original = rocky_ir::TargetRef {
+            catalog: model.config.target.catalog.clone(),
+            schema: model.config.target.schema.clone(),
+            table: model.config.target.table.clone(),
+        };
+        let shadow = rocky_core::shadow::shadow_target(&original, config);
+        if !shadow.catalog.is_empty() {
+            if quote_style.is_some() {
+                rocky_sql::validation::validate_gcp_project_id(&shadow.catalog).with_context(
+                    || {
+                        format!(
+                            "shadow target for model '{}' has an invalid BigQuery project ID",
+                            model.config.name
+                        )
+                    },
+                )?;
+            } else {
+                rocky_sql::validation::validate_identifier(&shadow.catalog).with_context(|| {
+                    format!(
+                        "shadow target for model '{}' has an invalid catalog identifier",
+                        model.config.name
+                    )
+                })?;
+            }
+        }
+        rocky_sql::validation::validate_identifier(&shadow.schema).with_context(|| {
+            format!(
+                "shadow target for model '{}' has an invalid schema identifier",
+                model.config.name
+            )
+        })?;
+        rocky_sql::validation::validate_identifier(&shadow.table).with_context(|| {
+            format!(
+                "shadow target for model '{}' has an invalid table identifier",
+                model.config.name
+            )
+        })?;
+
+        let original_key = target_identity(&original.catalog, &original.schema, &original.table);
+        let shadow_key = target_identity(&shadow.catalog, &shadow.schema, &shadow.table);
+        if let Some(production_models) = production_targets.get(&shadow_key) {
+            anyhow::bail!(
+                "shadow target '{}.{}.{}' for model '{}' collides with the production target of \
+                 model(s) {}. Choose a non-empty suffix or a dedicated shadow schema that cannot \
+                 overlap a production target",
+                shadow.catalog,
+                shadow.schema,
+                shadow.table,
+                model.config.name,
+                production_models.join(", "),
+            );
+        }
+        if let Some(existing_model) = shadow_owners.insert(shadow_key, model.config.name.clone()) {
+            anyhow::bail!(
+                "shadow target '{}.{}.{}' is shared by selected models '{}' and '{}'. Choose a \
+                 suffix or shadow schema that preserves a distinct target for every model",
+                shadow.catalog,
+                shadow.schema,
+                shadow.table,
+                existing_model,
+                model.config.name,
+            );
+        }
+        routes.insert(
+            model.config.name.clone(),
+            (
+                original_key,
+                rocky_sql::defer::DeferTarget {
+                    catalog: shadow.catalog,
+                    schema: shadow.schema,
+                    table: shadow.table,
+                    quote_style,
+                },
+            ),
+        );
+    }
+
+    let dependencies: HashMap<String, Vec<String>> = compile_result
+        .project
+        .dag_nodes
+        .iter()
+        .map(|node| (node.name.clone(), node.depends_on.clone()))
+        .collect();
+    for model in &mut compile_result.project.models {
+        let Some((_, own_shadow)) = routes.get(&model.config.name) else {
+            continue;
+        };
+
+        let renames: HashMap<String, rocky_sql::defer::DeferTarget> = dependencies
+            .get(&model.config.name)
+            .into_iter()
+            .flatten()
+            .filter_map(|dependency| routes.get(dependency))
+            .cloned()
+            .collect();
+        if !renames.is_empty() {
+            let outcome = rocky_sql::defer::rewrite_upstream_refs(&model.sql, &renames)
+                .with_context(|| {
+                    format!(
+                        "shadow mode could not rewrite upstream references in model '{}'",
+                        model.config.name
+                    )
+                })?;
+            anyhow::ensure!(
+                outcome.ambiguous_refs.is_empty(),
+                "shadow mode cannot safely route ambiguous upstream reference(s) {:?} in model \
+                 '{}'",
+                outcome.ambiguous_refs,
+                model.config.name
+            );
+            model.sql = outcome.sql;
+        }
+
+        model.config.target.catalog = own_shadow.catalog.clone();
+        model.config.target.schema = own_shadow.schema.clone();
+        model.config.target.table = own_shadow.table.clone();
+    }
+
+    Ok(())
+}
+
 /// The model phase completed cleanly: `execute_models` returned `Ok(())` AND it
 /// recorded NO new table failures (`failures_after == failures_before`).
 ///
@@ -5922,6 +6112,7 @@ pub(crate) async fn execute_backfill_set(
             // Target schemas already exist (the closure was built before); do not
             // auto-create, matching the `--model` entry point.
             false,
+            None, // backfills always target production
             &DeferOptions::default(),
             skip_gate,
             reuse_enabled,
@@ -6086,7 +6277,8 @@ pub(crate) struct GovernedModelGovernance {
 }
 
 /// The governance inputs of the exact compiled set [`execute_models`]
-/// executed, captured at the fingerprint-gate position (#1093).
+/// executed, captured from the fingerprint-gated compile after execution-only
+/// target routing (#1093).
 ///
 /// The post-execution reconcile sites (the replication/DAG classification +
 /// masking + retention + tags reconcile, and [`apply_model_governance_tags`]
@@ -6108,7 +6300,8 @@ pub(crate) struct GovernanceSnapshot {
 
 impl GovernanceSnapshot {
     /// Capture the governance inputs of `models` — the compiled set the
-    /// fingerprint gate verified (when governed), before defer mutates SQL.
+    /// fingerprint gate verified (when governed), after execution-only target
+    /// routing so governance follows the physical tables that were written.
     pub(crate) fn capture(models: &[rocky_core::models::Model]) -> Self {
         Self {
             models: models
@@ -6133,7 +6326,7 @@ impl GovernanceSnapshot {
 /// full-replication/DAG path runs after a clean model phase (§1.1 + §1.2).
 ///
 /// #1093: iterates the [`GovernanceSnapshot`] captured inside
-/// [`execute_models`] at the fingerprint gate — never a fresh disk compile —
+/// [`execute_models`] from the fingerprint-gated compile — never a fresh disk compile —
 /// with the SAME adapter calls in the SAME order the recompile-driven loop
 /// made: `apply_column_tags` → `apply_masking_policy` →
 /// `apply_retention_policy` → `set_tags`, per model, in compiled model order.
@@ -6275,6 +6468,10 @@ pub(crate) async fn execute_models(
     // `pipeline.target.governance.auto_create_schemas` here; defaults to
     // `false` for the model-only entry point that has no pipeline context.
     auto_create_schemas: bool,
+    // Physical target routing for `--shadow` / `--branch`. Applied after the
+    // governed fingerprint and `--defer` rewrite, but before schema creation,
+    // execution, state/reuse identity, metadata, and governance capture.
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
     // `--defer` selection state. When enabled (and a `model_name_filter` is
     // set), every project model NOT in the selection is treated as a deferred
     // upstream: the selected models' bare `ref()`s to those upstreams are
@@ -6549,16 +6746,6 @@ pub(crate) async fn execute_models(
         gate.verify(&compile_result.project.models, &extras)?;
     }
 
-    // #1093: capture the governance snapshot HERE — position-keyed to the
-    // fingerprint gate above (the verify runs only on governed paths; this
-    // capture is unconditional at this position) and BEFORE the `--defer`
-    // rewrite below mutates any SQL — so the snapshot reflects the exact
-    // gated, pre-defer compiled set. The post-execution reconcile sites
-    // consume THIS value instead of fresh-compiling from disk, so a
-    // post-execution `.sql`/`.toml` edit cannot change what governance is
-    // applied out from under the fingerprint that gated execution.
-    let governance_snapshot = GovernanceSnapshot::capture(&compile_result.project.models);
-
     // Per-model compile errors are first-class run failures, not silent
     // skips. Each model that fails to type-check (e.g. E020 — a
     // `time_interval` model whose `time_column` is absent from its SELECT
@@ -6616,6 +6803,23 @@ pub(crate) async fn execute_models(
             warehouse.dialect(),
         )?;
     }
+
+    if let Some(config) = shadow_config {
+        apply_shadow_rewrite(
+            &mut compile_result,
+            model_name_filter,
+            model_set,
+            config,
+            warehouse.dialect(),
+        )?;
+        output.shadow = true;
+    }
+
+    // #1093: capture governance from the same in-memory model set the
+    // fingerprint gate verified, after execution-only defer SQL and physical
+    // shadow-target rewrites. No files are re-read, and governance follows the
+    // exact physical targets this run materializes.
+    let governance_snapshot = GovernanceSnapshot::capture(&compile_result.project.models);
 
     // §P2.6 emit: compile_complete — fires once after a successful
     // compile pass, with the model count from the compiled project.
@@ -8437,7 +8641,7 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
 /// classification/retention governance posture on the replication path.
 ///
 /// #1093: reads the [`GovernanceSnapshot`] the caller's [`execute_models`]
-/// captured at the fingerprint gate — the internal recompile this function
+/// captured from the fingerprint-gated compile — the internal recompile this function
 /// used to run is gone, so a post-execution sidecar edit cannot change which
 /// tags are applied. The old compile inputs (`models_dir`, the config's
 /// mask/classification/freshness sections, `run_vars`) fed only that deleted
@@ -14798,6 +15002,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -14875,6 +15080,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true, // auto_create_schemas
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -14912,6 +15118,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15099,6 +15306,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15339,6 +15547,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15426,6 +15635,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15482,6 +15692,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15670,6 +15881,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15714,6 +15926,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true, // auto_create_schemas — the fixtures target `marts`
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15764,6 +15977,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -16202,6 +16416,139 @@ timestamp_column = "ts"
             ),
         )
         .expect("write model toml");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_targets_with_unisolated_external_state() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        std::fs::write(models_dir.join("events.sql"), "SELECT 1 AS id\n").expect("write model sql");
+        std::fs::write(
+            models_dir.join("events.toml"),
+            "[strategy]\ntype = \"content_addressed\"\n\
+             storage_prefix = \"s3://bucket/production/events\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"events\"\n",
+        )
+        .expect("write model config");
+
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile model");
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let config = rocky_core::shadow::ShadowConfig::default();
+
+        let content_addressed =
+            super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect)
+                .expect_err("content-addressed shadow must fail closed");
+        assert!(
+            content_addressed
+                .to_string()
+                .contains("object-storage prefix cannot yet be isolated safely")
+        );
+
+        compiled.project.models[0].config.strategy =
+            rocky_core::models::StrategyConfig::TimeInterval {
+                time_column: "id".to_string(),
+                granularity: rocky_ir::TimeGrain::Day,
+                lookback: 0,
+                batch_size: std::num::NonZeroU32::new(1).unwrap(),
+                first_partition: Some("2026-01-01".to_string()),
+            };
+        let time_interval =
+            super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect)
+                .expect_err("time-interval shadow must fail closed");
+        assert!(
+            time_interval
+                .to_string()
+                .contains("partition state cannot yet be isolated safely")
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_production_and_cross_model_target_collisions() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "reserved_shadow",
+            "SELECT 2 AS id",
+            "main",
+            "orders_rocky_shadow",
+        );
+        write_model_with_target(
+            &models_dir,
+            "regional_orders",
+            "SELECT 3 AS id",
+            "regional",
+            "orders",
+        );
+        let compile = || {
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir: models_dir.clone(),
+                ..Default::default()
+            })
+            .expect("compile models")
+        };
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let mut compiled = compile();
+        let empty_suffix = rocky_core::shadow::ShadowConfig {
+            suffix: String::new(),
+            cleanup_after: false,
+            schema_override: None,
+        };
+        let err = super::apply_shadow_rewrite(&mut compiled, None, None, &empty_suffix, &dialect)
+            .expect_err("an empty suffix must not route back to production");
+        assert!(
+            err.to_string()
+                .contains("collides with the production target")
+        );
+
+        let mut compiled = compile();
+        let production_schema = rocky_core::shadow::ShadowConfig {
+            schema_override: Some("main".to_string()),
+            cleanup_after: false,
+            ..Default::default()
+        };
+        let err =
+            super::apply_shadow_rewrite(&mut compiled, None, None, &production_schema, &dialect)
+                .expect_err("a production schema override must fail closed");
+        assert!(
+            err.to_string()
+                .contains("collides with the production target")
+        );
+
+        let mut compiled = compile();
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &dialect,
+        )
+        .expect_err("the default suffix must not overwrite another model's production target");
+        assert!(
+            err.to_string()
+                .contains("collides with the production target")
+        );
+
+        let mut compiled = compile();
+        let shared_schema = rocky_core::shadow::ShadowConfig {
+            schema_override: Some("isolated_shadow".to_string()),
+            cleanup_after: false,
+            ..Default::default()
+        };
+        let err = super::apply_shadow_rewrite(&mut compiled, None, None, &shared_schema, &dialect)
+            .expect_err("selected models must not share a derived shadow target");
+        assert!(err.to_string().contains("is shared by selected models"));
     }
 
     /// Finding 1 (physical-table read escapes containment). A raw-SQL model
@@ -16844,6 +17191,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -16952,6 +17300,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &defer_opts,
             super::SkipGateConfig::off(),
             false,
@@ -17075,6 +17424,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -17359,6 +17709,7 @@ timestamp_column = "ts"
                 None,
                 &rocky_core::config::SchemaCacheConfig::default(),
                 false,
+                None, // shadow_config (test)
                 &DeferOptions::default(),
                 super::SkipGateConfig::off(),
                 false,
@@ -17486,6 +17837,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             gate,
             false,
@@ -18463,6 +18815,7 @@ timestamp_column = "ts"
                 None,
                 &rocky_core::config::SchemaCacheConfig::default(),
                 false,
+                None, // shadow_config (test)
                 &DeferOptions::default(),
                 active_gate(true, 0),
                 false,

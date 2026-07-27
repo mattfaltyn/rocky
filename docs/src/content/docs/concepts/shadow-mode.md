@@ -14,6 +14,12 @@ Shadow mode writes pipeline output to shadow tables instead of (or alongside) pr
 3. A comparison engine checks row counts, schemas, and optionally sample data between shadow and production
 4. Results show pass/warn/fail with detailed diffs
 
+Shadow and branch runs currently reject `content_addressed` and `time_interval`
+models. Those strategies also persist object-storage or partition-state
+identities that cannot yet be isolated by rewriting only the warehouse target.
+Rocky also rejects a derived shadow target that matches any configured
+production target or another selected shadow target.
+
 ## Shadow target rewriting
 
 ### Suffix mode (default)
