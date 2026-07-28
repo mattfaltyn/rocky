@@ -1629,6 +1629,7 @@ pub async fn run(
             None,
             &schema_cache_cfg,
             auto_create_schemas,
+            shadow_config,
             defer_opts,
             skip_gate,
             // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
@@ -1964,6 +1965,7 @@ pub async fn run(
                 output_json,
                 partition_opts,
                 &schema_cache_cfg,
+                shadow_config,
                 skip_gate,
                 // `--no-reuse` — the force-BUILD escape hatch for the
                 // content-addressed surface (point-to reuse AND the
@@ -4691,7 +4693,8 @@ pub async fn run(
             // fire. Wrap both calls so subscribers see
             // `pipeline_error` before the error reaches the caller.
             // #1093: the block's `Ok` payload is the `GovernanceSnapshot`
-            // `execute_models` captured at the fingerprint gate — threaded out
+            // `execute_models` captured from the fingerprint-gated compile —
+            // after execution-only target routing — and threaded out
             // so the governance reconcile below applies the gated set, never a
             // fresh disk compile.
             let exec_result: Result<GovernanceSnapshot> = async {
@@ -4709,6 +4712,7 @@ pub async fn run(
                     Some(pipeline_name),
                     &schema_cache_cfg,
                     pipeline.target.governance.auto_create_schemas,
+                    shadow_config,
                     // No `--model` selection on the full-pipeline path, so
                     // `apply_defer_rewrite` is a no-op even when `--defer` is
                     // set (a full run builds every model).
@@ -4802,7 +4806,8 @@ pub async fn run(
             // mirroring the `apply_grants` semantics earlier in this path.
             //
             // #1093: the reconcile iterates the `GovernanceSnapshot` that
-            // `execute_models` captured at the fingerprint gate — the fresh
+            // `execute_models` captured from the fingerprint-gated compile —
+            // after execution-only target routing — and the fresh
             // disk compile that used to run here is gone, so a post-execution
             // sidecar edit cannot change what governance is applied. The
             // env-resolved mask mapping is deliberately NOT part of the
@@ -5608,12 +5613,13 @@ fn apply_defer_rewrite(
     };
 
     // BigQuery is the one shipping dialect whose qualified parts (the project /
-    // catalog) may contain characters bare SQL identifiers reject — hyphens.
-    // For it the catalog is validated with the GCP-project rule and the
-    // rewritten reference is backtick-quoted to match `format_table_ref`; every
-    // other dialect keeps the strict identifier rule and renders bare names.
+    // catalog) may contain characters bare SQL identifiers reject — hyphens, so
+    // only it validates the catalog with the GCP-project rule. Quoting is a
+    // separate question and is answered per dialect: Snowflake and Trino also
+    // quote every component of a target, so a bare rewritten read would fold
+    // case and name a different object.
     let is_bigquery = dialect.name() == "bigquery";
-    let quote_style: Option<char> = if is_bigquery { Some('`') } else { None };
+    let quote_style: Option<char> = rewrite_quote_style(dialect)?;
 
     // Validate the `--defer-to` schema override once up front — it is user
     // input that ends up serialized into SQL. Schemas/datasets never carry
@@ -5701,6 +5707,478 @@ fn apply_defer_rewrite(
                 )
             })?;
         model.sql = rewritten;
+    }
+
+    Ok(())
+}
+
+/// Identifier quoting a rewritten upstream reference must use so that it names
+/// the same object the producer's DDL creates.
+///
+/// This has to track `SqlDialect::format_table_ref` exactly: a producer writes
+/// its target through that method, and a rewritten read is re-serialized here,
+/// so the two must render the same object the same way.
+///
+/// Each value below is read off that dialect's `format_table_ref`, which is
+/// in-repo and checkable. This function deliberately does not reason about how
+/// any warehouse folds identifier case — that is a separate question answered by
+/// [`dialect_case_sensitive_identity`], and conflating the two is what made an
+/// earlier revision of this code wrong.
+///
+/// Unknown dialects fail closed. A new adapter that quotes its targets would
+/// otherwise inherit bare rendering silently, which is exactly the defect this
+/// function exists to prevent.
+fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<Option<char>> {
+    match dialect.name() {
+        // `format_table_ref` renders bare identifiers.
+        "duckdb" | "databricks" => Ok(None),
+        // `format_table_ref` renders backticks; its own comment gives the
+        // reason (project IDs may contain hyphens).
+        "bigquery" => Ok(Some('`')),
+        // `format_table_ref` renders double quotes on both.
+        "snowflake" | "trino" => Ok(Some('"')),
+        other => anyhow::bail!(
+            "cannot rewrite upstream references for dialect '{other}': its identifier quoting \
+             is unknown, so a rewritten reference could name a different object than the one \
+             the producing model creates. Add '{other}' to `rewrite_quote_style` after \
+             checking how its `format_table_ref` quotes each component"
+        ),
+    }
+}
+
+/// Whether this dialect treats identifier case as part of object identity.
+///
+/// Deliberately separate from [`rewrite_quote_style`]. Quoting is a rendering
+/// question and case-sensitivity is an identity one, and they do not imply each
+/// other: BigQuery is backtick-quoted because project IDs may contain hyphens,
+/// not because of case, and a dialect could just as well be case-sensitive
+/// without quoting. Reading one off the other risks both a needless refusal on
+/// a quoted-but-case-insensitive dialect and, worse, silence on a
+/// case-sensitive one that renders bare.
+///
+/// This matters because upstream references are matched case-insensitively, so
+/// only where case is part of identity can two targets differing by case be
+/// two different objects that a rewrite could confuse.
+///
+/// This answers one narrow question: can two configured targets that differ
+/// only by case be two different objects? It is NOT a specification of how a
+/// reference should be compared per component, and must not be used as one — a
+/// warehouse may well apply different rules to the catalog than to the schema
+/// and table. Making `rewrite_upstream_refs` case-aware therefore needs
+/// per-component semantics, established per dialect, rather than this boolean.
+///
+/// Each entry is taken from the warehouse's own documentation, not inferred
+/// from how Rocky renders a target — rendering and identity are independent, and
+/// deriving one from the other is what produced a wrong answer here before.
+/// DuckDB makes the point: it quotes with double quotes yet treats even quoted
+/// identifiers case-insensitively, the opposite of PostgreSQL.
+///
+/// Re-confirm against the vendor when adding a dialect.
+///
+/// Unknown dialects fail closed.
+fn dialect_case_sensitive_identity(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<bool> {
+    match dialect.name() {
+        // Two targets differing only by case name one object.
+        //
+        // DuckDB: "Identifiers ... are always case-insensitive ... DuckDB also
+        // treats quoted identifiers as case-insensitive" (case is preserved for
+        // display only) — duckdb.org/docs/stable/sql/dialect/keywords_and_identifiers
+        // Databricks: identifiers are case-insensitive, delimited ones included;
+        // Unity Catalog stores names lower-cased —
+        // docs.databricks.com/aws/en/sql/language-manual/sql-ref-identifiers
+        // Trino: "Identifiers are not treated as case sensitive" —
+        // trino.io/docs/current/language/reserved.html
+        "duckdb" | "databricks" | "trino" => Ok(false),
+        // Two targets differing only by case can name two objects.
+        //
+        // BigQuery: dataset and table names are case-sensitive by default, so
+        // `mydataset` and `MyDataset` coexist; a dataset may opt out with
+        // `is_case_insensitive` — docs.cloud.google.com/bigquery/docs/datasets
+        // Snowflake: an unquoted identifier is stored and resolved upper-cased,
+        // a double-quoted one "exactly as entered, including case"; an account
+        // may opt out with QUOTED_IDENTIFIERS_IGNORE_CASE —
+        // docs.snowflake.com/en/sql-reference/identifiers-syntax
+        //
+        // Both opt-outs would only ever make a rejected run acceptable, never
+        // the reverse, so assuming the default is the fail-closed choice.
+        "bigquery" | "snowflake" => Ok(true),
+        other => anyhow::bail!(
+            "shadow/branch execution does not know whether '{other}' treats identifier case as \
+             part of object identity, so it cannot tell whether two targets differing only by \
+             case name one object or two. Add '{other}' to \
+             `dialect_case_sensitive_identity` after checking how it folds identifiers"
+        ),
+    }
+}
+
+/// Route the models built by this invocation and their in-run dependency reads
+/// to shadow targets. Deferred or otherwise unselected upstreams stay on their
+/// production targets.
+fn apply_shadow_rewrite(
+    compile_result: &mut rocky_compiler::compile::CompileResult,
+    model_name_filter: Option<&str>,
+    model_set: Option<&std::collections::BTreeSet<String>>,
+    config: &rocky_core::shadow::ShadowConfig,
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    // `[resilience] contain_failures`. When on, execution follows the
+    // containment ledger's augmented layers, which own both the ordering and
+    // the cyclic-subgraph recovery — so this function must not recompute or
+    // hard-fail the plan.
+    contain_failures: bool,
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    let is_selected = |name: &str| {
+        model_name_filter.is_none_or(|selected| selected == name)
+            && model_set.is_none_or(|set| set.contains(name))
+    };
+    let target_identity = |catalog: &str, schema: &str, table: &str| {
+        format!("{catalog}.{schema}.{table}").to_ascii_lowercase()
+    };
+
+    let quote_style = rewrite_quote_style(dialect)?;
+
+    let mut production_targets: HashMap<String, Vec<String>> = HashMap::new();
+    for model in &compile_result.project.models {
+        production_targets
+            .entry(target_identity(
+                &model.config.target.catalog,
+                &model.config.target.schema,
+                &model.config.target.table,
+            ))
+            .or_default()
+            .push(model.config.name.clone());
+    }
+    let mut shadow_owners: HashMap<String, String> = HashMap::new();
+    let mut routes: HashMap<String, (String, rocky_sql::defer::DeferTarget)> = HashMap::new();
+    for model in &compile_result.project.models {
+        if !is_selected(&model.config.name) {
+            continue;
+        }
+        match &model.config.strategy {
+            rocky_core::models::StrategyConfig::ContentAddressed { .. } => {
+                anyhow::bail!(
+                    "shadow/branch execution is not supported for content-addressed model '{}': \
+                     its object-storage prefix cannot yet be isolated safely",
+                    model.config.name
+                );
+            }
+            rocky_core::models::StrategyConfig::TimeInterval { .. } => {
+                anyhow::bail!(
+                    "shadow/branch execution is not supported for time-interval model '{}': \
+                     its partition state cannot yet be isolated safely",
+                    model.config.name
+                );
+            }
+            // Ephemeral models emit no statements
+            // (`sql_gen::generate_transformation_sql` returns an empty vec), and
+            // the comments throughout this codebase describe them as "inlined as
+            // CTEs in downstream queries". No such inlining exists: nothing in
+            // `rocky-compiler` or `rocky-sql` rewrites a consumer's `FROM eph`
+            // into a CTE, and the dbt importer states outright that
+            // `materialized='ephemeral'` has no Rocky equivalent.
+            //
+            // So a consumer of an ephemeral model reads whatever physical table
+            // happens to carry that name. Under shadow that is the PRODUCTION
+            // table — the one thing this routing exists to prevent — and no
+            // rewrite here can fix it, because there is no shadow object to
+            // point the read at. Fail closed until inlining is real, the same
+            // way the two strategies above do.
+            rocky_core::models::StrategyConfig::Ephemeral => {
+                anyhow::bail!(
+                    "shadow/branch execution is not supported for ephemeral model '{}': \
+                     ephemeral models are not materialized and are not inlined into their \
+                     consumers, so a consumer would read the production table instead of an \
+                     isolated one. Give the model a materialized strategy to shadow it",
+                    model.config.name
+                );
+            }
+            rocky_core::models::StrategyConfig::FullRefresh
+            | rocky_core::models::StrategyConfig::Incremental { .. }
+            | rocky_core::models::StrategyConfig::Merge { .. }
+            | rocky_core::models::StrategyConfig::DeleteInsert { .. }
+            | rocky_core::models::StrategyConfig::Microbatch { .. }
+            | rocky_core::models::StrategyConfig::View
+            | rocky_core::models::StrategyConfig::MaterializedView
+            | rocky_core::models::StrategyConfig::DynamicTable { .. } => {}
+        }
+
+        let original = rocky_ir::TargetRef {
+            catalog: model.config.target.catalog.clone(),
+            schema: model.config.target.schema.clone(),
+            table: model.config.target.table.clone(),
+        };
+        let shadow = rocky_core::shadow::shadow_target(&original, config);
+        if !shadow.catalog.is_empty() {
+            // BigQuery specifically, not "any quoted dialect": Snowflake and
+            // Trino quote their targets too but their catalogs still follow the
+            // strict identifier rule, so the GCP project rule must not apply.
+            if dialect.name() == "bigquery" {
+                rocky_sql::validation::validate_gcp_project_id(&shadow.catalog).with_context(
+                    || {
+                        format!(
+                            "shadow target for model '{}' has an invalid BigQuery project ID",
+                            model.config.name
+                        )
+                    },
+                )?;
+            } else {
+                rocky_sql::validation::validate_identifier(&shadow.catalog).with_context(|| {
+                    format!(
+                        "shadow target for model '{}' has an invalid catalog identifier",
+                        model.config.name
+                    )
+                })?;
+            }
+        }
+        rocky_sql::validation::validate_identifier(&shadow.schema).with_context(|| {
+            format!(
+                "shadow target for model '{}' has an invalid schema identifier",
+                model.config.name
+            )
+        })?;
+        rocky_sql::validation::validate_identifier(&shadow.table).with_context(|| {
+            format!(
+                "shadow target for model '{}' has an invalid table identifier",
+                model.config.name
+            )
+        })?;
+
+        let original_key = target_identity(&original.catalog, &original.schema, &original.table);
+        let shadow_key = target_identity(&shadow.catalog, &shadow.schema, &shadow.table);
+        if let Some(production_models) = production_targets.get(&shadow_key) {
+            anyhow::bail!(
+                "shadow target '{}.{}.{}' for model '{}' collides with the production target of \
+                 model(s) {}. Choose a non-empty suffix or a dedicated shadow schema that cannot \
+                 overlap a production target",
+                shadow.catalog,
+                shadow.schema,
+                shadow.table,
+                model.config.name,
+                production_models.join(", "),
+            );
+        }
+        if let Some(existing_model) = shadow_owners.insert(shadow_key, model.config.name.clone()) {
+            anyhow::bail!(
+                "shadow target '{}.{}.{}' is shared by selected models '{}' and '{}'. Choose a \
+                 suffix or shadow schema that preserves a distinct target for every model",
+                shadow.catalog,
+                shadow.schema,
+                shadow.table,
+                existing_model,
+                model.config.name,
+            );
+        }
+        routes.insert(
+            model.config.name.clone(),
+            (
+                original_key,
+                rocky_sql::defer::DeferTarget {
+                    catalog: shadow.catalog,
+                    schema: shadow.schema,
+                    table: shadow.table,
+                    quote_style,
+                },
+            ),
+        );
+    }
+
+    // Target identity is case-folded, and so is the tail match inside
+    // `rewrite_upstream_refs`. Where the dialect makes case part of object
+    // identity that is a lossy key: `"Orders"` and `"orders"` are two distinct
+    // Snowflake tables that fold to one identity, so a read of one could be
+    // redirected to the other's shadow. Keyed on that declared property rather
+    // than on whether the dialect quotes — the two are independent, and reading
+    // one off the other would go quiet on a case-sensitive dialect that renders
+    // bare identifiers.
+    //
+    // The risk exists only where a rename is actually applied. A model's own
+    // identity is excluded from its rename set, so a run that routes a single
+    // model rewrites nothing at all and cannot misdirect anything however its
+    // target is spelled — rejecting that would fail a provably safe
+    // `--model` run. Below two routed models the check is therefore skipped
+    // entirely. Above it, the trigger is a routed model, while the collision
+    // partner is drawn from every compiled model: a read of an unselected
+    // `"Orders"` still tail-matches the rename key of a selected `"orders"`.
+    if dialect_case_sensitive_identity(dialect)? && routes.len() > 1 {
+        let mut folded: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for model in &compile_result.project.models {
+            let exact = format!(
+                "{}.{}.{}",
+                model.config.target.catalog, model.config.target.schema, model.config.target.table
+            );
+            folded
+                .entry(exact.to_ascii_lowercase())
+                .or_default()
+                .push((exact, model.config.name.clone()));
+        }
+        for model in &compile_result.project.models {
+            if !routes.contains_key(&model.config.name) {
+                continue;
+            }
+            let exact = format!(
+                "{}.{}.{}",
+                model.config.target.catalog, model.config.target.schema, model.config.target.table
+            );
+            let Some(group) = folded.get(&exact.to_ascii_lowercase()) else {
+                continue;
+            };
+            // Any other spelling of the same folded name is a different object
+            // on this dialect, and the rename matches case-insensitively, so a
+            // read of either could land on this model's shadow. Refuse.
+            //
+            // Deliberately unconditional on whether some model actually spells
+            // such a read today. Earlier revisions tried to require that
+            // evidence and it was wrong four times over — a scan of the SQL text
+            // cannot tell a table reference from a column, alias, literal or
+            // comment of the same name, and reconstructing the matcher's
+            // resolution from outside the matcher is what kept failing. The
+            // durable fix is to make `rewrite_upstream_refs` case-sensitive when
+            // the dialect quotes identifiers, after which this guard can go
+            // entirely; until then this errs toward refusing a run the operator
+            // can unblock by renaming, rather than silently reading the wrong
+            // table.
+            if let Some((other_exact, other_model)) =
+                group.iter().find(|(candidate, _)| *candidate != exact)
+            {
+                anyhow::bail!(
+                    "shadow/branch execution cannot distinguish the targets of models '{}' \
+                     ('{}') and '{}' ('{}'): they differ only by case, which this dialect \
+                     treats as two different objects, while upstream references are matched \
+                     case-insensitively. Rename one target so the two differ by more than \
+                     case, or scope the run so it routes only one of them",
+                    other_model,
+                    other_exact,
+                    model.config.name,
+                    exact,
+                );
+            }
+        }
+    }
+
+    // Reverse index of the rename keys, so a key that `rewrite_upstream_refs`
+    // reports as rewritten can be mapped back to the model that produces it.
+    // Every routed model materializes something: strategies that do not are
+    // rejected above.
+    let owner_by_key: HashMap<&str, &str> = routes
+        .iter()
+        .map(|(name, (original_key, _))| (original_key.as_str(), name.as_str()))
+        .collect();
+    // Edges discovered by the rewrite: `(consumer, producer)`. Collected here
+    // and applied to `dag_nodes` after the loop, which holds `models` mutably.
+    let mut derived_edges: Vec<(String, String)> = Vec::new();
+
+    for model in &mut compile_result.project.models {
+        let Some((_, own_shadow)) = routes.get(&model.config.name) else {
+            continue;
+        };
+
+        // Redirect a read of ANY *other* selected model's production target,
+        // not just the models named in this one's `depends_on`. The declared
+        // graph is not a complete read set: `resolve::classify_table_ref`
+        // auto-derives a dependency only from a BARE single-part name that
+        // matches a model name, so a model reading an in-run upstream by its
+        // physical `schema.table` (classified `SourceRef`) or
+        // `catalog.schema.table` (`RawRef`) name gets no edge — and would
+        // otherwise keep reading production while writing its shadow target.
+        // `commands::containment` refuses to trust `dag_nodes` for the same
+        // reason. Keyed by the upstream's production identity, which is what
+        // `rewrite_upstream_refs` tail-matches against.
+        //
+        // A model's OWN identity is excluded: a self-read (an incremental
+        // model's `WHERE ts > (SELECT MAX(ts) FROM <own target>)`) must keep
+        // reading the production watermark. That read is read-only, and
+        // pointing it at the not-yet-populated shadow target would change what
+        // the model computes.
+        //
+        let renames: HashMap<String, rocky_sql::defer::DeferTarget> = routes
+            .iter()
+            .filter(|(name, _)| name.as_str() != model.config.name.as_str())
+            .map(|(_, route)| route.clone())
+            .collect();
+        if !renames.is_empty() {
+            let outcome = rocky_sql::defer::rewrite_upstream_refs(&model.sql, &renames)
+                .with_context(|| {
+                    format!(
+                        "shadow mode could not rewrite upstream references in model '{}'",
+                        model.config.name
+                    )
+                })?;
+            anyhow::ensure!(
+                outcome.ambiguous_refs.is_empty(),
+                "shadow mode cannot safely route ambiguous upstream reference(s) {:?} in model \
+                 '{}'",
+                outcome.ambiguous_refs,
+                model.config.name
+            );
+            // Every reference actually redirected is now a read of a table
+            // THIS run produces, so it is a real dependency regardless of what
+            // the sidecar declared. Record it: without the edge the producer
+            // and consumer can share an execution layer and the consumer reads
+            // a shadow target that has not been written yet.
+            for key in &outcome.rewritten_keys {
+                if let Some(producer) = owner_by_key.get(key.as_str())
+                    && *producer != model.config.name.as_str()
+                {
+                    derived_edges.push((model.config.name.clone(), (*producer).to_string()));
+                }
+            }
+            model.sql = outcome.sql;
+        }
+
+        model.config.target.catalog = own_shadow.catalog.clone();
+        model.config.target.schema = own_shadow.schema.clone();
+        model.config.target.table = own_shadow.table.clone();
+    }
+
+    // Apply the derived edges and re-derive the execution plan. The compile
+    // pass computed `execution_order` / `layers` from the declared graph
+    // before this rewrite existed, so they must be recomputed or the new
+    // dependencies would not be honored. A rewrite that introduces a cycle
+    // (two models physically reading each other's targets) surfaces here as a
+    // `DagError` and fails the run rather than executing in an arbitrary order.
+    if !derived_edges.is_empty() {
+        let mut added = 0usize;
+        for (consumer, producer) in derived_edges {
+            let Some(node) = compile_result
+                .project
+                .dag_nodes
+                .iter_mut()
+                .find(|n| n.name == consumer)
+            else {
+                continue;
+            };
+            if !node.depends_on.contains(&producer) {
+                node.depends_on.push(producer);
+                added += 1;
+            }
+        }
+        // With `[resilience] contain_failures`, execution does not follow
+        // `project.layers` at all — it follows
+        // `ContainmentLedger::augmented_layers`, which derives its own ordering
+        // from the full ref-union-physical edge set (so it already orders a
+        // physical reader after its producer) and, on a cycle, CONTAINS the
+        // stuck set while still layering and running the acyclic remainder.
+        // Recomputing here would be ignored, and hard-failing on a cycle would
+        // preempt that documented recovery — turning "contain A and B, run C"
+        // into "run nothing". Leave the plan to the containment path.
+        if added > 0 && !contain_failures {
+            let nodes = &compile_result.project.dag_nodes;
+            let execution_order = rocky_ir::dag::topological_sort(nodes).with_context(|| {
+                "shadow mode redirected an upstream read that introduces a dependency cycle; \
+                 the models cannot be ordered safely. Declare the dependencies via depends_on \
+                 and remove the cycle, or enable `[resilience] contain_failures` to contain the \
+                 cyclic models and run the rest"
+            })?;
+            let layers = rocky_ir::dag::execution_layers(nodes).with_context(|| {
+                "shadow mode redirected an upstream read that introduces a dependency cycle; \
+                 the models cannot be layered safely. Declare the dependencies via depends_on \
+                 and remove the cycle, or enable `[resilience] contain_failures` to contain the \
+                 cyclic models and run the rest"
+            })?;
+            compile_result.project.execution_order = execution_order;
+            compile_result.project.layers = layers;
+        }
     }
 
     Ok(())
@@ -5922,6 +6400,7 @@ pub(crate) async fn execute_backfill_set(
             // Target schemas already exist (the closure was built before); do not
             // auto-create, matching the `--model` entry point.
             false,
+            None, // backfills always target production
             &DeferOptions::default(),
             skip_gate,
             reuse_enabled,
@@ -6086,7 +6565,8 @@ pub(crate) struct GovernedModelGovernance {
 }
 
 /// The governance inputs of the exact compiled set [`execute_models`]
-/// executed, captured at the fingerprint-gate position (#1093).
+/// executed, captured from the fingerprint-gated compile after execution-only
+/// target routing (#1093).
 ///
 /// The post-execution reconcile sites (the replication/DAG classification +
 /// masking + retention + tags reconcile, and [`apply_model_governance_tags`]
@@ -6108,7 +6588,8 @@ pub(crate) struct GovernanceSnapshot {
 
 impl GovernanceSnapshot {
     /// Capture the governance inputs of `models` — the compiled set the
-    /// fingerprint gate verified (when governed), before defer mutates SQL.
+    /// fingerprint gate verified (when governed), after execution-only target
+    /// routing so governance follows the physical tables that were written.
     pub(crate) fn capture(models: &[rocky_core::models::Model]) -> Self {
         Self {
             models: models
@@ -6133,7 +6614,7 @@ impl GovernanceSnapshot {
 /// full-replication/DAG path runs after a clean model phase (§1.1 + §1.2).
 ///
 /// #1093: iterates the [`GovernanceSnapshot`] captured inside
-/// [`execute_models`] at the fingerprint gate — never a fresh disk compile —
+/// [`execute_models`] from the fingerprint-gated compile — never a fresh disk compile —
 /// with the SAME adapter calls in the SAME order the recompile-driven loop
 /// made: `apply_column_tags` → `apply_masking_policy` →
 /// `apply_retention_policy` → `set_tags`, per model, in compiled model order.
@@ -6275,6 +6756,10 @@ pub(crate) async fn execute_models(
     // `pipeline.target.governance.auto_create_schemas` here; defaults to
     // `false` for the model-only entry point that has no pipeline context.
     auto_create_schemas: bool,
+    // Physical target routing for `--shadow` / `--branch`. Applied after the
+    // governed fingerprint and `--defer` rewrite, but before schema creation,
+    // execution, state/reuse identity, metadata, and governance capture.
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
     // `--defer` selection state. When enabled (and a `model_name_filter` is
     // set), every project model NOT in the selection is treated as a deferred
     // upstream: the selected models' bare `ref()`s to those upstreams are
@@ -6549,16 +7034,6 @@ pub(crate) async fn execute_models(
         gate.verify(&compile_result.project.models, &extras)?;
     }
 
-    // #1093: capture the governance snapshot HERE — position-keyed to the
-    // fingerprint gate above (the verify runs only on governed paths; this
-    // capture is unconditional at this position) and BEFORE the `--defer`
-    // rewrite below mutates any SQL — so the snapshot reflects the exact
-    // gated, pre-defer compiled set. The post-execution reconcile sites
-    // consume THIS value instead of fresh-compiling from disk, so a
-    // post-execution `.sql`/`.toml` edit cannot change what governance is
-    // applied out from under the fingerprint that gated execution.
-    let governance_snapshot = GovernanceSnapshot::capture(&compile_result.project.models);
-
     // Per-model compile errors are first-class run failures, not silent
     // skips. Each model that fails to type-check (e.g. E020 — a
     // `time_interval` model whose `time_column` is absent from its SELECT
@@ -6616,6 +7091,24 @@ pub(crate) async fn execute_models(
             warehouse.dialect(),
         )?;
     }
+
+    if let Some(config) = shadow_config {
+        apply_shadow_rewrite(
+            &mut compile_result,
+            model_name_filter,
+            model_set,
+            config,
+            warehouse.dialect(),
+            resilience.contain_failures,
+        )?;
+        output.shadow = true;
+    }
+
+    // #1093: capture governance from the same in-memory model set the
+    // fingerprint gate verified, after execution-only defer SQL and physical
+    // shadow-target rewrites. No files are re-read, and governance follows the
+    // exact physical targets this run materializes.
+    let governance_snapshot = GovernanceSnapshot::capture(&compile_result.project.models);
 
     // §P2.6 emit: compile_complete — fires once after a successful
     // compile pass, with the model count from the compiled project.
@@ -6704,6 +7197,16 @@ pub(crate) async fn execute_models(
         let mut targets: std::collections::BTreeSet<(String, String)> =
             std::collections::BTreeSet::new();
         for model in &compile_result.project.models {
+            // Only models this invocation will actually build. Pre-creating a
+            // schema for a model that is filtered out is wasted work in an
+            // ordinary run, and under `--shadow` it is an isolation break: the
+            // unselected model still carries its PRODUCTION target, so a shadow
+            // run would create production schemas.
+            if model_name_filter.is_some_and(|selected| selected != model.config.name)
+                || model_set.is_some_and(|set| !set.contains(&model.config.name))
+            {
+                continue;
+            }
             targets.insert((
                 model.config.target.catalog.clone(),
                 model.config.target.schema.clone(),
@@ -8437,7 +8940,7 @@ fn transformation_strategy_name(strategy: &MaterializationStrategy) -> &'static 
 /// classification/retention governance posture on the replication path.
 ///
 /// #1093: reads the [`GovernanceSnapshot`] the caller's [`execute_models`]
-/// captured at the fingerprint gate — the internal recompile this function
+/// captured from the fingerprint-gated compile — the internal recompile this function
 /// used to run is gone, so a post-execution sidecar edit cannot change which
 /// tags are applied. The old compile inputs (`models_dir`, the config's
 /// mask/classification/freshness sections, `run_vars`) fed only that deleted
@@ -14798,6 +15301,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -14875,6 +15379,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true, // auto_create_schemas
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -14912,6 +15417,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15099,6 +15605,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15339,6 +15846,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15426,6 +15934,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15482,6 +15991,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15670,6 +16180,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15714,6 +16225,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             true, // auto_create_schemas — the fixtures target `marts`
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -15764,6 +16276,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -16202,6 +16715,664 @@ timestamp_column = "ts"
             ),
         )
         .expect("write model toml");
+    }
+
+    /// An in-run upstream read spelled as a physical `schema.table` name must
+    /// be routed to that upstream's shadow target even when the sidecar
+    /// declares no `depends_on`.
+    ///
+    /// The declared graph is not a complete read set:
+    /// `rocky_compiler::resolve::classify_table_ref` auto-derives a dependency
+    /// only from a BARE single-part name matching a model name, so a two-part
+    /// `main.orders` is classified `SourceRef` and produces no DAG edge.
+    /// Routing off `depends_on` alone therefore left such a model writing its
+    /// shadow target while still reading production — the containment ledger
+    /// refuses to trust `dag_nodes` for exactly this reason.
+    ///
+    /// The bare-name model is the control: it proves the rewrite is reached at
+    /// all, so a failure of the qualified assertion isolates the regression.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_routes_undeclared_physical_upstream_reads() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        // Control: a bare-name read auto-derives `depends_on = ["orders"]`.
+        write_model_with_target(
+            &models_dir,
+            "mart_bare",
+            "SELECT id FROM orders",
+            "main",
+            "mart_bare",
+        );
+        // Regression: a two-part physical read declares nothing.
+        write_model_with_target(
+            &models_dir,
+            "mart_qualified",
+            "SELECT id FROM main.orders",
+            "main",
+            "mart_qualified",
+        );
+
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        assert!(
+            compiled
+                .project
+                .dag_nodes
+                .iter()
+                .any(|n| n.name == "mart_qualified" && n.depends_on.is_empty()),
+            "premise: a two-part physical read must not auto-derive a dependency"
+        );
+
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &dialect,
+            false,
+        )
+        .expect("shadow rewrite must succeed");
+
+        let sql_of = |name: &str| {
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == name)
+                .unwrap_or_else(|| panic!("model {name} missing"))
+                .sql
+                .to_ascii_lowercase()
+        };
+        assert!(
+            sql_of("mart_bare").contains("orders_rocky_shadow"),
+            "control: a declared bare-name upstream read must be routed to the shadow target"
+        );
+        assert!(
+            sql_of("mart_qualified").contains("orders_rocky_shadow"),
+            "an undeclared physical upstream read must not keep reading production"
+        );
+    }
+
+    /// An ephemeral model materializes nothing and — despite what the comments
+    /// around `sql_gen` claim — is never inlined into its consumers, so a
+    /// consumer's `FROM eph` resolves to whatever physical table carries that
+    /// name. Under shadow that is the production table, and no rewrite can fix
+    /// it because there is no shadow object to point the read at. Shadow mode
+    /// must therefore refuse the run rather than quietly read production.
+    /// A rewritten upstream read has to render the same way the producer's DDL
+    /// does, because both name the same object. Snowflake and Trino both emit
+    /// every component of a target double-quoted, so the rewritten read must be
+    /// quoted too; DuckDB renders bare. Nothing else in the suite exercises
+    /// these dialects, so this asserts the serialized SQL directly rather than
+    /// reasoning about how each warehouse resolves it.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rewritten_reads_match_the_producer_quoting_per_dialect() {
+        fn rewritten_sql(dialect: &dyn rocky_core::traits::SqlDialect) -> String {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(
+                &models_dir,
+                "mart",
+                "SELECT id FROM main.orders",
+                "main",
+                "mart",
+            );
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            super::apply_shadow_rewrite(
+                &mut compiled,
+                None,
+                None,
+                &rocky_core::shadow::ShadowConfig::default(),
+                dialect,
+                false,
+            )
+            .expect("shadow rewrite must succeed");
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == "mart")
+                .expect("mart missing")
+                .sql
+                .clone()
+        }
+
+        let duck = rewritten_sql(&rocky_duckdb::dialect::DuckDbSqlDialect);
+        assert!(
+            duck.contains("orders_rocky_shadow") && !duck.contains('"'),
+            "DuckDB renders bare identifiers: {duck}"
+        );
+
+        for (name, sql) in [
+            (
+                "snowflake",
+                rewritten_sql(&rocky_snowflake::dialect::SnowflakeSqlDialect),
+            ),
+            ("trino", rewritten_sql(&rocky_trino::dialect::TrinoDialect)),
+        ] {
+            assert!(
+                sql.contains("\"orders_rocky_shadow\""),
+                "{name} quotes its targets, so the rewritten read must be quoted too or it \
+                 folds case and names a different object: {sql}"
+            );
+        }
+    }
+
+    /// A run that routes a single model rewrites nothing — a model's own
+    /// identity is excluded from its rename set — so it cannot misdirect a read
+    /// however its target is spelled. Even a collision against the selected
+    /// model's OWN target must not fail it.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_allows_a_single_model_run_whose_own_target_collides_by_case() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // The one routed model even reads the OTHER spelling. With a single
+        // route there are no renames to apply, so nothing can be redirected and
+        // the read must be left exactly as written.
+        write_model_with_target(
+            &models_dir,
+            "lower",
+            "SELECT id FROM main.Orders",
+            "main",
+            "orders",
+        );
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            Some("lower"),
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect("a single-model run rewrites no reads and must not be rejected");
+        let lower = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "lower")
+            .expect("lower missing");
+        assert_eq!(lower.config.target.table, "orders_rocky_shadow");
+        assert!(
+            lower.sql.contains("main.Orders") && !lower.sql.contains("rocky_shadow"),
+            "a single-model run applies no renames, so the read stays as written: {}",
+            lower.sql
+        );
+        let upper = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "upper")
+            .expect("upper missing");
+        assert_eq!(
+            upper.config.target.table, "Orders",
+            "an unselected model must stay on its production target"
+        );
+    }
+
+    /// A folded name can be shared by three or more targets. Evidence for one
+    /// colliding spelling says nothing about another, so the guard has to weigh
+    /// every partner: here the first one it meets has no ambiguous read and the
+    /// second one does.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_a_later_case_collision_partner() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // Reads the TABLE variant. Nothing anywhere reads the schema variant.
+        write_model_with_target(
+            &models_dir,
+            "driver",
+            "SELECT id FROM main.Orders",
+            "main",
+            "driver",
+        );
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        // Two further spellings of the same folded identity. `a_schema_variant`
+        // sorts first, and no model reads `Main`, so a guard that stopped at the
+        // first partner would clear the run.
+        write_model_with_target(
+            &models_dir,
+            "a_schema_variant",
+            "SELECT 2 AS id",
+            "Main",
+            "orders",
+        );
+        write_model_with_target(
+            &models_dir,
+            "z_table_variant",
+            "SELECT 3 AS id",
+            "main",
+            "Orders",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["driver".to_string(), "lower".to_string()]
+                .into_iter()
+                .collect();
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            Some(&selected),
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("a colliding partner beyond the first must still be rejected");
+        assert!(
+            format!("{err:#}").contains("differ only by case"),
+            "error must explain the collision: {err:#}"
+        );
+    }
+
+    /// On a dialect where identifiers are case-insensitive, two targets that
+    /// differ only by case name the SAME object, so there is nothing to
+    /// disambiguate and the run must proceed.
+    ///
+    /// Covers Trino as well as DuckDB, and Trino is the point: Rocky renders its
+    /// targets double-quoted, yet it is declared case-insensitive. A guard keyed
+    /// on quoting would refuse this run; one keyed on identity does not.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_allows_case_collisions_on_a_case_insensitive_dialect() {
+        for (name, dialect) in [
+            (
+                "duckdb",
+                &rocky_duckdb::dialect::DuckDbSqlDialect as &dyn rocky_core::traits::SqlDialect,
+            ),
+            ("trino", &rocky_trino::dialect::TrinoDialect),
+        ] {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(
+                &models_dir,
+                "driver",
+                "SELECT id FROM main.Orders",
+                "main",
+                "driver",
+            );
+            write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            let selected: std::collections::BTreeSet<String> =
+                ["driver".to_string(), "lower".to_string()]
+                    .into_iter()
+                    .collect();
+            super::apply_shadow_rewrite(
+                &mut compiled,
+                None,
+                Some(&selected),
+                &rocky_core::shadow::ShadowConfig::default(),
+                dialect,
+                false,
+            )
+            .unwrap_or_else(|err| {
+                panic!("{name} folds identifier case, so there is no ambiguity to refuse: {err:#}")
+            });
+        }
+    }
+
+    /// A case collision can sit in the schema or catalog rather than the table.
+    /// `Main.orders` and `main.orders` spell the table identically, so evidence
+    /// keyed on the table alone would find nothing and let the ambiguous read
+    /// through.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_case_collision_in_the_schema_component() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // Reads the unselected model's schema spelling; the table part matches.
+        write_model_with_target(
+            &models_dir,
+            "driver",
+            "SELECT id FROM Main.orders",
+            "main",
+            "driver",
+        );
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "Main", "orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["driver".to_string(), "lower".to_string()]
+                .into_iter()
+                .collect();
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            Some(&selected),
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("a schema-only case collision must be rejected too");
+        assert!(
+            format!("{err:#}").contains("differ only by case"),
+            "error must explain the collision: {err:#}"
+        );
+    }
+
+    /// The case guard must scope its TRIGGER to routed models. Two models that
+    /// collide only by case and are both outside the selected set can never be
+    /// the destination of a rename, so the run is safe and must not be rejected.
+    /// Uses two routed models so the guard actually runs — with one, the
+    /// no-renames short-circuit would decide the outcome instead.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_allows_case_collisions_outside_the_selected_set() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "picked", "SELECT 1 AS id", "main", "picked");
+        write_model_with_target(&models_dir, "also", "SELECT 1 AS id", "main", "also");
+        // Two models that collide only by case, neither of them selected.
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["picked".to_string(), "also".to_string()]
+                .into_iter()
+                .collect();
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            Some(&selected),
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect("a collision the run does not route must not reject it");
+        let picked = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "picked")
+            .expect("picked missing");
+        assert_eq!(picked.config.target.table, "picked_rocky_shadow");
+    }
+
+    /// A routed model whose target case-collides with an UNSELECTED model is the
+    /// gap the shadow-owner check cannot see: the unselected model is never
+    /// routed, so no shared shadow target exists, yet a read of its target still
+    /// folds onto the routed model's rename key and would be redirected to that
+    /// model's shadow. Needs two routed models, because a single one applies no
+    /// renames at all.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_case_collision_between_routed_and_unselected_targets() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // Reads the UNSELECTED model's target in its own spelling. That read
+        // folds onto `lower`'s rename key and would be redirected to `lower`'s
+        // shadow — the misdirection this guard exists to catch.
+        write_model_with_target(
+            &models_dir,
+            "driver",
+            "SELECT id FROM main.Orders",
+            "main",
+            "driver",
+        );
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        // Not selected, so `shadow_owners` never compares against it.
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["driver".to_string(), "lower".to_string()]
+                .into_iter()
+                .collect();
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            Some(&selected),
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("a routed target colliding by case with an unselected one must be rejected");
+        assert!(
+            format!("{err:#}").contains("differ only by case"),
+            "error must explain the collision: {err:#}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_ephemeral_models() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        std::fs::write(models_dir.join("eph.sql"), "SELECT 1 AS id\n").expect("write sql");
+        std::fs::write(
+            models_dir.join("eph.toml"),
+            "[strategy]\ntype = \"ephemeral\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"eph\"\n",
+        )
+        .expect("write toml");
+        // Reads the ephemeral model's nominal target by physical name. Nothing
+        // inlines that read, so under shadow it would resolve to production.
+        write_model_with_target(
+            &models_dir,
+            "consumer",
+            "SELECT id FROM main.eph",
+            "main",
+            "consumer",
+        );
+
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &dialect,
+            false,
+        )
+        .expect_err("an ephemeral model must be rejected, not silently left on production");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("ephemeral model 'eph'") && message.contains("not inlined"),
+            "error must name the model and why it cannot be shadowed: {message}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_targets_with_unisolated_external_state() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        std::fs::write(models_dir.join("events.sql"), "SELECT 1 AS id\n").expect("write model sql");
+        std::fs::write(
+            models_dir.join("events.toml"),
+            "[strategy]\ntype = \"content_addressed\"\n\
+             storage_prefix = \"s3://bucket/production/events\"\n\n\
+             [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"events\"\n",
+        )
+        .expect("write model config");
+
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile model");
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+        let config = rocky_core::shadow::ShadowConfig::default();
+
+        let content_addressed =
+            super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect, false)
+                .expect_err("content-addressed shadow must fail closed");
+        assert!(
+            content_addressed
+                .to_string()
+                .contains("object-storage prefix cannot yet be isolated safely")
+        );
+
+        compiled.project.models[0].config.strategy =
+            rocky_core::models::StrategyConfig::TimeInterval {
+                time_column: "id".to_string(),
+                granularity: rocky_ir::TimeGrain::Day,
+                lookback: 0,
+                batch_size: std::num::NonZeroU32::new(1).unwrap(),
+                first_partition: Some("2026-01-01".to_string()),
+            };
+        let time_interval =
+            super::apply_shadow_rewrite(&mut compiled, None, None, &config, &dialect, false)
+                .expect_err("time-interval shadow must fail closed");
+        assert!(
+            time_interval
+                .to_string()
+                .contains("partition state cannot yet be isolated safely")
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_production_and_cross_model_target_collisions() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "reserved_shadow",
+            "SELECT 2 AS id",
+            "main",
+            "orders_rocky_shadow",
+        );
+        write_model_with_target(
+            &models_dir,
+            "regional_orders",
+            "SELECT 3 AS id",
+            "regional",
+            "orders",
+        );
+        let compile = || {
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir: models_dir.clone(),
+                ..Default::default()
+            })
+            .expect("compile models")
+        };
+        let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let mut compiled = compile();
+        let empty_suffix = rocky_core::shadow::ShadowConfig {
+            suffix: String::new(),
+            cleanup_after: false,
+            schema_override: None,
+        };
+        let err =
+            super::apply_shadow_rewrite(&mut compiled, None, None, &empty_suffix, &dialect, false)
+                .expect_err("an empty suffix must not route back to production");
+        assert!(
+            err.to_string()
+                .contains("collides with the production target")
+        );
+
+        let mut compiled = compile();
+        let production_schema = rocky_core::shadow::ShadowConfig {
+            schema_override: Some("main".to_string()),
+            cleanup_after: false,
+            ..Default::default()
+        };
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &production_schema,
+            &dialect,
+            false,
+        )
+        .expect_err("a production schema override must fail closed");
+        assert!(
+            err.to_string()
+                .contains("collides with the production target")
+        );
+
+        let mut compiled = compile();
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &dialect,
+            false,
+        )
+        .expect_err("the default suffix must not overwrite another model's production target");
+        assert!(
+            err.to_string()
+                .contains("collides with the production target")
+        );
+
+        let mut compiled = compile();
+        let shared_schema = rocky_core::shadow::ShadowConfig {
+            schema_override: Some("isolated_shadow".to_string()),
+            cleanup_after: false,
+            ..Default::default()
+        };
+        let err =
+            super::apply_shadow_rewrite(&mut compiled, None, None, &shared_schema, &dialect, false)
+                .expect_err("selected models must not share a derived shadow target");
+        assert!(err.to_string().contains("is shared by selected models"));
     }
 
     /// Finding 1 (physical-table read escapes containment). A raw-SQL model
@@ -16844,6 +18015,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -16952,6 +18124,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &defer_opts,
             super::SkipGateConfig::off(),
             false,
@@ -17075,6 +18248,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             super::SkipGateConfig::off(),
             false,
@@ -17359,6 +18533,7 @@ timestamp_column = "ts"
                 None,
                 &rocky_core::config::SchemaCacheConfig::default(),
                 false,
+                None, // shadow_config (test)
                 &DeferOptions::default(),
                 super::SkipGateConfig::off(),
                 false,
@@ -17486,6 +18661,7 @@ timestamp_column = "ts"
             None,
             &rocky_core::config::SchemaCacheConfig::default(),
             false,
+            None, // shadow_config (test)
             &DeferOptions::default(),
             gate,
             false,
@@ -18463,6 +19639,7 @@ timestamp_column = "ts"
                 None,
                 &rocky_core::config::SchemaCacheConfig::default(),
                 false,
+                None, // shadow_config (test)
                 &DeferOptions::default(),
                 active_gate(true, 0),
                 false,

@@ -65,6 +65,8 @@ pub async fn run_transformation(
     // `with_ttl_override` so the override propagates consistently
     // across replication and transformation paths.
     schema_cache_cfg: &rocky_core::config::SchemaCacheConfig,
+    // Resolved `--shadow` / `--branch` physical-target routing.
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
     // Fully-resolved model-skip gate (default-off unless `--skip-unchanged`
     // / `[run] skip_unchanged` is set). Passed straight through to
     // `execute_models`.
@@ -164,6 +166,7 @@ pub async fn run_transformation(
                 None,
                 schema_cache_cfg,
                 pipeline.target.governance.auto_create_schemas,
+                shadow_config,
                 // run_local has no `--model` selection; defer is a no-op here.
                 &super::run::DeferOptions::default(),
                 skip_gate,
@@ -1172,17 +1175,21 @@ mod tests {
             .unwrap();
     }
 
-    /// Count rows in `main.<table>`.
-    async fn count_rows(db: &Path, table: &str) -> i64 {
+    async fn count_rows_in_schema(db: &Path, schema: &str, table: &str) -> i64 {
         let a = DuckDbWarehouseAdapter::open(db).expect("count open");
         let r = a
-            .execute_query(&format!("SELECT COUNT(*) FROM main.{table}"))
+            .execute_query(&format!("SELECT COUNT(*) FROM {schema}.{table}"))
             .await
             .unwrap();
         r.rows[0][0]
             .as_i64()
             .or_else(|| r.rows[0][0].as_str().and_then(|s| s.parse().ok()))
             .unwrap()
+    }
+
+    /// Count rows in `main.<table>`.
+    async fn count_rows(db: &Path, table: &str) -> i64 {
+        count_rows_in_schema(db, "main", table).await
     }
 
     /// Write a `full_refresh` SQL model (`name.sql` + `name.toml`) into the
@@ -1210,10 +1217,17 @@ mod tests {
     }
 
     /// Drive `super::super::run::run()` end-to-end against the given config +
-    /// canonical `state_path`, exercising the full transformation dispatch
-    /// (`run() → run_transformation`). `skip_unchanged` toggles the gate.
-    async fn run_full_dag(config_path: &Path, state_path: &Path, skip_unchanged: bool) {
+    /// canonical `state_path`, exercising both the full transformation
+    /// dispatch and its model-only entry point.
+    async fn run_full_dag(
+        config_path: &Path,
+        state_path: &Path,
+        skip_unchanged: bool,
+        shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+        model_name_filter: Option<&str>,
+    ) {
         let opts = PartitionRunOptions::default();
+        let models_dir = config_path.parent().unwrap().join("models");
         let skip_opts = SkipRunOptions {
             skip_unchanged,
             force_rebuild: false,
@@ -1230,13 +1244,13 @@ mod tests {
             state_path,
             None,  // governance_override
             false, // output_json
-            None,  // models_dir override — take from config
+            model_name_filter.map(|_| models_dir.as_path()),
             false, // run_all
             None,  // resume_run_id
             false, // resume_latest
-            None,  // shadow_config
+            shadow_config,
             &opts,
-            None, // model_name_filter
+            model_name_filter,
             None, // cache_ttl_override
             None, // idempotency_key
             None, // env
@@ -1310,7 +1324,7 @@ auto_create_schemas = true
         let config_path = dir.join("rocky.toml");
 
         // ---- Run 1: fresh state ⇒ both models build. -------------------
-        run_full_dag(&config_path, &state_path, true).await;
+        run_full_dag(&config_path, &state_path, true, None, None).await;
         assert_eq!(count_rows(&db, "stg").await, 3, "run 1 builds stg");
         assert_eq!(count_rows(&db, "mart").await, 3, "run 1 builds mart");
 
@@ -1347,7 +1361,7 @@ auto_create_schemas = true
         assert_eq!(count_rows(&db, "mart").await, 4);
 
         // ---- Run 2: byte-identical ⇒ both SKIP (sentinels survive). ----
-        run_full_dag(&config_path, &state_path, true).await;
+        run_full_dag(&config_path, &state_path, true, None, None).await;
         assert_eq!(
             count_rows(&db, "stg").await,
             4,
@@ -1367,7 +1381,7 @@ auto_create_schemas = true
             "SELECT id FROM main.stg WHERE id > 1",
             &["stg"],
         );
-        run_full_dag(&config_path, &state_path, true).await;
+        run_full_dag(&config_path, &state_path, true, None, None).await;
         assert_eq!(
             count_rows(&db, "stg").await,
             4,
@@ -1481,17 +1495,186 @@ auto_create_schemas = true
         write_config(dir, &db, "");
         let config_path = dir.join("rocky.toml");
 
-        run_full_dag(&config_path, &state_path, false).await;
+        run_full_dag(&config_path, &state_path, false, None, None).await;
         insert_sentinel(&db, "stg", 999).await;
         assert_eq!(count_rows(&db, "stg").await, 4);
 
         // Gate off ⇒ run 2 rebuilds unconditionally ⇒ sentinel dropped.
-        run_full_dag(&config_path, &state_path, false).await;
+        run_full_dag(&config_path, &state_path, false, None, None).await;
         assert_eq!(
             count_rows(&db, "stg").await,
             3,
             "default-off must rebuild every run — sentinel dropped"
         );
+    }
+
+    /// Routing an undeclared physical upstream read to the producer's shadow
+    /// target creates a real dependency, so execution must order the producer
+    /// first even though the sidecar declares no `depends_on`. Without the
+    /// derived edge the two models share an execution layer and the consumer
+    /// reads a shadow table its producer has not written yet.
+    #[tokio::test]
+    async fn transformation_shadow_orders_undeclared_physical_upstream() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+
+        write_model(
+            &models_dir,
+            "orders",
+            "SELECT * FROM (VALUES (1)) AS t(id)",
+            &[],
+        );
+        // Seed production with the dependency declared. A project whose
+        // physical read is undeclared cannot build on a FRESH warehouse at all
+        // — the producer and consumer share a layer and the consumer runs
+        // first — which is the separate, pre-existing ordering gap. Declaring
+        // it here establishes the steady state this test is about: production
+        // tables already exist, so the shadow run is the only thing under test.
+        write_model(
+            &models_dir,
+            "mart",
+            "SELECT id FROM main.orders",
+            &["orders"],
+        );
+        write_config(dir, &db, "");
+        let config_path = dir.join("rocky.toml");
+
+        run_full_dag(&config_path, &state_path, false, None, None).await;
+        assert_eq!(count_rows(&db, "orders").await, 1);
+        assert_eq!(count_rows(&db, "mart").await, 1);
+
+        // Now drop the declaration: the read is physical and undeclared.
+        write_model(&models_dir, "mart", "SELECT id FROM main.orders", &[]);
+        write_model(
+            &models_dir,
+            "orders",
+            "SELECT * FROM (VALUES (1), (2)) AS t(id)",
+            &[],
+        );
+        let shadow = rocky_core::shadow::ShadowConfig {
+            cleanup_after: false,
+            ..Default::default()
+        };
+        run_full_dag(&config_path, &state_path, false, Some(&shadow), None).await;
+
+        assert_eq!(
+            count_rows(&db, "orders").await,
+            1,
+            "shadow must not overwrite production"
+        );
+        assert_eq!(
+            count_rows(&db, "orders_rocky_shadow").await,
+            2,
+            "producer must materialize its shadow target"
+        );
+        assert_eq!(
+            count_rows(&db, "mart_rocky_shadow").await,
+            2,
+            "consumer must read the producer's shadow target, which requires the producer to \
+             have run first"
+        );
+    }
+
+    /// A transformation shadow run must materialize the rewritten physical
+    /// target and leave the production table untouched. Exercise both CLI
+    /// routing modes: the default suffix and branch-style schema override.
+    #[tokio::test]
+    async fn transformation_shadow_routes_targets_without_overwriting_production() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let db = dir.join("t.duckdb");
+        let state_path = dir.join(".rocky-state.redb");
+
+        write_model(
+            &models_dir,
+            "orders",
+            "SELECT * FROM (VALUES (1)) AS t(id)",
+            &[],
+        );
+        write_model(
+            &models_dir,
+            "mart",
+            "SELECT id FROM main.orders",
+            &["orders"],
+        );
+        write_config(dir, &db, "");
+        let config_path = dir.join("rocky.toml");
+
+        run_full_dag(&config_path, &state_path, false, None, None).await;
+        assert_eq!(count_rows(&db, "orders").await, 1);
+        assert_eq!(count_rows(&db, "mart").await, 1);
+
+        write_model(
+            &models_dir,
+            "orders",
+            "SELECT * FROM (VALUES (1), (2)) AS t(id)",
+            &[],
+        );
+        let suffix_shadow = rocky_core::shadow::ShadowConfig {
+            cleanup_after: false,
+            ..Default::default()
+        };
+        run_full_dag(
+            &config_path,
+            &state_path,
+            false,
+            Some(&suffix_shadow),
+            Some("orders"),
+        )
+        .await;
+        assert_eq!(
+            count_rows(&db, "orders").await,
+            1,
+            "suffix shadow must not overwrite the production target"
+        );
+        assert_eq!(
+            count_rows(&db, "orders_rocky_shadow").await,
+            2,
+            "suffix shadow must materialize the rewritten table"
+        );
+
+        run_full_dag(&config_path, &state_path, false, Some(&suffix_shadow), None).await;
+        assert_eq!(
+            count_rows(&db, "mart_rocky_shadow").await,
+            2,
+            "downstream suffix shadow must read the shadow upstream"
+        );
+
+        write_model(
+            &models_dir,
+            "orders",
+            "SELECT * FROM (VALUES (1), (2), (3)) AS t(id)",
+            &[],
+        );
+        let branch_shadow = rocky_core::shadow::ShadowConfig {
+            schema_override: Some("branch_fix_1269".to_string()),
+            cleanup_after: false,
+            ..Default::default()
+        };
+        run_full_dag(&config_path, &state_path, false, Some(&branch_shadow), None).await;
+        assert_eq!(
+            count_rows(&db, "orders").await,
+            1,
+            "branch shadow must not overwrite the production target"
+        );
+        assert_eq!(
+            count_rows_in_schema(&db, "branch_fix_1269", "orders").await,
+            3,
+            "branch shadow must materialize in its isolated schema"
+        );
+        assert_eq!(
+            count_rows_in_schema(&db, "branch_fix_1269", "mart").await,
+            3,
+            "downstream branch model must read the branch upstream"
+        );
+        assert_eq!(count_rows(&db, "orders").await, 1);
+        assert_eq!(count_rows(&db, "mart").await, 1);
     }
 
     /// Reached-ness guard for per-model `[governance.tags]` application.
@@ -1528,7 +1711,7 @@ auto_create_schemas = true
 
         // The run must succeed: the governance.tags apply block runs (no-op on
         // DuckDB) without aborting the transformation.
-        run_full_dag(&config_path, &state_path, false).await;
+        run_full_dag(&config_path, &state_path, false, None, None).await;
 
         // The view materialized and is queryable.
         let a = DuckDbWarehouseAdapter::open(&db).expect("open db");
@@ -1785,6 +1968,7 @@ auto_create_schemas = true
             false, // output_json
             &PartitionRunOptions::default(),
             &rocky_core::config::SchemaCacheConfig::default(),
+            None, // shadow_config (test)
             super::super::run::SkipGateConfig::off(),
             false, // no_reuse
             &state_path,

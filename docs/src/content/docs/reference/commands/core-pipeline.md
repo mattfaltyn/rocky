@@ -419,6 +419,30 @@ rocky run --filter client=acme --shadow
 rocky compare --filter client=acme
 ```
 
+Shadow and branch runs fail closed when the selected transformation set
+contains a `content_addressed`, `time_interval` or `ephemeral` model — the first
+two require additional storage or partition-state isolation, and an ephemeral
+model is neither materialized nor inlined, so its consumer would read
+production. They also fail closed when the chosen suffix or schema would collide
+with a production target or another selected shadow target.
+
+On a dialect where identifier case is part of object identity — Snowflake and
+BigQuery — a run routing more than one model is refused when a routed target
+differs only by case from any other model's target. Those are two distinct
+objects to the warehouse, but upstream references are matched
+case-insensitively, so a read of either could be redirected to the wrong one.
+The refusal is deliberate and does not depend on whether any model spells such a
+read today; rename one of the targets, or scope the run so it routes only one of
+them.
+
+This is not the same as whether the dialect quotes identifiers. Rocky renders
+Trino targets double-quoted, yet treats two Trino targets differing only by case
+as one object, so such a run proceeds there.
+
+`--shadow` and `--branch` isolate `rocky run` for transformation pipelines.
+`rocky run --dag`, and the snapshot and load pipeline kinds, still write
+production targets despite accepting the flags.
+
 Or run against a named branch:
 
 ```bash
