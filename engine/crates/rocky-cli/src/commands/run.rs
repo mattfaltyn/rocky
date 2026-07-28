@@ -5744,6 +5744,42 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
     }
 }
 
+/// Whether `sql` mentions `token` as an identifier in some spelling other than
+/// `token` itself.
+///
+/// The shadow rename matches table references case-insensitively, so on a
+/// dialect where identifiers are case-sensitive a read spelled `Orders` folds
+/// onto the rename key of a target spelled `orders`. Only such a read can be
+/// misdirected; a mention that already matches the routed spelling exactly is
+/// unambiguous. Bounded on identifier characters so `orders` does not match
+/// `orders_daily`.
+fn mentions_other_casing(sql: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let haystack = sql.to_ascii_lowercase();
+    let needle = token.to_ascii_lowercase();
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0usize;
+    while let Some(offset) = haystack[from..].find(&needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let bounded_left =
+            start == 0 || !haystack[..start].chars().next_back().is_some_and(is_ident);
+        let bounded_right = haystack[end..].chars().next().is_none_or(|c| !is_ident(c));
+        if bounded_left
+            && bounded_right
+            && sql
+                .get(start..end)
+                .is_some_and(|spelling| spelling != token)
+        {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// Route the models built by this invocation and their in-run dependency reads
 /// to shadow targets. Deferred or otherwise unselected upstreams stay on their
 /// production targets.
@@ -5953,6 +5989,23 @@ fn apply_shadow_rewrite(
             let Some(group) = folded.get(&exact.to_ascii_lowercase()) else {
                 continue;
             };
+            // Only a read spelled differently from this model's own target can
+            // be folded onto its rename key by mistake. If every mention of the
+            // table across the models being rewritten already matches the
+            // routed spelling exactly, the rewrite is unambiguous and the run is
+            // safe however many other objects share the folded name.
+            let table = model.config.target.table.as_str();
+            let miscased_read = routes.keys().any(|name| {
+                compile_result
+                    .project
+                    .models
+                    .iter()
+                    .find(|candidate| &candidate.config.name == name)
+                    .is_some_and(|candidate| mentions_other_casing(&candidate.sql, table))
+            });
+            if !miscased_read {
+                continue;
+            }
             if let Some((other_exact, other_model)) =
                 group.iter().find(|(candidate, _)| *candidate != exact)
             {
@@ -16798,8 +16851,16 @@ timestamp_column = "ts"
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
-        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
-        // Same folded identity as the selected model, different spelling.
+        // The one routed model even reads the OTHER spelling. With a single
+        // route there are no renames to apply, so nothing can be redirected and
+        // the read must be left exactly as written.
+        write_model_with_target(
+            &models_dir,
+            "lower",
+            "SELECT id FROM main.Orders",
+            "main",
+            "orders",
+        );
         write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
         let mut compiled =
             rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
@@ -16823,6 +16884,11 @@ timestamp_column = "ts"
             .find(|m| m.config.name == "lower")
             .expect("lower missing");
         assert_eq!(lower.config.target.table, "orders_rocky_shadow");
+        assert!(
+            lower.sql.contains("main.Orders") && !lower.sql.contains("rocky_shadow"),
+            "a single-model run applies no renames, so the read stays as written: {}",
+            lower.sql
+        );
         let upper = compiled
             .project
             .models
@@ -16832,6 +16898,58 @@ timestamp_column = "ts"
         assert_eq!(
             upper.config.target.table, "Orders",
             "an unselected model must stay on its production target"
+        );
+    }
+
+    /// A collision is only dangerous if some read is actually spelled the other
+    /// way. Two routed models that never mention the ambiguous table in a
+    /// different casing rewrite nothing ambiguous, so the run is safe even
+    /// though a case-colliding target exists elsewhere in the project.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_allows_a_case_collision_no_model_reads_ambiguously() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // Reads `lower`'s target in exactly the routed spelling: unambiguous.
+        write_model_with_target(
+            &models_dir,
+            "driver",
+            "SELECT id FROM main.orders",
+            "main",
+            "driver",
+        );
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["driver".to_string(), "lower".to_string()]
+                .into_iter()
+                .collect();
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            Some(&selected),
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect("no read is spelled ambiguously, so the run must not be rejected");
+        let driver = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "driver")
+            .expect("driver missing");
+        assert!(
+            driver.sql.contains("orders_rocky_shadow"),
+            "the unambiguous read must still be routed: {}",
+            driver.sql
         );
     }
 
@@ -16891,7 +17009,16 @@ timestamp_column = "ts"
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
-        write_model_with_target(&models_dir, "driver", "SELECT 1 AS id", "main", "driver");
+        // Reads the UNSELECTED model's target in its own spelling. That read
+        // folds onto `lower`'s rename key and would be redirected to `lower`'s
+        // shadow — the misdirection this guard exists to catch.
+        write_model_with_target(
+            &models_dir,
+            "driver",
+            "SELECT id FROM main.Orders",
+            "main",
+            "driver",
+        );
         write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
         // Not selected, so `shadow_owners` never compares against it.
         write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
