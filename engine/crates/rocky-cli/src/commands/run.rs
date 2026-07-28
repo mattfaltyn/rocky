@@ -5613,12 +5613,13 @@ fn apply_defer_rewrite(
     };
 
     // BigQuery is the one shipping dialect whose qualified parts (the project /
-    // catalog) may contain characters bare SQL identifiers reject — hyphens.
-    // For it the catalog is validated with the GCP-project rule and the
-    // rewritten reference is backtick-quoted to match `format_table_ref`; every
-    // other dialect keeps the strict identifier rule and renders bare names.
+    // catalog) may contain characters bare SQL identifiers reject — hyphens, so
+    // only it validates the catalog with the GCP-project rule. Quoting is a
+    // separate question and is answered per dialect: Snowflake and Trino also
+    // quote every component of a target, so a bare rewritten read would fold
+    // case and name a different object.
     let is_bigquery = dialect.name() == "bigquery";
-    let quote_style: Option<char> = if is_bigquery { Some('`') } else { None };
+    let quote_style: Option<char> = rewrite_quote_style(dialect)?;
 
     // Validate the `--defer-to` schema override once up front — it is user
     // input that ends up serialized into SQL. Schemas/datasets never carry
@@ -5711,6 +5712,38 @@ fn apply_defer_rewrite(
     Ok(())
 }
 
+/// Identifier quoting a rewritten upstream reference must use so that it names
+/// the same object the producer's DDL creates.
+///
+/// This has to track `SqlDialect::format_table_ref` exactly. A producer writes
+/// its target through that method; a rewritten read is re-serialized here. Where
+/// the two disagree the read names a different object than the producer created:
+/// on Snowflake and Trino every component is emitted double-quoted and therefore
+/// case-sensitive, so a bare read folds to upper case and either errors or, worse,
+/// resolves to an unrelated table of that name.
+///
+/// Unknown dialects fail closed. A new adapter that quotes its targets would
+/// otherwise inherit bare rendering silently, which is exactly the defect this
+/// function exists to prevent.
+fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<Option<char>> {
+    match dialect.name() {
+        // `format_table_ref` renders bare identifiers.
+        "duckdb" | "databricks" => Ok(None),
+        // Backticks: BigQuery project IDs may contain hyphens, which a bare
+        // identifier would parse as subtraction.
+        "bigquery" => Ok(Some('`')),
+        // Double quotes: both dialects quote every component of a target, which
+        // makes the object case-sensitive.
+        "snowflake" | "trino" => Ok(Some('"')),
+        other => anyhow::bail!(
+            "cannot rewrite upstream references for dialect '{other}': its identifier quoting \
+             is unknown, so a rewritten reference could name a different object than the one \
+             the producing model creates. Add '{other}' to `rewrite_quote_style` after \
+             checking how its `format_table_ref` quotes each component"
+        ),
+    }
+}
+
 /// Route the models built by this invocation and their in-run dependency reads
 /// to shadow targets. Deferred or otherwise unselected upstreams stay on their
 /// production targets.
@@ -5736,7 +5769,41 @@ fn apply_shadow_rewrite(
         format!("{catalog}.{schema}.{table}").to_ascii_lowercase()
     };
 
-    let quote_style = (dialect.name() == "bigquery").then_some('`');
+    let quote_style = rewrite_quote_style(dialect)?;
+
+    // Target identity is case-folded, and so is the tail match inside
+    // `rewrite_upstream_refs`. On a dialect that quotes its targets that is a
+    // lossy key: `"Orders"` and `"orders"` are two distinct Snowflake tables
+    // that fold to one identity, and a read of either could be redirected to
+    // the other's shadow. Refuse rather than guess. Checked across every
+    // compiled model, not just the selected ones, because an unselected model
+    // is exactly the case the routing loop below would not otherwise notice.
+    if quote_style.is_some() {
+        let mut folded: HashMap<String, (String, String)> = HashMap::new();
+        for model in &compile_result.project.models {
+            let exact = format!(
+                "{}.{}.{}",
+                model.config.target.catalog, model.config.target.schema, model.config.target.table
+            );
+            let key = exact.to_ascii_lowercase();
+            if let Some((other_exact, other_model)) =
+                folded.insert(key, (exact.clone(), model.config.name.clone()))
+                && other_exact != exact
+            {
+                anyhow::bail!(
+                    "shadow/branch execution cannot distinguish the targets of models '{}' \
+                     ('{}') and '{}' ('{}'): they differ only by case, which this dialect \
+                     treats as two different objects. Rename one target so the two differ by \
+                     more than case",
+                    other_model,
+                    other_exact,
+                    model.config.name,
+                    exact,
+                );
+            }
+        }
+    }
+
     let mut production_targets: HashMap<String, Vec<String>> = HashMap::new();
     for model in &compile_result.project.models {
         production_targets
@@ -5750,9 +5817,6 @@ fn apply_shadow_rewrite(
     }
     let mut shadow_owners: HashMap<String, String> = HashMap::new();
     let mut routes: HashMap<String, (String, rocky_sql::defer::DeferTarget)> = HashMap::new();
-    // Routed models that materialize nothing, so no reader may be redirected to
-    // their shadow target and no ordering edge may point at them.
-    let mut ephemeral_models: std::collections::HashSet<String> = std::collections::HashSet::new();
     for model in &compile_result.project.models {
         if !is_selected(&model.config.name) {
             continue;
@@ -5772,21 +5836,28 @@ fn apply_shadow_rewrite(
                     model.config.name
                 );
             }
-            // Ephemeral models are inlined as CTEs and never materialized —
-            // `sql_gen::generate_transformation_sql` returns no statements for
-            // them — so their configured target is nominal. They are still
-            // ROUTED (their target is rewritten below) because the governance
-            // snapshot is captured from these same models and its reconcile
-            // loops issue adapter calls against `target_*` without checking
-            // strategy or whether anything was materialized. Leaving an
-            // ephemeral target on production would let a shadow run apply that
-            // model's tags / masks / retention to the PRODUCTION table.
+            // Ephemeral models emit no statements
+            // (`sql_gen::generate_transformation_sql` returns an empty vec), and
+            // the comments throughout this codebase describe them as "inlined as
+            // CTEs in downstream queries". No such inlining exists: nothing in
+            // `rocky-compiler` or `rocky-sql` rewrites a consumer's `FROM eph`
+            // into a CTE, and the dbt importer states outright that
+            // `materialized='ephemeral'` has no Rocky equivalent.
             //
-            // They are excluded from the reader renames and the edge index
-            // below instead: nothing creates their shadow target, so no reader
-            // may be redirected to it and no ordering edge may depend on it.
+            // So a consumer of an ephemeral model reads whatever physical table
+            // happens to carry that name. Under shadow that is the PRODUCTION
+            // table — the one thing this routing exists to prevent — and no
+            // rewrite here can fix it, because there is no shadow object to
+            // point the read at. Fail closed until inlining is real, the same
+            // way the two strategies above do.
             rocky_core::models::StrategyConfig::Ephemeral => {
-                ephemeral_models.insert(model.config.name.clone());
+                anyhow::bail!(
+                    "shadow/branch execution is not supported for ephemeral model '{}': \
+                     ephemeral models are not materialized and are not inlined into their \
+                     consumers, so a consumer would read the production table instead of an \
+                     isolated one. Give the model a materialized strategy to shadow it",
+                    model.config.name
+                );
             }
             rocky_core::models::StrategyConfig::FullRefresh
             | rocky_core::models::StrategyConfig::Incremental { .. }
@@ -5805,7 +5876,10 @@ fn apply_shadow_rewrite(
         };
         let shadow = rocky_core::shadow::shadow_target(&original, config);
         if !shadow.catalog.is_empty() {
-            if quote_style.is_some() {
+            // BigQuery specifically, not "any quoted dialect": Snowflake and
+            // Trino quote their targets too but their catalogs still follow the
+            // strict identifier rule, so the GCP project rule must not apply.
+            if dialect.name() == "bigquery" {
                 rocky_sql::validation::validate_gcp_project_id(&shadow.catalog).with_context(
                     || {
                         format!(
@@ -5877,11 +5951,10 @@ fn apply_shadow_rewrite(
 
     // Reverse index of the rename keys, so a key that `rewrite_upstream_refs`
     // reports as rewritten can be mapped back to the model that produces it.
-    // Ephemeral models are absent: they materialize nothing, so they can never
-    // be the producer an ordering edge should wait on.
+    // Every routed model materializes something: strategies that do not are
+    // rejected above.
     let owner_by_key: HashMap<&str, &str> = routes
         .iter()
-        .filter(|(name, _)| !ephemeral_models.contains(name.as_str()))
         .map(|(name, (original_key, _))| (original_key.as_str(), name.as_str()))
         .collect();
     // Edges discovered by the rewrite: `(consumer, producer)`. Collected here
@@ -5911,15 +5984,9 @@ fn apply_shadow_rewrite(
         // pointing it at the not-yet-populated shadow target would change what
         // the model computes.
         //
-        // Ephemeral upstreams are excluded too: they are inlined as CTEs and
-        // materialize nothing, so their shadow target is never created and a
-        // redirected read would resolve to a table that does not exist.
         let renames: HashMap<String, rocky_sql::defer::DeferTarget> = routes
             .iter()
-            .filter(|(name, _)| {
-                name.as_str() != model.config.name.as_str()
-                    && !ephemeral_models.contains(name.as_str())
-            })
+            .filter(|(name, _)| name.as_str() != model.config.name.as_str())
             .map(|(_, route)| route.clone())
             .collect();
         if !renames.is_empty() {
@@ -7023,6 +7090,16 @@ pub(crate) async fn execute_models(
         let mut targets: std::collections::BTreeSet<(String, String)> =
             std::collections::BTreeSet::new();
         for model in &compile_result.project.models {
+            // Only models this invocation will actually build. Pre-creating a
+            // schema for a model that is filtered out is wasted work in an
+            // ordinary run, and under `--shadow` it is an isolation break: the
+            // unselected model still carries its PRODUCTION target, so a shadow
+            // run would create production schemas.
+            if model_name_filter.is_some_and(|selected| selected != model.config.name)
+                || model_set.is_some_and(|set| !set.contains(&model.config.name))
+            {
+                continue;
+            }
             targets.insert((
                 model.config.target.catalog.clone(),
                 model.config.target.schema.clone(),
@@ -16617,16 +16694,114 @@ timestamp_column = "ts"
         );
     }
 
-    /// An ephemeral model materializes nothing, so no reader may be redirected
-    /// to its shadow target — but its target must still be rewritten off
-    /// production. `GovernanceSnapshot::capture` reads these same models and
-    /// its reconcile loops issue `apply_column_tags` / `apply_masking_policy` /
-    /// `apply_retention_policy` / `set_tags` against `target_*` without
-    /// consulting the strategy, so an ephemeral target left on production would
-    /// let a shadow run mutate PRODUCTION governance metadata.
+    /// An ephemeral model materializes nothing and — despite what the comments
+    /// around `sql_gen` claim — is never inlined into its consumers, so a
+    /// consumer's `FROM eph` resolves to whatever physical table carries that
+    /// name. Under shadow that is the production table, and no rewrite can fix
+    /// it because there is no shadow object to point the read at. Shadow mode
+    /// must therefore refuse the run rather than quietly read production.
+    /// A rewritten upstream read has to name the same object the producer's DDL
+    /// creates. Snowflake and Trino emit every component of a target
+    /// double-quoted, which makes the object case-sensitive, so a bare read
+    /// folds to upper case and names a different table. Nothing else in the
+    /// suite executes against those dialects, so this asserts the serialized
+    /// SQL directly.
     #[cfg(feature = "duckdb")]
     #[test]
-    fn shadow_routes_ephemeral_target_but_never_redirects_readers_to_it() {
+    fn shadow_rewritten_reads_match_the_producer_quoting_per_dialect() {
+        fn rewritten_sql(dialect: &dyn rocky_core::traits::SqlDialect) -> String {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(
+                &models_dir,
+                "mart",
+                "SELECT id FROM main.orders",
+                "main",
+                "mart",
+            );
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            super::apply_shadow_rewrite(
+                &mut compiled,
+                None,
+                None,
+                &rocky_core::shadow::ShadowConfig::default(),
+                dialect,
+                false,
+            )
+            .expect("shadow rewrite must succeed");
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == "mart")
+                .expect("mart missing")
+                .sql
+                .clone()
+        }
+
+        let duck = rewritten_sql(&rocky_duckdb::dialect::DuckDbSqlDialect);
+        assert!(
+            duck.contains("orders_rocky_shadow") && !duck.contains('"'),
+            "DuckDB renders bare identifiers: {duck}"
+        );
+
+        for (name, sql) in [
+            (
+                "snowflake",
+                rewritten_sql(&rocky_snowflake::dialect::SnowflakeSqlDialect),
+            ),
+            ("trino", rewritten_sql(&rocky_trino::dialect::TrinoDialect)),
+        ] {
+            assert!(
+                sql.contains("\"orders_rocky_shadow\""),
+                "{name} quotes its targets, so the rewritten read must be quoted too or it \
+                 folds case and names a different object: {sql}"
+            );
+        }
+    }
+
+    /// Two targets differing only by case are one object to the case-folded
+    /// identity key but two objects to a quoting dialect. Refuse rather than
+    /// redirect a read to the wrong one.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_case_only_target_collisions_on_quoting_dialects() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("case-only target collision must be rejected on a quoting dialect");
+        assert!(
+            format!("{err:#}").contains("differ only by case"),
+            "error must explain the collision: {err:#}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_ephemeral_models() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
@@ -16637,7 +16812,8 @@ timestamp_column = "ts"
              [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"eph\"\n",
         )
         .expect("write toml");
-        // Reads the ephemeral model's nominal target by physical name.
+        // Reads the ephemeral model's nominal target by physical name. Nothing
+        // inlines that read, so under shadow it would resolve to production.
         write_model_with_target(
             &models_dir,
             "consumer",
@@ -16653,7 +16829,7 @@ timestamp_column = "ts"
             })
             .expect("compile models");
         let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
-        super::apply_shadow_rewrite(
+        let err = super::apply_shadow_rewrite(
             &mut compiled,
             None,
             None,
@@ -16661,46 +16837,11 @@ timestamp_column = "ts"
             &dialect,
             false,
         )
-        .expect("shadow rewrite must succeed");
-
-        let model = |name: &str| {
-            compiled
-                .project
-                .models
-                .iter()
-                .find(|m| m.config.name == name)
-                .unwrap_or_else(|| panic!("model {name} missing"))
-        };
-
-        // The ephemeral target is rewritten, so nothing downstream of the
-        // governance snapshot can address the production table.
-        assert_eq!(
-            model("eph").config.target.table,
-            "eph_rocky_shadow",
-            "an ephemeral target must not stay on production during a shadow run"
-        );
-        // But no reader is pointed at that never-created table.
+        .expect_err("an ephemeral model must be rejected, not silently left on production");
+        let message = format!("{err:#}");
         assert!(
-            model("consumer")
-                .sql
-                .to_ascii_lowercase()
-                .contains("main.eph")
-                && !model("consumer")
-                    .sql
-                    .to_ascii_lowercase()
-                    .contains("eph_rocky_shadow"),
-            "a read of an ephemeral model must not be redirected to its shadow target: {:?}",
-            model("consumer").sql
-        );
-        // And no ordering edge waits on a model that materializes nothing.
-        assert!(
-            compiled
-                .project
-                .dag_nodes
-                .iter()
-                .find(|n| n.name == "consumer")
-                .is_some_and(|n| !n.depends_on.iter().any(|d| d == "eph")),
-            "no derived edge may name an ephemeral producer"
+            message.contains("ephemeral model 'eph'") && message.contains("not inlined"),
+            "error must name the model and why it cannot be shadowed: {message}"
         );
     }
 

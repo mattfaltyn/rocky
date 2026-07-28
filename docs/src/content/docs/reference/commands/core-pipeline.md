@@ -420,10 +420,16 @@ rocky compare --filter client=acme
 ```
 
 Shadow and branch runs fail closed when the selected transformation set
-contains a `content_addressed` or `time_interval` model because those
-strategies require additional storage or partition-state isolation. They also
-fail closed when the chosen suffix or schema would collide with a production
-target or another selected shadow target.
+contains a `content_addressed`, `time_interval` or `ephemeral` model — the first
+two require additional storage or partition-state isolation, and an ephemeral
+model is neither materialized nor inlined, so its consumer would read
+production. They also fail closed when the chosen suffix or schema would collide
+with a production target or another selected shadow target, and when two targets
+differ only by case on a dialect that quotes identifiers.
+
+`--shadow` and `--branch` isolate `rocky run` for transformation pipelines.
+`rocky run --dag`, and the snapshot and load pipeline kinds, still write
+production targets despite accepting the flags.
 
 Or run against a named branch:
 

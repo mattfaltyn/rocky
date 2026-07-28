@@ -14,11 +14,25 @@ Shadow mode writes pipeline output to shadow tables instead of (or alongside) pr
 3. A comparison engine checks row counts, schemas, and optionally sample data between shadow and production
 4. Results show pass/warn/fail with detailed diffs
 
-Shadow and branch runs currently reject `content_addressed` and `time_interval`
-models. Those strategies also persist object-storage or partition-state
+:::caution[Shadow isolation covers `rocky run` for transformation pipelines only]
+`rocky run --dag`, and the snapshot and load pipeline kinds, still accept
+`--shadow` and `--branch` but write **production** targets. Do not rely on those
+entrypoints for isolation.
+:::
+
+Shadow and branch runs currently reject `content_addressed`, `time_interval` and
+`ephemeral` models. The first two persist object-storage or partition-state
 identities that cannot yet be isolated by rewriting only the warehouse target.
-Rocky also rejects a derived shadow target that matches any configured
-production target or another selected shadow target.
+Ephemeral models are neither materialized nor inlined into their consumers, so a
+consumer would read the production table and no rewrite could redirect it — give
+the model a materialized strategy to shadow it. Rocky also rejects a derived
+shadow target that matches any configured production target or another selected
+shadow target.
+
+Rocky does **not** yet verify that a derived shadow target is unoccupied by an
+object it does not know about. If a table matching the derived name already
+exists and is not a Rocky model target — a source, a seed, or an ad-hoc table —
+a full-refresh model will replace it. Prefer a dedicated shadow schema you own.
 
 A model that reads another selected model's table is routed to that upstream's
 shadow target whether or not it declares the dependency in `depends_on` —
