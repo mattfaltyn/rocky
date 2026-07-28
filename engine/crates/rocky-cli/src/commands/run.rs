@@ -5758,17 +5758,31 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
 /// only where case is part of identity can two targets differing by case be
 /// two different objects that a rewrite could confuse.
 ///
+/// This answers one narrow question: can two configured targets that differ
+/// only by case be two different objects? It is NOT a specification of how a
+/// reference should be compared per component, and must not be used as one.
+/// BigQuery is the counter-example — its dataset and table IDs are
+/// case-sensitive while its project IDs are not — so making
+/// `rewrite_upstream_refs` case-aware needs per-component semantics rather than
+/// this single boolean.
+///
 /// Unknown dialects fail closed.
 fn dialect_case_sensitive_identity(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<bool> {
     match dialect.name() {
         // Identifiers are case-insensitive: `Orders` and `orders` are one
         // object, so no pair of targets can differ by case alone.
         "duckdb" | "databricks" => Ok(false),
+        // Trino normalizes identifiers to lower case whether or not they are
+        // quoted, so `"Orders"` and `orders` name the same table. This is
+        // exactly why quoting cannot stand in for case-sensitivity: Rocky
+        // renders Trino targets double-quoted, yet case is still not part of
+        // identity.
+        "trino" => Ok(false),
         // Dataset and table IDs are case-sensitive.
         "bigquery" => Ok(true),
-        // Rocky renders every component double-quoted, and a quoted identifier
-        // is taken verbatim rather than case-folded.
-        "snowflake" | "trino" => Ok(true),
+        // Rocky renders every component double-quoted, and Snowflake takes a
+        // quoted identifier verbatim instead of folding it to upper case.
+        "snowflake" => Ok(true),
         other => anyhow::bail!(
             "shadow/branch execution does not know whether '{other}' treats identifier case as \
              part of object identity, so it cannot tell whether two targets differing only by \
@@ -16964,42 +16978,56 @@ timestamp_column = "ts"
 
     /// On a dialect where identifiers are case-insensitive, two targets that
     /// differ only by case name the SAME object, so there is nothing to
-    /// disambiguate and the run must proceed. Pins the false branch of the
-    /// case-sensitivity declaration, which quoting alone would not decide.
+    /// disambiguate and the run must proceed.
+    ///
+    /// Covers Trino as well as DuckDB, and Trino is the point: Rocky renders
+    /// its targets double-quoted, yet Trino folds identifiers to lower case
+    /// whether quoted or not. A guard keyed on quoting would refuse this run;
+    /// one keyed on identity does not.
     #[cfg(feature = "duckdb")]
     #[test]
     fn shadow_allows_case_collisions_on_a_case_insensitive_dialect() {
-        let tmp = tempfile::TempDir::new().expect("temp dir");
-        let models_dir = tmp.path().join("models");
-        std::fs::create_dir(&models_dir).expect("mkdir models");
-        write_model_with_target(
-            &models_dir,
-            "driver",
-            "SELECT id FROM main.Orders",
-            "main",
-            "driver",
-        );
-        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
-        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
-        let mut compiled =
-            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
-                models_dir,
-                ..Default::default()
-            })
-            .expect("compile models");
-        let selected: std::collections::BTreeSet<String> =
-            ["driver".to_string(), "lower".to_string()]
-                .into_iter()
-                .collect();
-        super::apply_shadow_rewrite(
-            &mut compiled,
-            None,
-            Some(&selected),
-            &rocky_core::shadow::ShadowConfig::default(),
-            &rocky_duckdb::dialect::DuckDbSqlDialect,
-            false,
-        )
-        .expect("DuckDB folds identifier case, so there is no ambiguity to refuse");
+        for (name, dialect) in [
+            (
+                "duckdb",
+                &rocky_duckdb::dialect::DuckDbSqlDialect as &dyn rocky_core::traits::SqlDialect,
+            ),
+            ("trino", &rocky_trino::dialect::TrinoDialect),
+        ] {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(
+                &models_dir,
+                "driver",
+                "SELECT id FROM main.Orders",
+                "main",
+                "driver",
+            );
+            write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            let selected: std::collections::BTreeSet<String> =
+                ["driver".to_string(), "lower".to_string()]
+                    .into_iter()
+                    .collect();
+            super::apply_shadow_rewrite(
+                &mut compiled,
+                None,
+                Some(&selected),
+                &rocky_core::shadow::ShadowConfig::default(),
+                dialect,
+                false,
+            )
+            .unwrap_or_else(|err| {
+                panic!("{name} folds identifier case, so there is no ambiguity to refuse: {err:#}")
+            });
+        }
     }
 
     /// A case collision can sit in the schema or catalog rather than the table.
