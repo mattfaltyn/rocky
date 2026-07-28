@@ -5767,22 +5767,40 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
 /// and table. Making `rewrite_upstream_refs` case-aware therefore needs
 /// per-component semantics, established per dialect, rather than this boolean.
 ///
-/// The values below are a policy table about warehouse identifier rules, and
-/// nothing in this repository proves them. Only Snowflake has in-repo evidence:
-/// `rocky-snowflake`'s `format_table_ref` documents that emitting bare
-/// identifiers "silently breaks against any schema / table created with quoted
-/// lowercase names", which is why its targets are quoted at all. **Confirm each
-/// entry against that warehouse's published identifier rules before relying on
-/// it, and re-confirm when adding one.** Deriving these from how Rocky renders a
-/// target is precisely the mistake that produced the wrong answer here before —
-/// rendering and identity are independent.
+/// Each entry is taken from the warehouse's own documentation, not inferred
+/// from how Rocky renders a target — rendering and identity are independent, and
+/// deriving one from the other is what produced a wrong answer here before.
+/// DuckDB makes the point: it quotes with double quotes yet treats even quoted
+/// identifiers case-insensitively, the opposite of PostgreSQL.
+///
+/// Re-confirm against the vendor when adding a dialect.
 ///
 /// Unknown dialects fail closed.
 fn dialect_case_sensitive_identity(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<bool> {
     match dialect.name() {
         // Two targets differing only by case name one object.
+        //
+        // DuckDB: "Identifiers ... are always case-insensitive ... DuckDB also
+        // treats quoted identifiers as case-insensitive" (case is preserved for
+        // display only) — duckdb.org/docs/stable/sql/dialect/keywords_and_identifiers
+        // Databricks: identifiers are case-insensitive, delimited ones included;
+        // Unity Catalog stores names lower-cased —
+        // docs.databricks.com/aws/en/sql/language-manual/sql-ref-identifiers
+        // Trino: "Identifiers are not treated as case sensitive" —
+        // trino.io/docs/current/language/reserved.html
         "duckdb" | "databricks" | "trino" => Ok(false),
         // Two targets differing only by case can name two objects.
+        //
+        // BigQuery: dataset and table names are case-sensitive by default, so
+        // `mydataset` and `MyDataset` coexist; a dataset may opt out with
+        // `is_case_insensitive` — docs.cloud.google.com/bigquery/docs/datasets
+        // Snowflake: an unquoted identifier is stored and resolved upper-cased,
+        // a double-quoted one "exactly as entered, including case"; an account
+        // may opt out with QUOTED_IDENTIFIERS_IGNORE_CASE —
+        // docs.snowflake.com/en/sql-reference/identifiers-syntax
+        //
+        // Both opt-outs would only ever make a rejected run acceptable, never
+        // the reverse, so assuming the default is the fail-closed choice.
         "bigquery" | "snowflake" => Ok(true),
         other => anyhow::bail!(
             "shadow/branch execution does not know whether '{other}' treats identifier case as \
