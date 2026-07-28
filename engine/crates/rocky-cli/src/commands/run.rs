@@ -5771,59 +5771,6 @@ fn apply_shadow_rewrite(
 
     let quote_style = rewrite_quote_style(dialect)?;
 
-    // Target identity is case-folded, and so is the tail match inside
-    // `rewrite_upstream_refs`. On a dialect that quotes its targets that is a
-    // lossy key: `"Orders"` and `"orders"` are two distinct Snowflake tables
-    // that fold to one identity, so a read of one could be redirected to the
-    // other's shadow.
-    //
-    // Only a ROUTED model's production identity becomes a rename key, so the
-    // ambiguity exists only when a selected model is one side of the collision.
-    // Two unrelated models that happen to differ only by case are none of this
-    // run's business, and rejecting them would fail a scoped `--model` run that
-    // is provably safe. The other side may be unselected, though: a read of an
-    // unselected `"Orders"` still tail-matches the rename key of a selected
-    // `"orders"`, which is exactly the misdirection being prevented.
-    if quote_style.is_some() {
-        let mut folded: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for model in &compile_result.project.models {
-            let exact = format!(
-                "{}.{}.{}",
-                model.config.target.catalog, model.config.target.schema, model.config.target.table
-            );
-            folded
-                .entry(exact.to_ascii_lowercase())
-                .or_default()
-                .push((exact, model.config.name.clone()));
-        }
-        for model in &compile_result.project.models {
-            if !is_selected(&model.config.name) {
-                continue;
-            }
-            let exact = format!(
-                "{}.{}.{}",
-                model.config.target.catalog, model.config.target.schema, model.config.target.table
-            );
-            let Some(group) = folded.get(&exact.to_ascii_lowercase()) else {
-                continue;
-            };
-            if let Some((other_exact, other_model)) =
-                group.iter().find(|(candidate, _)| *candidate != exact)
-            {
-                anyhow::bail!(
-                    "shadow/branch execution cannot distinguish the targets of models '{}' \
-                     ('{}') and '{}' ('{}'): they differ only by case, which this dialect \
-                     treats as two different objects. Rename one target so the two differ by \
-                     more than case, or scope the run so it does not select either",
-                    other_model,
-                    other_exact,
-                    model.config.name,
-                    exact,
-                );
-            }
-        }
-    }
-
     let mut production_targets: HashMap<String, Vec<String>> = HashMap::new();
     for model in &compile_result.project.models {
         production_targets
@@ -5967,6 +5914,60 @@ fn apply_shadow_rewrite(
                 },
             ),
         );
+    }
+
+    // Target identity is case-folded, and so is the tail match inside
+    // `rewrite_upstream_refs`. On a dialect that quotes its targets that is a
+    // lossy key: `"Orders"` and `"orders"` are two distinct Snowflake tables
+    // that fold to one identity, so a read of one could be redirected to the
+    // other's shadow.
+    //
+    // The risk exists only where a rename is actually applied. A model's own
+    // identity is excluded from its rename set, so a run that routes a single
+    // model rewrites nothing at all and cannot misdirect anything however its
+    // target is spelled — rejecting that would fail a provably safe
+    // `--model` run. Below two routed models the check is therefore skipped
+    // entirely. Above it, the trigger is a routed model, while the collision
+    // partner is drawn from every compiled model: a read of an unselected
+    // `"Orders"` still tail-matches the rename key of a selected `"orders"`.
+    if quote_style.is_some() && routes.len() > 1 {
+        let mut folded: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for model in &compile_result.project.models {
+            let exact = format!(
+                "{}.{}.{}",
+                model.config.target.catalog, model.config.target.schema, model.config.target.table
+            );
+            folded
+                .entry(exact.to_ascii_lowercase())
+                .or_default()
+                .push((exact, model.config.name.clone()));
+        }
+        for model in &compile_result.project.models {
+            if !routes.contains_key(&model.config.name) {
+                continue;
+            }
+            let exact = format!(
+                "{}.{}.{}",
+                model.config.target.catalog, model.config.target.schema, model.config.target.table
+            );
+            let Some(group) = folded.get(&exact.to_ascii_lowercase()) else {
+                continue;
+            };
+            if let Some((other_exact, other_model)) =
+                group.iter().find(|(candidate, _)| *candidate != exact)
+            {
+                anyhow::bail!(
+                    "shadow/branch execution cannot distinguish the targets of models '{}' \
+                     ('{}') and '{}' ('{}'): they differ only by case, which this dialect \
+                     treats as two different objects. Rename one target so the two differ by \
+                     more than case, or scope the run so it routes only one of them",
+                    other_model,
+                    other_exact,
+                    model.config.name,
+                    exact,
+                );
+            }
+        }
     }
 
     // Reverse index of the rename keys, so a key that `rewrite_upstream_refs`
@@ -16787,19 +16788,18 @@ timestamp_column = "ts"
         }
     }
 
-    /// The case guard must scope to what the run actually routes. Only a
-    /// selected model's identity becomes a rename key, so a collision between
-    /// two models this run does not touch cannot misdirect anything — and
-    /// rejecting it would fail a scoped `--model` run that is provably safe.
+    /// A run that routes a single model rewrites nothing — a model's own
+    /// identity is excluded from its rename set — so it cannot misdirect a read
+    /// however its target is spelled. Even a collision against the selected
+    /// model's OWN target must not fail it.
     #[cfg(feature = "duckdb")]
     #[test]
-    fn shadow_allows_case_collisions_outside_the_selected_set() {
+    fn shadow_allows_a_single_model_run_whose_own_target_collides_by_case() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
-        write_model_with_target(&models_dir, "picked", "SELECT 1 AS id", "main", "picked");
-        // Two models that collide only by case, neither of them selected.
         write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        // Same folded identity as the selected model, different spelling.
         write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
         let mut compiled =
             rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
@@ -16809,13 +16809,67 @@ timestamp_column = "ts"
             .expect("compile models");
         super::apply_shadow_rewrite(
             &mut compiled,
-            Some("picked"),
+            Some("lower"),
             None,
             &rocky_core::shadow::ShadowConfig::default(),
             &rocky_snowflake::dialect::SnowflakeSqlDialect,
             false,
         )
-        .expect("a scoped run must not be rejected for a collision it does not route");
+        .expect("a single-model run rewrites no reads and must not be rejected");
+        let lower = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "lower")
+            .expect("lower missing");
+        assert_eq!(lower.config.target.table, "orders_rocky_shadow");
+        let upper = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "upper")
+            .expect("upper missing");
+        assert_eq!(
+            upper.config.target.table, "Orders",
+            "an unselected model must stay on its production target"
+        );
+    }
+
+    /// The case guard must scope its TRIGGER to routed models. Two models that
+    /// collide only by case and are both outside the selected set can never be
+    /// the destination of a rename, so the run is safe and must not be rejected.
+    /// Uses two routed models so the guard actually runs — with one, the
+    /// no-renames short-circuit would decide the outcome instead.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_allows_case_collisions_outside_the_selected_set() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "picked", "SELECT 1 AS id", "main", "picked");
+        write_model_with_target(&models_dir, "also", "SELECT 1 AS id", "main", "also");
+        // Two models that collide only by case, neither of them selected.
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["picked".to_string(), "also".to_string()]
+                .into_iter()
+                .collect();
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            Some(&selected),
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect("a collision the run does not route must not reject it");
         let picked = compiled
             .project
             .models
@@ -16825,16 +16879,21 @@ timestamp_column = "ts"
         assert_eq!(picked.config.target.table, "picked_rocky_shadow");
     }
 
-    /// Two targets differing only by case are one object to the case-folded
-    /// identity key but two objects to a quoting dialect. Refuse rather than
-    /// redirect a read to the wrong one.
+    /// A routed model whose target case-collides with an UNSELECTED model is the
+    /// gap the shadow-owner check cannot see: the unselected model is never
+    /// routed, so no shared shadow target exists, yet a read of its target still
+    /// folds onto the routed model's rename key and would be redirected to that
+    /// model's shadow. Needs two routed models, because a single one applies no
+    /// renames at all.
     #[cfg(feature = "duckdb")]
     #[test]
-    fn shadow_rejects_case_only_target_collisions_on_quoting_dialects() {
+    fn shadow_rejects_case_collision_between_routed_and_unselected_targets() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "driver", "SELECT 1 AS id", "main", "driver");
         write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        // Not selected, so `shadow_owners` never compares against it.
         write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
         let mut compiled =
             rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
@@ -16842,15 +16901,19 @@ timestamp_column = "ts"
                 ..Default::default()
             })
             .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["driver".to_string(), "lower".to_string()]
+                .into_iter()
+                .collect();
         let err = super::apply_shadow_rewrite(
             &mut compiled,
             None,
-            None,
+            Some(&selected),
             &rocky_core::shadow::ShadowConfig::default(),
             &rocky_snowflake::dialect::SnowflakeSqlDialect,
             false,
         )
-        .expect_err("case-only target collision must be rejected on a quoting dialect");
+        .expect_err("a routed target colliding by case with an unselected one must be rejected");
         assert!(
             format!("{err:#}").contains("differ only by case"),
             "error must explain the collision: {err:#}"
