@@ -5989,26 +5989,47 @@ fn apply_shadow_rewrite(
             let Some(group) = folded.get(&exact.to_ascii_lowercase()) else {
                 continue;
             };
-            // Only a read spelled differently from this model's own target can
-            // be folded onto its rename key by mistake. If every mention of the
-            // table across the models being rewritten already matches the
-            // routed spelling exactly, the rewrite is unambiguous and the run is
-            // safe however many other objects share the folded name.
-            let table = model.config.target.table.as_str();
-            let miscased_read = routes.keys().any(|name| {
-                compile_result
-                    .project
-                    .models
-                    .iter()
-                    .find(|candidate| &candidate.config.name == name)
-                    .is_some_and(|candidate| mentions_other_casing(&candidate.sql, table))
-            });
-            if !miscased_read {
-                continue;
-            }
             if let Some((other_exact, other_model)) =
                 group.iter().find(|(candidate, _)| *candidate != exact)
             {
+                // Only a read spelled differently from this model's own target
+                // can be folded onto its rename key by mistake. Check exactly
+                // the components that disagree between the two targets: a
+                // collision may sit in the catalog or schema rather than the
+                // table (`Main.orders` against `main.orders` spells the table
+                // identically), and checking components that already agree
+                // would reject on an unrelated mention of a common word.
+                let routed = [
+                    model.config.target.catalog.as_str(),
+                    model.config.target.schema.as_str(),
+                    model.config.target.table.as_str(),
+                ];
+                let other: Vec<&str> = other_exact.split('.').collect();
+                let ambiguous_parts: Vec<&str> = routed
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, part)| {
+                        other
+                            .get(*index)
+                            .is_some_and(|counterpart| counterpart != *part)
+                    })
+                    .map(|(_, part)| *part)
+                    .collect();
+                let miscased_read = routes.keys().any(|name| {
+                    compile_result
+                        .project
+                        .models
+                        .iter()
+                        .find(|candidate| &candidate.config.name == name)
+                        .is_some_and(|candidate| {
+                            ambiguous_parts
+                                .iter()
+                                .any(|part| mentions_other_casing(&candidate.sql, part))
+                        })
+                });
+                if !miscased_read {
+                    continue;
+                }
                 anyhow::bail!(
                     "shadow/branch execution cannot distinguish the targets of models '{}' \
                      ('{}') and '{}' ('{}'): they differ only by case, which this dialect \
@@ -16898,6 +16919,51 @@ timestamp_column = "ts"
         assert_eq!(
             upper.config.target.table, "Orders",
             "an unselected model must stay on its production target"
+        );
+    }
+
+    /// A case collision can sit in the schema or catalog rather than the table.
+    /// `Main.orders` and `main.orders` spell the table identically, so evidence
+    /// keyed on the table alone would find nothing and let the ambiguous read
+    /// through.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_case_collision_in_the_schema_component() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // Reads the unselected model's schema spelling; the table part matches.
+        write_model_with_target(
+            &models_dir,
+            "driver",
+            "SELECT id FROM Main.orders",
+            "main",
+            "driver",
+        );
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "Main", "orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["driver".to_string(), "lower".to_string()]
+                .into_iter()
+                .collect();
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            Some(&selected),
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("a schema-only case collision must be rejected too");
+        assert!(
+            format!("{err:#}").contains("differ only by case"),
+            "error must explain the collision: {err:#}"
         );
     }
 
