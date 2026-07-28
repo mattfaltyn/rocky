@@ -5989,8 +5989,12 @@ fn apply_shadow_rewrite(
             let Some(group) = folded.get(&exact.to_ascii_lowercase()) else {
                 continue;
             };
-            if let Some((other_exact, other_model)) =
-                group.iter().find(|(candidate, _)| *candidate != exact)
+            // EVERY colliding spelling, not just the first. A folded name can
+            // be shared by three or more targets, and evidence for one partner
+            // says nothing about another: stopping at the first would skip a
+            // partner whose components a model does read ambiguously.
+            for (other_exact, other_model) in
+                group.iter().filter(|(candidate, _)| *candidate != exact)
             {
                 // Only a read spelled differently from this model's own target
                 // can be folded onto its rename key by mistake. Check exactly
@@ -16919,6 +16923,67 @@ timestamp_column = "ts"
         assert_eq!(
             upper.config.target.table, "Orders",
             "an unselected model must stay on its production target"
+        );
+    }
+
+    /// A folded name can be shared by three or more targets. Evidence for one
+    /// colliding spelling says nothing about another, so the guard has to weigh
+    /// every partner: here the first one it meets has no ambiguous read and the
+    /// second one does.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_rejects_a_later_case_collision_partner() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // Reads the TABLE variant. Nothing anywhere reads the schema variant.
+        write_model_with_target(
+            &models_dir,
+            "driver",
+            "SELECT id FROM main.Orders",
+            "main",
+            "driver",
+        );
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        // Two further spellings of the same folded identity. `a_schema_variant`
+        // sorts first, and no model reads `Main`, so a guard that stopped at the
+        // first partner would clear the run.
+        write_model_with_target(
+            &models_dir,
+            "a_schema_variant",
+            "SELECT 2 AS id",
+            "Main",
+            "orders",
+        );
+        write_model_with_target(
+            &models_dir,
+            "z_table_variant",
+            "SELECT 3 AS id",
+            "main",
+            "Orders",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["driver".to_string(), "lower".to_string()]
+                .into_iter()
+                .collect();
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            Some(&selected),
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("a colliding partner beyond the first must still be rejected");
+        assert!(
+            format!("{err:#}").contains("differ only by case"),
+            "error must explain the collision: {err:#}"
         );
     }
 
