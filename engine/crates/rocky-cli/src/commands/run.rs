@@ -5774,27 +5774,47 @@ fn apply_shadow_rewrite(
     // Target identity is case-folded, and so is the tail match inside
     // `rewrite_upstream_refs`. On a dialect that quotes its targets that is a
     // lossy key: `"Orders"` and `"orders"` are two distinct Snowflake tables
-    // that fold to one identity, and a read of either could be redirected to
-    // the other's shadow. Refuse rather than guess. Checked across every
-    // compiled model, not just the selected ones, because an unselected model
-    // is exactly the case the routing loop below would not otherwise notice.
+    // that fold to one identity, so a read of one could be redirected to the
+    // other's shadow.
+    //
+    // Only a ROUTED model's production identity becomes a rename key, so the
+    // ambiguity exists only when a selected model is one side of the collision.
+    // Two unrelated models that happen to differ only by case are none of this
+    // run's business, and rejecting them would fail a scoped `--model` run that
+    // is provably safe. The other side may be unselected, though: a read of an
+    // unselected `"Orders"` still tail-matches the rename key of a selected
+    // `"orders"`, which is exactly the misdirection being prevented.
     if quote_style.is_some() {
-        let mut folded: HashMap<String, (String, String)> = HashMap::new();
+        let mut folded: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for model in &compile_result.project.models {
             let exact = format!(
                 "{}.{}.{}",
                 model.config.target.catalog, model.config.target.schema, model.config.target.table
             );
-            let key = exact.to_ascii_lowercase();
+            folded
+                .entry(exact.to_ascii_lowercase())
+                .or_default()
+                .push((exact, model.config.name.clone()));
+        }
+        for model in &compile_result.project.models {
+            if !is_selected(&model.config.name) {
+                continue;
+            }
+            let exact = format!(
+                "{}.{}.{}",
+                model.config.target.catalog, model.config.target.schema, model.config.target.table
+            );
+            let Some(group) = folded.get(&exact.to_ascii_lowercase()) else {
+                continue;
+            };
             if let Some((other_exact, other_model)) =
-                folded.insert(key, (exact.clone(), model.config.name.clone()))
-                && other_exact != exact
+                group.iter().find(|(candidate, _)| *candidate != exact)
             {
                 anyhow::bail!(
                     "shadow/branch execution cannot distinguish the targets of models '{}' \
                      ('{}') and '{}' ('{}'): they differ only by case, which this dialect \
                      treats as two different objects. Rename one target so the two differ by \
-                     more than case",
+                     more than case, or scope the run so it does not select either",
                     other_model,
                     other_exact,
                     model.config.name,
@@ -16765,6 +16785,44 @@ timestamp_column = "ts"
                  folds case and names a different object: {sql}"
             );
         }
+    }
+
+    /// The case guard must scope to what the run actually routes. Only a
+    /// selected model's identity becomes a rename key, so a collision between
+    /// two models this run does not touch cannot misdirect anything — and
+    /// rejecting it would fail a scoped `--model` run that is provably safe.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_allows_case_collisions_outside_the_selected_set() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "picked", "SELECT 1 AS id", "main", "picked");
+        // Two models that collide only by case, neither of them selected.
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            Some("picked"),
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect("a scoped run must not be rejected for a collision it does not route");
+        let picked = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "picked")
+            .expect("picked missing");
+        assert_eq!(picked.config.target.table, "picked_rocky_shadow");
     }
 
     /// Two targets differing only by case are one object to the case-folded
