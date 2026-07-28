@@ -67,11 +67,29 @@ the required checks to the GitHub Actions source if the settings UI offers that
 choice. Require branches to be up to date before merging, do not grant ordinary
 bypass access, and keep any emergency override limited to named maintainers.
 
+Requiring these two checks is not optional hardening, and the repository's other
+required checks are not a substitute. Every other required context is
+path-filtered on `engine/**`, so a pull request that bundles any engine source
+edit with a hostile `.github` edit reports all of them green. If the containment
+check is merely present-and-red rather than required, GitHub returns a mergeable
+state and the change lands with no override and no administrator involvement. The
+absence of an engine change is likewise not a barrier: a `.github`-only pull
+request leaves the engine contexts pending, which is the same state that ordinary
+docs-only work produces, so it is routinely cleared rather than investigated.
+
 Verify the rule with a disposable pull request that makes a policy regression:
 the first check must fail from trusted `main` tooling, the candidate regression
 suite must report its own result, and GitHub must refuse the merge. Restore the
 test branch without merging it. A green policy job is advisory until these
 required-check rules are enabled.
+
+**Status: enabled.** The `main` ruleset now requires `Credential containment
+policy` and `Credential-containment regression tests` alongside the engine
+contexts, with branches required to be up to date. The rule was verified against
+a real trust-root change rather than a disposable one: #1277 turned the policy
+check red, the regression suite reported its own green result, and GitHub refused
+the merge until a maintainer applied the narrow override. Before the required
+checks were added, that same pull request reported a mergeable state.
 
 The trusted policy workflow never checks out the candidate revision. It uses a
 read-only token to fetch the exact candidate commit's `.github` Git tree as
@@ -111,6 +129,38 @@ closed only after these pass on the merged revision:
 Record the run URLs in the remediation ledger. Until these pass on `main`, the
 code is merge-ready but RD-026 stays In review.
 
+## Release and deployment action sources
+
+The containment rules above govern jobs reachable from a pull request. Release,
+publish and deployment workflows are a different trust domain: they run from a
+tag or a push, never execute candidate code, and so none of the pull-request
+rules applied to them. They do hold a write token and the publishing secrets,
+which made an unreviewed action source in one of their steps a direct path into
+the artifacts this project ships — `engine/install.sh` serves exactly those
+binaries.
+
+Every job that is not reachable from a pull request may therefore only run
+actions in `RELEASE_ACTION_SOURCES`, the pinned allowlist in the checker. Parsing
+fails closed: a step whose `uses:` cannot be read as exactly one pinned remote
+source is a violation rather than something to skip, and a repository-local
+action in such a job is rejected outright. Adding a new action to a release
+workflow is a trust-root change and follows the bootstrap procedure below.
+
+Pin provenance is not self-verifying. A pinned commit that shares a long prefix
+with the intended tag but diverges is indistinguishable by eye and simply fails
+to resolve at run time. Confirm any new pin against its upstream tag before
+adding it to the allowlist.
+
+These jobs must also use the canonical block form the checker understands: block
+mapping jobs, a `steps:` list at six-space indentation, no flow-style `jobs: {...}`,
+no job image, and no reusable-workflow call. A step whose scalar spans several
+lines with a continuation beginning `uses:` is rejected as well. Recognising that
+shape needs a real YAML parser, which this checker forgoes so the same trusted
+file can run in the minimal policy job, so it fails closed and the author
+reformats. The restriction is safe in the other direction: a scalar can never
+conceal an executed step, because step splitting keys off the six-space prefix
+unconditionally.
+
 ## Updating frozen trust roots
 
 The credential-containment workflow compares the candidate copies of its
@@ -131,5 +181,11 @@ Use this bootstrap procedure for an intentional trust-root update:
    imports candidate code before credentials become available.
 4. Have an authorized maintainer use the narrow branch-protection override to
    merge that reviewed SHA. Do not disable the policy or broaden its allowlist.
-5. Treat the new `main` revision as the trusted checker, rerun the containment
-   workflow, and confirm it accepts the repository before any other merge.
+5. Treat the new `main` revision as the trusted checker and confirm it accepts the
+   repository before any other merge. `ci-security-policy.yml` triggers only on
+   `pull_request_target`, so there is no way to rerun it against `main` on demand:
+   the confirmation run is **the next pull request opened after the bootstrap
+   merge**. Open one that does not itself touch a trust root, and require its
+   `Credential containment policy` result to be green before merging anything
+   else. A second trust-root pull request opened immediately would report red for
+   its own bootstrap reasons and cannot confirm the previous one.

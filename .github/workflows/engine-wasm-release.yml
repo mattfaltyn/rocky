@@ -23,7 +23,7 @@ jobs:
     name: Ensure GitHub Release exists
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -48,7 +48,7 @@ jobs:
     needs: ensure-release
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -71,7 +71,7 @@ jobs:
       # Prebuilt binary — avoids ~40s of `cargo install wasm-pack --locked`
       # per run and skips a transitive compilation that occasionally trips
       # MSRV / yanked-crate failures.
-      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e0cafa345d365d15 # v0.4.0
+      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
         with:
           version: 'v0.13.1'
 

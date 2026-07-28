@@ -39,7 +39,13 @@ from normalize_json import (  # noqa: E402
     extract_command_object,
     normalize_preview_json,
 )
-from check_credential_containment import FROZEN_TRUST_ROOTS, check_repository  # noqa: E402
+from check_credential_containment import (  # noqa: E402
+    CHECKOUT_SOURCE,
+    FROZEN_TRUST_ROOTS,
+    RELEASE_ACTION_SOURCES,
+    WASM_PACK_SOURCE,
+    check_repository,
+)
 from preview_comment import (  # noqa: E402
     COMMENT_MARKER,
     MAX_COMMENT_BYTES,
@@ -1081,7 +1087,7 @@ jobs:
   payload:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - run: ./payload/run.sh
@@ -1292,7 +1298,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out exact candidate policy input
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
@@ -1553,6 +1559,324 @@ jobs:
         violations = self.check_fixture("engine-evals.yml", workflow)
         self.assertTrue(any("duplicate top-level" in item for item in violations))
 
+    def test_release_workflow_cannot_run_an_unreviewed_action(self) -> None:
+        workflow = self.read(".github/workflows/engine-release.yml").replace(
+            "      - uses: actions/checkout@"
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "      - uses: attacker/evil-action@"
+            "1111111111111111111111111111111111111111 # v1",
+            1,
+        )
+        violations = self.check_fixture("engine-release.yml", workflow)
+        self.assertTrue(
+            any("release step action source is not allow-listed" in item for item in violations)
+        )
+
+    def test_every_release_workflow_rejects_an_unreviewed_action(self) -> None:
+        """The rule must bind on each credentialed non-pull-request workflow.
+
+        Covering only engine-release.yml would let a sibling release workflow
+        regress silently, which is how this gap existed in the first place.
+        """
+
+        workflows = REPOSITORY_ROOT / ".github" / "workflows"
+        covered = []
+        for path in sorted(workflows.glob("*.yml")):
+            text = path.read_text()
+            if "\n  pull_request:" in text or "\n  pull_request_target:" in text:
+                continue
+            if "\n      - uses: " not in text:
+                continue
+            covered.append(path.name)
+            hostile = text.replace(
+                "\n      - uses: ",
+                "\n      - uses: attacker/evil-action@"
+                "1111111111111111111111111111111111111111\n      - uses: ",
+                1,
+            )
+            violations = self.check_fixture(path.name, hostile)
+            self.assertTrue(
+                any(
+                    "release step action source is not allow-listed" in item
+                    for item in violations
+                ),
+                f"{path.name} did not reject an unreviewed action source",
+            )
+        self.assertIn("engine-release.yml", covered)
+        self.assertIn("engine-wasm-release.yml", covered)
+        self.assertIn("sdk-release.yml", covered)
+        self.assertIn("dagster-release.yml", covered)
+        self.assertIn("vscode-release.yml", covered)
+
+    def test_release_step_local_action_and_ambiguous_uses_fail_closed(self) -> None:
+        base = self.read(".github/workflows/engine-release.yml")
+        local = base.replace(
+            "      - uses: actions/checkout@"
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "      - uses: ./.github/actions/rocky-preview",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "release step runs a repository-local action" in item
+                for item in self.check_fixture("engine-release.yml", local)
+            )
+        )
+        ambiguous = base.replace(
+            "      - uses: actions/checkout@"
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "      - uses: actions/checkout@"
+            "3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+            "        uses: attacker/evil-action@"
+            "1111111111111111111111111111111111111111",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "release step declares more than one action source" in item
+                for item in self.check_fixture("engine-release.yml", ambiguous)
+            )
+        )
+
+    def test_release_job_cannot_hide_an_action_outside_a_canonical_step(self) -> None:
+        """Per-step correctness is not enough; the step list must be complete.
+
+        _step_blocks only recognises canonical six-space steps, so a job-level
+        `uses:` or a differently indented step list would be parsed as "no steps"
+        and pass a per-step allowlist unchallenged. Each of these shapes is a
+        working release job as far as GitHub is concerned.
+        """
+
+        reusable = """\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: attacker/evil-repo/.github/workflows/pwn.yml@main
+    secrets: inherit
+"""
+        self.assertTrue(
+            any(
+                "release job must not call a reusable workflow" in item
+                for item in self.check_fixture("engine-release.yml", reusable)
+            ),
+            "a reusable workflow call escaped the release allowlist",
+        )
+
+        misindented = """\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+        - uses: attacker/evil-action@1111111111111111111111111111111111111111
+"""
+        self.assertTrue(
+            any(
+                "release job declares an action outside a canonical step" in item
+                for item in self.check_fixture("engine-release.yml", misindented)
+            ),
+            "a non-canonical step indentation escaped the release allowlist",
+        )
+
+    def test_release_workflow_must_use_canonical_block_jobs(self) -> None:
+        """Flow-style jobs would otherwise skip every per-job release rule.
+
+        `jobs: {build: {...}}` is valid to GitHub and passes actionlint, but the
+        job parser returns either nothing or an `<unparsed:...>` entry, so the
+        per-job loop never runs the release rules and the workflow passes while
+        executing an arbitrary action. The pull-request side already rejects this
+        shape; workflows a pull request cannot reach must too.
+        """
+
+        header = (
+            "name: engine-release\non:\n  push:\n    tags: [\"engine-v*\"]\n\n"
+            "permissions:\n  contents: write\n\n"
+        )
+        evil = "attacker/evil-action@1111111111111111111111111111111111111111"
+        for label, body in (
+            ("inline jobs mapping", "jobs: {build: {runs-on: ubuntu-latest, steps: [{uses: %s}]}}\n" % evil),
+            ("flow-style job body", "jobs:\n  build: {runs-on: ubuntu-latest, steps: [{uses: %s}]}\n" % evil),
+            ("inline reusable workflow", "jobs: {build: {uses: attacker/evil/.github/workflows/p.yml@main}}\n"),
+        ):
+            violations = self.check_fixture("engine-release.yml", header + body)
+            self.assertTrue(
+                any("must use canonical block form" in item for item in violations),
+                f"{label} escaped the release rules",
+            )
+
+    def test_release_completeness_ignores_non_step_uses_keys(self) -> None:
+        """A `uses` key outside the steps block is data, not an action.
+
+        A matrix dimension named `uses` sits at a deeper indentation than the
+        step parser recognises, so counting `uses:` across the whole job would
+        read it as a missed action and reject a valid workflow.
+        """
+
+        workflow = f"""\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - uses: linux
+          - uses: macos
+    steps:
+      - uses: {CHECKOUT_SOURCE}
+"""
+        violations = [
+            item
+            for item in self.check_fixture("engine-release.yml", workflow)
+            if "release" in item
+        ]
+        self.assertEqual(violations, [], "matrix data was read as an action source")
+
+    def test_release_rules_read_structure_not_run_script_bodies(self) -> None:
+        """A `run:` body is shell, not an action source.
+
+        The completeness check counts `uses:` occurrences, so a heredoc that
+        writes out a workflow file - which legitimately contains `- uses:` lines -
+        would be counted as an action the step parser missed and reject a valid
+        job. `_check_unprivileged_job` already reads structural text for the same
+        reason; the release rules must too.
+        """
+
+        workflow = f"""\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # uses: attacker/evil-action@1111111111111111111111111111111111111111
+      - name: generate a workflow
+        run: |
+          cat > wf.yml <<'EOF'
+          steps:
+            - uses: someone/else@2222222222222222222222222222222222222222
+          EOF
+      - uses: {CHECKOUT_SOURCE}
+"""
+        violations = [
+            item
+            for item in self.check_fixture("engine-release.yml", workflow)
+            if "release" in item
+        ]
+        self.assertEqual(violations, [], "release rules read a run: body as an action")
+
+    def test_release_job_cannot_run_a_container_image(self) -> None:
+        """A job image runs arbitrary code under the same write token as a step."""
+
+        for key, value in (("container", "attacker/evil-image:latest"), ("services", "")):
+            block = f"    {key}: {value}\n" if value else (
+                "    services:\n      db:\n        image: attacker/evil-image:latest\n"
+            )
+            workflow = f"""\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+{block}    steps:
+      - uses: {CHECKOUT_SOURCE}
+"""
+            self.assertTrue(
+                any(
+                    f"release job declares a {key}" in item
+                    for item in self.check_fixture("engine-release.yml", workflow)
+                ),
+                f"a hostile {key} escaped the release rules",
+            )
+
+    def test_release_rules_reject_multiline_scalar_steps_by_design(self) -> None:
+        """A multi-line scalar whose continuation starts with `uses:` is rejected.
+
+        This is a deliberate restriction, not an oversight. Recognising a plain or
+        quoted multi-line scalar needs a real YAML parser, which this checker
+        forgoes on purpose so the same trusted file can run in the minimal policy
+        job. The failure is closed: the continuation is counted as an action the
+        step parser missed, so a workflow using that shape is rejected and the
+        author reformats. A scalar can never hide an executed step in the other
+        direction -- `_step_blocks` splits on the six-space step prefix
+        unconditionally -- which is what makes the restriction safe to keep.
+
+        Pinned here so a future reader sees an intended boundary rather than a bug.
+        """
+
+        workflow = f"""\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: a title
+          uses: not/an-action@1111111111111111111111111111111111111111
+      - uses: {CHECKOUT_SOURCE}
+"""
+        violations = self.check_fixture("engine-release.yml", workflow)
+        self.assertTrue(
+            any("release" in item for item in violations),
+            "multi-line scalar steps must fail closed",
+        )
+
+    def test_pinned_release_actions_resolve_to_their_commented_versions(self) -> None:
+        """Every allow-listed release action must be pinned to a real 40-hex commit.
+
+        engine-wasm-release.yml shipped a wasm-pack pin that shared a 25-character
+        prefix with the real v0.4.0 commit and then diverged, so the action could
+        never resolve. A malformed pin is indistinguishable from a correct one by
+        eye, so assert the shape here and keep the allowlist the single source.
+        """
+
+        for source in RELEASE_ACTION_SOURCES:
+            owner_repo, _, sha = source.partition("@")
+            self.assertRegex(sha, r"^[0-9a-f]{40}$", f"{owner_repo} is not SHA-pinned")
+            self.assertIn("/", owner_repo)
+
+        workflows = REPOSITORY_ROOT / ".github" / "workflows"
+        wasm = (workflows / "engine-wasm-release.yml").read_text()
+        self.assertIn(WASM_PACK_SOURCE, wasm)
 
 class WorkflowPolicyTests(unittest.TestCase):
     def read(self, relative_path: str) -> str:
