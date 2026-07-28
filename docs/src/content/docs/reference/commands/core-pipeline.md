@@ -435,9 +435,9 @@ The refusal is deliberate and does not depend on whether any model spells such a
 read today; rename one of the targets, or scope the run so it routes only one of
 them.
 
-This is not the same as whether the dialect quotes identifiers. Trino renders
-targets double-quoted yet folds identifiers to lower case regardless, so two
-targets differing only by case name one object there and the run proceeds.
+This is not the same as whether the dialect quotes identifiers. Rocky renders
+Trino targets double-quoted, yet treats two Trino targets differing only by case
+as one object, so such a run proceeds there.
 
 `--shadow` and `--branch` isolate `rocky run` for transformation pipelines.
 `rocky run --dag`, and the snapshot and load pipeline kinds, still write
