@@ -26,7 +26,7 @@ PINNED_CHECKOUT_RE = re.compile(r"actions/checkout@[0-9a-f]{40}")
 PINNED_REMOTE_ACTION_RE = re.compile(
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.\-/]+@[0-9a-f]{40}"
 )
-CHECKOUT_SOURCE = "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
+CHECKOUT_SOURCE = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 GITHUB_SCRIPT_SOURCE = (
     "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3"
 )
@@ -39,7 +39,7 @@ RUST_TOOLCHAIN_SOURCE = (
 RUST_CACHE_SOURCE = (
     "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
 )
-SETUP_UV_SOURCE = "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990"
+SETUP_UV_SOURCE = "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9"
 SETUP_NODE_SOURCE = (
     "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
 )
