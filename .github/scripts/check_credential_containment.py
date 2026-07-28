@@ -43,6 +43,52 @@ SETUP_UV_SOURCE = "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9"
 SETUP_NODE_SOURCE = (
     "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
 )
+DEPLOY_PAGES_SOURCE = (
+    "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128"
+)
+UPLOAD_PAGES_ARTIFACT_SOURCE = (
+    "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9"
+)
+SETUP_NASM_SOURCE = "ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b"
+WASM_PACK_SOURCE = (
+    "jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa"
+)
+SETUP_ZIG_SOURCE = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29"
+PYPI_PUBLISH_SOURCE = (
+    "pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247"
+)
+GH_RELEASE_SOURCE = (
+    "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
+)
+TAIKI_INSTALL_SOURCE = (
+    "taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf"
+)
+# Actions a job may run when it is not reachable from a pull request. Release,
+# publish and deployment workflows never execute candidate code, so the
+# containment rules that govern pull-request jobs do not apply to them; what they
+# do hold is a write token and the publishing secrets. That makes an unreviewed
+# action source in one of their steps a direct supply-chain path into the
+# artifacts this project ships, which nothing else in this checker examined.
+RELEASE_ACTION_SOURCES = frozenset(
+    {
+        CHECKOUT_SOURCE,
+        DEPLOY_PAGES_SOURCE,
+        GH_RELEASE_SOURCE,
+        GITHUB_SCRIPT_SOURCE,
+        PYPI_PUBLISH_SOURCE,
+        RUST_CACHE_SOURCE,
+        RUST_TOOLCHAIN_SOURCE,
+        SETUP_NASM_SOURCE,
+        SETUP_NODE_SOURCE,
+        SETUP_UV_SOURCE,
+        SETUP_ZIG_SOURCE,
+        TAIKI_INSTALL_SOURCE,
+        UPLOAD_ARTIFACT_SOURCE,
+        UPLOAD_PAGES_ARTIFACT_SOURCE,
+        WASM_PACK_SOURCE,
+    }
+)
+STEP_USES_RE = re.compile(r"(?m)^\s+(?:-\s+)?uses:\s*([^\s#]+)")
 MODEL_SECRET_RE = re.compile(r"\bANTHROPIC_API_KEY\b", re.IGNORECASE)
 CANDIDATE_JOBS = {
     ("ai-review.yml", "context"),
@@ -1270,6 +1316,67 @@ def _check_unprivileged_job(
     return violations
 
 
+def _check_release_job_sources(job: str) -> list[str]:
+    """Restrict a non-pull-request job to the pinned release action allowlist.
+
+    Parsing fails closed. A step whose `uses:` cannot be read as exactly one
+    pinned remote source is a violation rather than something to skip, because
+    the surrounding job holds credentials and an unreadable step is precisely
+    where an attacker would hide one.
+    """
+
+    # Read structure only. A `run:` body is shell, not an action source, and a
+    # heredoc that writes out a workflow file legitimately contains `- uses:`
+    # lines; counting those would reject a valid job. _yaml_structural_text
+    # drops comments and block-scalar bodies, and it cannot hide a real step:
+    # scalar mode ends as soon as indentation returns to the step level.
+    structural = _yaml_structural_text(job)
+    violations: list[str] = []
+    parsed: list[str] = []
+
+    # A job-level `uses:` is a reusable-workflow call: it replaces the whole job
+    # and never appears as a step, so no step-based rule can see it.
+    if _key_block(structural, "uses", indent=4) is not None:
+        violations.append("release job must not call a reusable workflow")
+
+    for step in _step_blocks(structural):
+        declared = STEP_USES_RE.findall(step)
+        if not declared:
+            continue
+        parsed.extend(declared)
+        if len(declared) > 1:
+            violations.append("release step declares more than one action source")
+            continue
+        source = declared[0].strip("'\"")
+        if source.startswith("."):
+            violations.append("release step runs a repository-local action")
+        elif source not in RELEASE_ACTION_SOURCES:
+            violations.append("release step action source is not allow-listed")
+
+    # Completeness, not just per-step correctness. _step_blocks only recognises
+    # canonical six-space steps, so anything else -- a job-level `uses:` calling
+    # a reusable workflow, or a step list at a different indentation -- would
+    # otherwise be invisible here and pass. Comparing the raw count against the
+    # parsed count turns every such shape into a violation instead of a silent
+    # gap, which is the difference between this rule binding and merely looking
+    # like it does.
+    # Completeness, not just per-step correctness. _step_blocks only recognises
+    # canonical six-space steps, so a step list at any other indentation would
+    # otherwise be invisible here and pass. Count within the steps block only:
+    # a `uses` key elsewhere in the job -- a matrix dimension named `uses`, say --
+    # is data, not an action, and counting it would reject a valid job.
+    steps_block = _key_block(structural, "steps", indent=4)
+    if steps_block is not None and len(STEP_USES_RE.findall(steps_block)) != len(parsed):
+        violations.append("release job declares an action outside a canonical step")
+
+    # A job image runs arbitrary code under the same write token as the steps,
+    # so it is an action source in everything but name.
+    for key in ("container", "services"):
+        if _key_block(structural, key, indent=4) is not None:
+            violations.append(f"release job declares a {key}")
+    return violations
+
+
 def _check_live_evals(workflow: Workflow, job: str) -> list[str]:
     violations: list[str] = []
     top_level_keys = re.findall(
@@ -1477,6 +1584,15 @@ def check_workflow(workflow: Workflow) -> list[str]:
         violations.append("PR-triggered jobs must use canonical block form")
     if pr_triggered and any(name.startswith("<unparsed:") for name in jobs):
         violations.append("PR-triggered job definitions must use canonical block form")
+    # The same requirement for workflows a pull request cannot reach. Without it
+    # the release rules below are trivially evaded: a flow-style `jobs: {...}`
+    # is valid to GitHub and to actionlint, but the job parser returns either
+    # nothing or an <unparsed:...> entry, so every per-job rule is skipped and
+    # the workflow passes while running an arbitrary action.
+    if not pr_triggered and ("jobs:" not in workflow.text.splitlines() or not jobs):
+        violations.append("release jobs must use canonical block form")
+    if not pr_triggered and any(name.startswith("<unparsed:") for name in jobs):
+        violations.append("release job definitions must use canonical block form")
     job_names = [
         match.group("bare") or match.group("single") or match.group("double")
         for line in workflow.text.splitlines()
@@ -1559,6 +1675,8 @@ def check_workflow(workflow: Workflow) -> list[str]:
                     allowed_checkout_maps=CANDIDATE_CHECKOUT_MAPS.get(job_identity),
                 )
             )
+        if not pr_triggered and not job_name.startswith("<unparsed:"):
+            violations.extend(_check_release_job_sources(job))
         if MODEL_SECRET_RE.search(job) and (workflow.path.name, job_name) not in {
             ("ai-review.yml", "ai-review"),
             ("engine-evals-live.yml", "evals"),
