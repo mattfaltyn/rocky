@@ -5744,42 +5744,6 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
     }
 }
 
-/// Whether `sql` mentions `token` as an identifier in some spelling other than
-/// `token` itself.
-///
-/// The shadow rename matches table references case-insensitively, so on a
-/// dialect where identifiers are case-sensitive a read spelled `Orders` folds
-/// onto the rename key of a target spelled `orders`. Only such a read can be
-/// misdirected; a mention that already matches the routed spelling exactly is
-/// unambiguous. Bounded on identifier characters so `orders` does not match
-/// `orders_daily`.
-fn mentions_other_casing(sql: &str, token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let haystack = sql.to_ascii_lowercase();
-    let needle = token.to_ascii_lowercase();
-    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    let mut from = 0usize;
-    while let Some(offset) = haystack[from..].find(&needle) {
-        let start = from + offset;
-        let end = start + needle.len();
-        let bounded_left =
-            start == 0 || !haystack[..start].chars().next_back().is_some_and(is_ident);
-        let bounded_right = haystack[end..].chars().next().is_none_or(|c| !is_ident(c));
-        if bounded_left
-            && bounded_right
-            && sql
-                .get(start..end)
-                .is_some_and(|spelling| spelling != token)
-        {
-            return true;
-        }
-        from = end;
-    }
-    false
-}
-
 /// Route the models built by this invocation and their in-run dependency reads
 /// to shadow targets. Deferred or otherwise unselected upstreams stay on their
 /// production targets.
@@ -5989,56 +5953,30 @@ fn apply_shadow_rewrite(
             let Some(group) = folded.get(&exact.to_ascii_lowercase()) else {
                 continue;
             };
-            // EVERY colliding spelling, not just the first. A folded name can
-            // be shared by three or more targets, and evidence for one partner
-            // says nothing about another: stopping at the first would skip a
-            // partner whose components a model does read ambiguously.
-            for (other_exact, other_model) in
-                group.iter().filter(|(candidate, _)| *candidate != exact)
+            // Any other spelling of the same folded name is a different object
+            // on this dialect, and the rename matches case-insensitively, so a
+            // read of either could land on this model's shadow. Refuse.
+            //
+            // Deliberately unconditional on whether some model actually spells
+            // such a read today. Earlier revisions tried to require that
+            // evidence and it was wrong four times over — a scan of the SQL text
+            // cannot tell a table reference from a column, alias, literal or
+            // comment of the same name, and reconstructing the matcher's
+            // resolution from outside the matcher is what kept failing. The
+            // durable fix is to make `rewrite_upstream_refs` case-sensitive when
+            // the dialect quotes identifiers, after which this guard can go
+            // entirely; until then this errs toward refusing a run the operator
+            // can unblock by renaming, rather than silently reading the wrong
+            // table.
+            if let Some((other_exact, other_model)) =
+                group.iter().find(|(candidate, _)| *candidate != exact)
             {
-                // Only a read spelled differently from this model's own target
-                // can be folded onto its rename key by mistake. Check exactly
-                // the components that disagree between the two targets: a
-                // collision may sit in the catalog or schema rather than the
-                // table (`Main.orders` against `main.orders` spells the table
-                // identically), and checking components that already agree
-                // would reject on an unrelated mention of a common word.
-                let routed = [
-                    model.config.target.catalog.as_str(),
-                    model.config.target.schema.as_str(),
-                    model.config.target.table.as_str(),
-                ];
-                let other: Vec<&str> = other_exact.split('.').collect();
-                let ambiguous_parts: Vec<&str> = routed
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, part)| {
-                        other
-                            .get(*index)
-                            .is_some_and(|counterpart| counterpart != *part)
-                    })
-                    .map(|(_, part)| *part)
-                    .collect();
-                let miscased_read = routes.keys().any(|name| {
-                    compile_result
-                        .project
-                        .models
-                        .iter()
-                        .find(|candidate| &candidate.config.name == name)
-                        .is_some_and(|candidate| {
-                            ambiguous_parts
-                                .iter()
-                                .any(|part| mentions_other_casing(&candidate.sql, part))
-                        })
-                });
-                if !miscased_read {
-                    continue;
-                }
                 anyhow::bail!(
                     "shadow/branch execution cannot distinguish the targets of models '{}' \
                      ('{}') and '{}' ('{}'): they differ only by case, which this dialect \
-                     treats as two different objects. Rename one target so the two differ by \
-                     more than case, or scope the run so it routes only one of them",
+                     treats as two different objects, while upstream references are matched \
+                     case-insensitively. Rename one target so the two differ by more than \
+                     case, or scope the run so it routes only one of them",
                     other_model,
                     other_exact,
                     model.config.name,
@@ -17029,58 +16967,6 @@ timestamp_column = "ts"
         assert!(
             format!("{err:#}").contains("differ only by case"),
             "error must explain the collision: {err:#}"
-        );
-    }
-
-    /// A collision is only dangerous if some read is actually spelled the other
-    /// way. Two routed models that never mention the ambiguous table in a
-    /// different casing rewrite nothing ambiguous, so the run is safe even
-    /// though a case-colliding target exists elsewhere in the project.
-    #[cfg(feature = "duckdb")]
-    #[test]
-    fn shadow_allows_a_case_collision_no_model_reads_ambiguously() {
-        let tmp = tempfile::TempDir::new().expect("temp dir");
-        let models_dir = tmp.path().join("models");
-        std::fs::create_dir(&models_dir).expect("mkdir models");
-        // Reads `lower`'s target in exactly the routed spelling: unambiguous.
-        write_model_with_target(
-            &models_dir,
-            "driver",
-            "SELECT id FROM main.orders",
-            "main",
-            "driver",
-        );
-        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
-        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
-        let mut compiled =
-            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
-                models_dir,
-                ..Default::default()
-            })
-            .expect("compile models");
-        let selected: std::collections::BTreeSet<String> =
-            ["driver".to_string(), "lower".to_string()]
-                .into_iter()
-                .collect();
-        super::apply_shadow_rewrite(
-            &mut compiled,
-            None,
-            Some(&selected),
-            &rocky_core::shadow::ShadowConfig::default(),
-            &rocky_snowflake::dialect::SnowflakeSqlDialect,
-            false,
-        )
-        .expect("no read is spelled ambiguously, so the run must not be rejected");
-        let driver = compiled
-            .project
-            .models
-            .iter()
-            .find(|m| m.config.name == "driver")
-            .expect("driver missing");
-        assert!(
-            driver.sql.contains("orders_rocky_shadow"),
-            "the unambiguous read must still be routed: {}",
-            driver.sql
         );
     }
 

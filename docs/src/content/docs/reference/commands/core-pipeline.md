@@ -424,8 +424,15 @@ contains a `content_addressed`, `time_interval` or `ephemeral` model — the fir
 two require additional storage or partition-state isolation, and an ephemeral
 model is neither materialized nor inlined, so its consumer would read
 production. They also fail closed when the chosen suffix or schema would collide
-with a production target or another selected shadow target, and when two targets
-differ only by case on a dialect that quotes identifiers.
+with a production target or another selected shadow target.
+
+On a dialect that quotes identifiers — Snowflake and Trino — a run routing more
+than one model is refused when a routed target differs only by case from any
+other model's target. Those are two distinct objects to the warehouse, but
+upstream references are matched case-insensitively, so a read of either could be
+redirected to the wrong one. The refusal is deliberate and does not depend on
+whether any model spells such a read today; rename one of the targets, or scope
+the run so it routes only one of them.
 
 `--shadow` and `--branch` isolate `rocky run` for transformation pipelines.
 `rocky run --dag`, and the snapshot and load pipeline kinds, still write
