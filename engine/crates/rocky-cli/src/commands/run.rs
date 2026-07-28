@@ -5715,12 +5715,22 @@ fn apply_defer_rewrite(
 /// Identifier quoting a rewritten upstream reference must use so that it names
 /// the same object the producer's DDL creates.
 ///
-/// This has to track `SqlDialect::format_table_ref` exactly. A producer writes
-/// its target through that method; a rewritten read is re-serialized here. Where
-/// the two disagree the read names a different object than the producer created:
-/// on Snowflake and Trino every component is emitted double-quoted and therefore
-/// case-sensitive, so a bare read folds to upper case and either errors or, worse,
-/// resolves to an unrelated table of that name.
+/// This has to track `SqlDialect::format_table_ref` exactly: a producer writes
+/// its target through that method, and a rewritten read is re-serialized here,
+/// so the two must render the same object the same way.
+///
+/// How much rides on that differs by dialect, and quoting is not the same
+/// question as case-sensitivity — see [`dialect_case_sensitive_identity`]:
+///
+/// - Snowflake folds an unquoted identifier to UPPER case and takes a quoted one
+///   verbatim. Rocky quotes its targets, so a bare read would fold and either
+///   error or resolve to an unrelated table. Here the quoting is load-bearing.
+/// - Trino folds identifiers to lower case whether or not they are quoted, so
+///   both spellings resolve alike. Quoting matches the producer's rendering and
+///   is needed for components that are reserved words, but it is not what makes
+///   the read resolve.
+/// - BigQuery needs backticks because project IDs may contain hyphens, which a
+///   bare identifier would parse as subtraction. Nothing to do with case.
 ///
 /// Unknown dialects fail closed. A new adapter that quotes its targets would
 /// otherwise inherit bare rendering silently, which is exactly the defect this
@@ -5732,8 +5742,9 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
         // Backticks: BigQuery project IDs may contain hyphens, which a bare
         // identifier would parse as subtraction.
         "bigquery" => Ok(Some('`')),
-        // Double quotes: both dialects quote every component of a target, which
-        // makes the object case-sensitive.
+        // Double quotes: both render every component of a target quoted. For
+        // Snowflake that also decides which object the read names; for Trino it
+        // only keeps the rendering consistent.
         "snowflake" | "trino" => Ok(Some('"')),
         other => anyhow::bail!(
             "cannot rewrite upstream references for dialect '{other}': its identifier quoting \
@@ -16788,11 +16799,15 @@ timestamp_column = "ts"
     /// name. Under shadow that is the production table, and no rewrite can fix
     /// it because there is no shadow object to point the read at. Shadow mode
     /// must therefore refuse the run rather than quietly read production.
-    /// A rewritten upstream read has to name the same object the producer's DDL
-    /// creates. Snowflake and Trino emit every component of a target
-    /// double-quoted, which makes the object case-sensitive, so a bare read
-    /// folds to upper case and names a different table. Nothing else in the
-    /// suite executes against those dialects, so this asserts the serialized
+    /// A rewritten upstream read has to render the same way the producer's DDL
+    /// does. Snowflake and Trino both emit every component of a target
+    /// double-quoted, so the rewritten read must be quoted too.
+    ///
+    /// What that buys differs: on Snowflake a bare read would fold to UPPER case
+    /// and name a different table, so the quoting decides correctness; on Trino
+    /// identifiers fold to lower case either way, so it only keeps the rendering
+    /// consistent and covers components that are reserved words. Nothing else in
+    /// the suite executes against these dialects, so this asserts the serialized
     /// SQL directly.
     #[cfg(feature = "duckdb")]
     #[test]
