@@ -5744,6 +5744,40 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
     }
 }
 
+/// Whether this dialect treats identifier case as part of object identity.
+///
+/// Deliberately separate from [`rewrite_quote_style`]. Quoting is a rendering
+/// question and case-sensitivity is an identity one, and they do not imply each
+/// other: BigQuery is backtick-quoted because project IDs may contain hyphens,
+/// not because of case, and a dialect could just as well be case-sensitive
+/// without quoting. Reading one off the other risks both a needless refusal on
+/// a quoted-but-case-insensitive dialect and, worse, silence on a
+/// case-sensitive one that renders bare.
+///
+/// This matters because upstream references are matched case-insensitively, so
+/// only where case is part of identity can two targets differing by case be
+/// two different objects that a rewrite could confuse.
+///
+/// Unknown dialects fail closed.
+fn dialect_case_sensitive_identity(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<bool> {
+    match dialect.name() {
+        // Identifiers are case-insensitive: `Orders` and `orders` are one
+        // object, so no pair of targets can differ by case alone.
+        "duckdb" | "databricks" => Ok(false),
+        // Dataset and table IDs are case-sensitive.
+        "bigquery" => Ok(true),
+        // Rocky renders every component double-quoted, and a quoted identifier
+        // is taken verbatim rather than case-folded.
+        "snowflake" | "trino" => Ok(true),
+        other => anyhow::bail!(
+            "shadow/branch execution does not know whether '{other}' treats identifier case as \
+             part of object identity, so it cannot tell whether two targets differing only by \
+             case name one object or two. Add '{other}' to \
+             `dialect_case_sensitive_identity` after checking how it folds identifiers"
+        ),
+    }
+}
+
 /// Route the models built by this invocation and their in-run dependency reads
 /// to shadow targets. Deferred or otherwise unselected upstreams stay on their
 /// production targets.
@@ -5917,10 +5951,13 @@ fn apply_shadow_rewrite(
     }
 
     // Target identity is case-folded, and so is the tail match inside
-    // `rewrite_upstream_refs`. On a dialect that quotes its targets that is a
-    // lossy key: `"Orders"` and `"orders"` are two distinct Snowflake tables
-    // that fold to one identity, so a read of one could be redirected to the
-    // other's shadow.
+    // `rewrite_upstream_refs`. Where the dialect makes case part of object
+    // identity that is a lossy key: `"Orders"` and `"orders"` are two distinct
+    // Snowflake tables that fold to one identity, so a read of one could be
+    // redirected to the other's shadow. Keyed on that declared property rather
+    // than on whether the dialect quotes — the two are independent, and reading
+    // one off the other would go quiet on a case-sensitive dialect that renders
+    // bare identifiers.
     //
     // The risk exists only where a rename is actually applied. A model's own
     // identity is excluded from its rename set, so a run that routes a single
@@ -5930,7 +5967,7 @@ fn apply_shadow_rewrite(
     // entirely. Above it, the trigger is a routed model, while the collision
     // partner is drawn from every compiled model: a read of an unselected
     // `"Orders"` still tail-matches the rename key of a selected `"orders"`.
-    if quote_style.is_some() && routes.len() > 1 {
+    if dialect_case_sensitive_identity(dialect)? && routes.len() > 1 {
         let mut folded: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for model in &compile_result.project.models {
             let exact = format!(
@@ -16923,6 +16960,46 @@ timestamp_column = "ts"
             format!("{err:#}").contains("differ only by case"),
             "error must explain the collision: {err:#}"
         );
+    }
+
+    /// On a dialect where identifiers are case-insensitive, two targets that
+    /// differ only by case name the SAME object, so there is nothing to
+    /// disambiguate and the run must proceed. Pins the false branch of the
+    /// case-sensitivity declaration, which quoting alone would not decide.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_allows_case_collisions_on_a_case_insensitive_dialect() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(
+            &models_dir,
+            "driver",
+            "SELECT id FROM main.Orders",
+            "main",
+            "driver",
+        );
+        write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let selected: std::collections::BTreeSet<String> =
+            ["driver".to_string(), "lower".to_string()]
+                .into_iter()
+                .collect();
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            Some(&selected),
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_duckdb::dialect::DuckDbSqlDialect,
+            false,
+        )
+        .expect("DuckDB folds identifier case, so there is no ambiguity to refuse");
     }
 
     /// A case collision can sit in the schema or catalog rather than the table.
