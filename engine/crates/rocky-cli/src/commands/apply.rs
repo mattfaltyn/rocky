@@ -651,6 +651,14 @@ async fn execute_run_plan(
             state_path,
             output_json,
             &crate::commands::run::SkipRunOptions::default(),
+            // Shadow routing IS part of a persisted plan's contract: the plan
+            // captures `shadow` / `shadow_suffix` / `shadow_schema` / `branch`,
+            // and `shadow_config` above is reconstructed from them for exactly
+            // this reason. Dropping it here is the same defect as #1272 one
+            // level up — `rocky plan --dag --shadow` followed by `rocky apply`
+            // would write production while reporting success. The non-DAG path
+            // below passes the same value.
+            shadow_config.as_ref(),
         )
         .await
         .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
@@ -3815,6 +3823,108 @@ mod tests {
             touched.contains_key("payments"),
             "the physical FQN must map to the logical model name so an \
              attribute-scoped policy rule still fires; got {touched:?}"
+        );
+    }
+
+    /// #1272 sentinel: a stored `--dag --shadow` plan must carry its shadow
+    /// routing into execution.
+    ///
+    /// `execute_run_plan` reconstructs `shadow_config` from the plan's persisted
+    /// `shadow` / `shadow_suffix` / `shadow_schema` / `branch` fields and passes
+    /// it on the non-DAG path, but the DAG path passed a literal `None` — so
+    /// `rocky plan --dag --shadow` followed by `rocky apply <id>` wrote
+    /// production while reporting success. That the plan persists those fields
+    /// at all is what refutes the "a stored plan carries no shadow routing"
+    /// justification the dropped argument used to carry.
+    ///
+    /// Observed through the DAG's shadow refusal, which fires only when
+    /// `run_with_dag` actually receives a shadow config: with the routing
+    /// dropped, this project instead materializes `proj.seeds.countries` in
+    /// production and returns `Ok`. Both halves are asserted, so restoring the
+    /// `None` fails on the missing error AND on the production table appearing.
+    #[tokio::test]
+    async fn a_stored_dag_shadow_plan_carries_its_shadow_routing_into_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+        let db_path = root.join("proj.duckdb");
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/countries.toml"),
+            "name = \"countries\"\n\n\
+             [target]\n\
+             catalog = \"proj\"\n\
+             schema = \"seeds\"\n\
+             table = \"countries\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/countries.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+        let run_plan = RunPlan {
+            dag: true,
+            shadow: true,
+            models: vec![],
+            execution_layers: vec![],
+            ..minimal_run_plan()
+        };
+
+        let err = execute_run_plan(
+            &config_path,
+            loaded,
+            "plan-dag-shadow",
+            run_plan,
+            &root.join(".rocky-state.redb"),
+            false,
+            "apply-run-id",
+            // A human apply: the governed `--dag` refusal above does not apply.
+            None,
+        )
+        .await
+        .expect_err("a stored --dag --shadow plan must reach the shadow-aware DAG path");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--shadow / --branch is not supported by `rocky run --dag`"),
+            "the shadow config reached run_with_dag, so its shadow refusal fired: {msg}"
+        );
+
+        // The sentinel: nothing was materialized. With the routing dropped, the
+        // seed node runs and this table exists with two rows.
+        let seeded = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path)
+            .ok()
+            .and_then(|adapter| {
+                let conn = adapter.shared_connector();
+                let guard = conn.lock().unwrap();
+                guard
+                    .execute_sql("SELECT COUNT(*) FROM proj.seeds.countries")
+                    .ok()
+            });
+        assert!(
+            seeded.is_none(),
+            "the apply must not have materialized the production seed table"
         );
     }
 

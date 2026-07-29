@@ -42,6 +42,7 @@ type SubRunner = Arc<
             String,
             Option<String>,
             SkipRunOptions,
+            Option<rocky_core::shadow::ShadowConfig>,
         ) -> Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send>>
         + Send
         + Sync,
@@ -70,7 +71,8 @@ fn default_sub_runner() -> SubRunner {
          state_path: PathBuf,
          pipeline_name: String,
          model_name: Option<String>,
-         skip_opts| {
+         skip_opts,
+         shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
             Box::pin(async move {
                 let models_dir = models_dir_for_model_scope(
                     &config_path,
@@ -100,7 +102,7 @@ fn default_sub_runner() -> SubRunner {
                     false,
                     None,
                     false,
-                    None,
+                    shadow_config.as_ref(),
                     &partition_opts,
                     model_name.as_deref(),
                     // DAG sub-runs inherit config-derived TTL.
@@ -174,6 +176,12 @@ pub async fn run_with_dag(
     // build (and `--no-reuse` disables content-addressed reuse + column-skip)
     // instead of being silently dropped at the DAG boundary.
     skip_opts: &super::run::SkipRunOptions,
+    // `--shadow` / `--branch`, threaded into every sub-run. Dropping it at the
+    // DAG boundary is what let `rocky run --dag --shadow` write production
+    // targets (#1272). Each sub-run is an ordinary `run()`, so it gets whatever
+    // isolation that pipeline kind supports — and the kinds that support none
+    // now refuse rather than write production.
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
 ) -> Result<()> {
     // Under `-o json` the orchestrator contract is that stdout is exactly one
     // JSON document (the `DagRunOutput` below). Sub-runs are dispatched with
@@ -232,6 +240,51 @@ pub async fn run_with_dag(
         .collect();
     unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name);
 
+    // `--dag` cannot isolate a run, so it refuses to pretend it can.
+    //
+    // #1272 was filed because `--dag --shadow` silently wrote production. The
+    // obvious repair — thread `shadow_config` into every sub-run — is necessary
+    // but NOT sufficient, and shipping it alone would have replaced a visible
+    // wrong with an invisible one. Four independent reasons, each verified:
+    //
+    // 1. **Cross-model reads are not routed.** The DAG dispatches each
+    //    transformation model as its own ONE-model sub-run, so
+    //    `apply_shadow_rewrite` runs with `model_name_filter = Some(this
+    //    model)`. Its rename set is every OTHER routed model, and with a single
+    //    routed model that set is empty — nothing is rewritten. For `a -> b`,
+    //    `b_shadow` is therefore built by reading PRODUCTION `a`. Measured: with
+    //    `a` changed to emit 2, a shadow run yields `a_shadow = 2` and
+    //    `b_shadow = 1`, and exits 0. That is a false green — the operator then
+    //    compares shadow against production and sees agreement that the run
+    //    never established.
+    // 2. **Seeds are not routed.** A seed node dispatches to `seed::run_seed`,
+    //    which takes no shadow config and DROPs, recreates and repopulates its
+    //    CONFIGURED target.
+    // 3. **Replication suffix mode corrupts the SOURCE.** `TableTask` carries one
+    //    `table_name` for both sides and `run()` stores the SUFFIXED name in it,
+    //    so the copy reads `<source_schema>.<table>_rocky_shadow`.
+    // 4. **Snapshot and load are unrouted** and already refuse inside `run()`.
+    //
+    // Refusing whole rather than carving out the narrow survivors (a
+    // single-model DAG; replication under `schema_override`) is deliberate:
+    // every carve-out is another surface for exactly this class of defect, and
+    // this path has now produced four of them. Lift the refusal when the DAG
+    // executes its transformation models as one shadow-aware unit — at which
+    // point the per-node `shadow_config` threading below is what carries it.
+    // Tracked as #1279.
+    if shadow_config.is_some() {
+        anyhow::bail!(
+            "--shadow / --branch is not supported by `rocky run --dag`: the DAG runs each model \
+             as its own sub-run, so a model's reads of an upstream built by this same run are \
+             NOT redirected to that upstream's shadow target — the downstream shadow table would \
+             be built from production data and the run would still report success. Seed, \
+             snapshot and load nodes are not routed at all, and replication's suffix mode \
+             rewrites the source it reads. Run the shadow pipeline without `--dag` (a single \
+             `rocky run --shadow` routes every selected model and rewrites the reads between \
+             them), or run the DAG without the flag"
+        );
+    }
+
     info!(
         nodes = dag.node_count(),
         edges = dag.edge_count(),
@@ -254,6 +307,7 @@ pub async fn run_with_dag(
         seeds_dir,
         node_pipelines,
         skip_opts: *skip_opts,
+        shadow_config: shadow_config.cloned(),
         sub_runner: default_sub_runner(),
     };
     let executor = DagExecutor::new(dispatcher);
@@ -412,6 +466,10 @@ struct CliDispatcher {
     /// from the outer `run_with_dag` so each sub-run honors it. `Copy`, so the
     /// per-node closure captures a value (no borrow escaping the dispatcher).
     skip_opts: super::run::SkipRunOptions,
+    /// `--shadow` / `--branch`, threaded from the outer `run_with_dag` so each
+    /// sub-run honors it. Dropping it here is what let `rocky run --dag
+    /// --shadow` write production targets (#1272).
+    shadow_config: Option<rocky_core::shadow::ShadowConfig>,
     /// The injected sub-run driver. Production is [`default_sub_runner`]; tests
     /// substitute a recorder to observe the `skip_opts` each sub-run receives.
     sub_runner: SubRunner,
@@ -424,6 +482,7 @@ impl NodeDispatcher for CliDispatcher {
         let loaded = Arc::clone(&self.loaded);
         let state_path = self.state_path.clone();
         let skip_opts = self.skip_opts;
+        let shadow_config = self.shadow_config.clone();
         let sub_runner = self.sub_runner.clone();
         let label = label.to_string();
         match kind {
@@ -490,6 +549,7 @@ impl NodeDispatcher for CliDispatcher {
                         pipeline_name,
                         model_name,
                         skip_opts,
+                        shadow_config,
                     )
                     .await
                 }))
@@ -633,6 +693,7 @@ adapter = "default"
     fn dispatcher_with_nodes(
         loaded: Arc<LoadedConfig>,
         skip_opts: SkipRunOptions,
+        shadow_config: Option<rocky_core::shadow::ShadowConfig>,
         recorder: SubRunner,
         n: usize,
     ) -> (CliDispatcher, Vec<NodeId>) {
@@ -651,6 +712,7 @@ adapter = "default"
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
             skip_opts,
+            shadow_config,
             sub_runner: recorder,
         };
         (dispatcher, node_ids)
@@ -675,7 +737,7 @@ adapter = "default"
         // A recorder sub-runner: capture the skip_opts and return Ok without
         // running a real pipeline.
         let recorder: SubRunner = Arc::new(
-            move |_config, _loaded, _state, _pipeline, model_name, skip_opts| {
+            move |_config, _loaded, _state, _pipeline, model_name, skip_opts, _shadow| {
                 let sink = sink.clone();
                 Box::pin(async move {
                     sink.lock().unwrap().push((model_name, skip_opts));
@@ -691,7 +753,7 @@ adapter = "default"
             no_prune: false,
         };
         let (dispatcher, node_ids) =
-            dispatcher_with_nodes(test_loaded_config(), skip_opts, recorder, 1);
+            dispatcher_with_nodes(test_loaded_config(), skip_opts, None, recorder, 1);
 
         // Drive a real pipeline-node dispatch through the production path.
         let fut = dispatcher
@@ -716,6 +778,84 @@ adapter = "default"
         );
     }
 
+    /// #1272 regression: `rocky run --dag --shadow` / `--branch` must reach
+    /// EVERY sub-run. Pre-fix, `default_sub_runner` passed a hardcoded `None`
+    /// into `run()`'s `shadow_config` slot, so the flag was silently dropped at
+    /// the DAG boundary and every node wrote its PRODUCTION target — the run
+    /// reporting success the whole time.
+    ///
+    /// Non-vacuous, and deliberately mirroring
+    /// [`dispatch_passes_the_threaded_skip_opts_to_each_sub_run`], which exists
+    /// to catch a silent drop at this same boundary: a recording [`SubRunner`]
+    /// captures the EXACT `ShadowConfig` each dispatch passes. Reverting the
+    /// dispatch argument to `None` records `None` and fails the first assertion.
+    ///
+    /// The values asserted are deliberately NOT `ShadowConfig::default()` — a
+    /// revert that substituted a default-constructed config rather than `None`
+    /// would still fail on the suffix and the schema override. Three nodes,
+    /// because the drop this guards against was per-node: one node proves the
+    /// argument is wired, three prove no node is served a different value.
+    ///
+    /// (The behavioural end-to-end proof — a `--dag --shadow` run leaving
+    /// production untouched — is the transformation arm's own coverage in
+    /// `run.rs`; this test owns the boundary, which is where the defect was.)
+    #[tokio::test]
+    async fn dispatch_passes_the_threaded_shadow_config_to_each_sub_run() {
+        type RecordedShadow = (Option<String>, Option<rocky_core::shadow::ShadowConfig>);
+        let recorded: Arc<Mutex<Vec<RecordedShadow>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        let recorder: SubRunner = Arc::new(
+            move |_config, _loaded, _state, _pipeline, model_name, _skip_opts, shadow| {
+                let sink = sink.clone();
+                Box::pin(async move {
+                    sink.lock().unwrap().push((model_name, shadow));
+                    Ok(())
+                })
+            },
+        );
+
+        let shadow_config = rocky_core::shadow::ShadowConfig {
+            suffix: "_pr1272_shadow".to_string(),
+            schema_override: Some("isolated_ns".to_string()),
+            cleanup_after: false,
+        };
+        let (dispatcher, node_ids) = dispatcher_with_nodes(
+            test_loaded_config(),
+            SkipRunOptions::default(),
+            Some(shadow_config),
+            recorder,
+            3,
+        );
+
+        for (i, id) in node_ids.iter().enumerate() {
+            let fut = dispatcher
+                .dispatch(id, NodeKind::Transformation, &format!("dim_orders_{i}"))
+                .expect("a pipeline node dispatches a future");
+            fut.await.expect("recorder sub-runner returns Ok");
+        }
+
+        let got = recorded.lock().unwrap();
+        assert_eq!(got.len(), 3, "every node dispatched a sub-run");
+        for (i, (model_name, shadow)) in got.iter().enumerate() {
+            let shadow = shadow.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "node {i} ({model_name:?}) received no shadow config: `--shadow` / `--branch` \
+                     was dropped at the DAG boundary, so this sub-run would write its production \
+                     target"
+                )
+            });
+            assert_eq!(
+                shadow.suffix, "_pr1272_shadow",
+                "node {i} must receive the threaded suffix, not a default-constructed config"
+            );
+            assert_eq!(
+                shadow.schema_override.as_deref(),
+                Some("isolated_ns"),
+                "node {i} must receive the threaded schema override"
+            );
+        }
+    }
+
     /// WP-01 PR-B (#1120): every DAG sub-run receives the SAME
     /// `Arc<LoadedConfig>` instance — an `Arc::clone` of the one snapshot
     /// `run_with_dag` captured, never a per-node reload.
@@ -728,18 +868,24 @@ adapter = "default"
     async fn dispatch_passes_the_same_loaded_config_arc_to_every_sub_run() {
         let recorded: Arc<Mutex<Vec<Arc<LoadedConfig>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = recorded.clone();
-        let recorder: SubRunner =
-            Arc::new(move |_config, loaded, _state, _pipeline, _model, _skip| {
+        let recorder: SubRunner = Arc::new(
+            move |_config, loaded, _state, _pipeline, _model, _skip, _shadow| {
                 let sink = sink.clone();
                 Box::pin(async move {
                     sink.lock().unwrap().push(loaded);
                     Ok(())
                 })
-            });
+            },
+        );
 
         let loaded = test_loaded_config();
-        let (dispatcher, node_ids) =
-            dispatcher_with_nodes(Arc::clone(&loaded), SkipRunOptions::default(), recorder, 3);
+        let (dispatcher, node_ids) = dispatcher_with_nodes(
+            Arc::clone(&loaded),
+            SkipRunOptions::default(),
+            None,
+            recorder,
+            3,
+        );
 
         for (i, id) in node_ids.iter().enumerate() {
             let fut = dispatcher
@@ -838,6 +984,7 @@ mod tests {
             seeds_dir: root.join("seeds"),
             node_pipelines: HashMap::new(),
             skip_opts: SkipRunOptions::default(),
+            shadow_config: None,
             sub_runner: default_sub_runner(),
         };
         let id = NodeId::new("seed", "countries");
@@ -937,6 +1084,7 @@ mod tests {
             &state_path,
             false,
             &crate::commands::run::SkipRunOptions::default(),
+            None,
         )
         .await
         .expect("run --dag should succeed");
@@ -969,6 +1117,213 @@ mod tests {
             .execute_sql("SELECT COUNT(*) FROM proj.silver.dim_country")
             .unwrap();
         assert_eq!(cell_i64(&model_rows.rows[0][0]), 2, "model rows");
+    }
+
+    /// #1272 sentinel: `rocky run --dag --shadow` must not touch a production
+    /// seed table.
+    ///
+    /// A seed node dispatches to `run_seed`, which DROPs and repopulates the
+    /// seed's CONFIGURED target and accepts no shadow config — so before the
+    /// refusal, a shadow DAG isolated the models and destroyed the seed tables
+    /// beside them, exit 0.
+    ///
+    /// Non-vacuous by construction, and deliberately NOT resting on the error
+    /// string: the CSV grows to three rows between the two runs, so a seed node
+    /// that executed would leave three rows behind. Asserting the production
+    /// table still holds the original two proves the seed did not run, rather
+    /// than proving an error was formatted. Deleting the refusal makes the row
+    /// count 3 and fails it.
+    #[tokio::test]
+    async fn shadow_dag_refuses_seeds_and_leaves_the_production_seed_table_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/countries.toml"),
+            "name = \"countries\"\n\n\
+             [target]\n\
+             catalog = \"proj\"\n\
+             schema = \"seeds\"\n\
+             table = \"countries\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/countries.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let state_path = root.join(".rocky-state.redb");
+
+        // Establish the production seed table: two rows.
+        run_with_dag(
+            &config_path,
+            &state_path,
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+        )
+        .await
+        .expect("the non-shadow DAG seeds production");
+
+        // Grow the CSV. A seed node that runs now would leave three rows.
+        std::fs::write(
+            root.join("seeds/countries.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\nFR,France\n",
+        )
+        .unwrap();
+
+        let shadow_config = rocky_core::shadow::ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: None,
+            cleanup_after: false,
+        };
+        let err = run_with_dag(
+            &config_path,
+            &state_path,
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+            Some(&shadow_config),
+        )
+        .await
+        .expect_err("a shadow DAG containing a seed must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--shadow / --branch is not supported by `rocky run --dag`"),
+            "the DAG refuses shadow before executing anything: {msg}"
+        );
+
+        // The sentinel: production still holds the ORIGINAL two rows, so the
+        // seed node never executed.
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT COUNT(*) FROM proj.seeds.countries")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&rows.rows[0][0]),
+            2,
+            "the shadow run must not have repopulated the production seed table"
+        );
+    }
+
+    /// #1272: `rocky run --dag --shadow` must refuse rather than build a
+    /// downstream shadow table from PRODUCTION data.
+    ///
+    /// This is the measurement that decided the refusal. `b` reads `a`; the DAG
+    /// dispatches each as its own one-model sub-run, so `apply_shadow_rewrite`
+    /// sees a single routed model and its rename set — every OTHER routed model
+    /// — is empty. Nothing in `b`'s SQL is rewritten.
+    ///
+    /// Before the refusal this test recorded, with `a` changed to emit 2:
+    ///   proj.silver.a = 1, proj.silver.b = 1        (production, untouched)
+    ///   proj.silver.a_shadow = 2                    (isolated correctly)
+    ///   proj.silver.b_shadow = 1                    <-- read PRODUCTION a
+    /// and `run_with_dag` returned Ok. A false green: the operator compares
+    /// shadow against production and sees an agreement the run never
+    /// established.
+    ///
+    /// The assertion is on the ABSENCE of the shadow tables, not on the error
+    /// text, so it fails if the refusal is ever lifted without the routing
+    /// landing first — `b_shadow` reappearing with the stale value 1 is exactly
+    /// the defect.
+    #[tokio::test]
+    async fn shadow_dag_refuses_rather_than_build_a_downstream_from_production() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.silver]\ntype = \"transformation\"\n\n\
+                 [pipeline.silver.target]\nadapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\nauto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("models/a.sql"), "SELECT 1 AS v\n").unwrap();
+        std::fs::write(
+            root.join("models/a.toml"),
+            "name = \"a\"\n\n[target]\ncatalog = \"proj\"\nschema = \"silver\"\ntable = \"a\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/b.sql"), "SELECT v FROM proj.silver.a\n").unwrap();
+        std::fs::write(
+            root.join("models/b.toml"),
+            "name = \"b\"\n\n[target]\ncatalog = \"proj\"\nschema = \"silver\"\ntable = \"b\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let state_path = root.join(".rocky-state.redb");
+        run_with_dag(
+            &config_path,
+            &state_path,
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+        )
+        .await
+        .expect("the non-shadow DAG builds production");
+
+        // Divergence: an isolated run would have to compute 2 all the way
+        // through, so a downstream holding 1 proves it read production.
+        std::fs::write(root.join("models/a.sql"), "SELECT 2 AS v\n").unwrap();
+
+        let shadow_config = rocky_core::shadow::ShadowConfig {
+            suffix: "_shadow".to_string(),
+            schema_override: None,
+            cleanup_after: false,
+        };
+        run_with_dag(
+            &config_path,
+            &state_path,
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+            Some(&shadow_config),
+        )
+        .await
+        .expect_err("a shadow DAG must be refused, not silently mis-isolated");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        for table in ["proj.silver.a_shadow", "proj.silver.b_shadow"] {
+            assert!(
+                guard
+                    .execute_sql(&format!("SELECT v FROM {table}"))
+                    .is_err(),
+                "{table} must not exist: the refusal fires before the executor runs"
+            );
+        }
+        // Production is untouched by the refused run.
+        let prod_b = guard.execute_sql("SELECT v FROM proj.silver.b").unwrap();
+        assert_eq!(cell_i64(&prod_b.rows[0][0]), 1, "production b untouched");
     }
 
     #[tokio::test]
@@ -1035,6 +1390,7 @@ mod tests {
             &root.join(".rocky-state.redb"),
             false,
             &crate::commands::run::SkipRunOptions::default(),
+            None,
         )
         .await
         .expect("run --dag should succeed");
