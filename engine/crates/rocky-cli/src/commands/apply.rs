@@ -624,12 +624,8 @@ async fn execute_run_plan(
 
     let models_dir_path = run_plan.models_dir.as_ref().map(std::path::PathBuf::from);
 
-    // `--dag` runs every pipeline as a unified DAG. The DAG runner is
-    // currently flag-light (it reads config + tooling defaults rather than
-    // walking the same flag matrix as `commands::run::run`), so we dispatch
-    // to it for plans that captured `dag = true` and let the future
-    // unification land separately. This preserves the parity-with-`rocky run`
-    // shape for the alias-deprecation path.
+    // `--dag` runs every pipeline as a unified DAG. Partition selection is
+    // replayed from the persisted plan into every transformation sub-run.
     if run_plan.dag {
         // Fail-closed (D): the DAG runner dispatches sub-runs with NO governance
         // context, so a governed (agent) DAG apply would execute every pipeline
@@ -650,6 +646,7 @@ async fn execute_run_plan(
             config_path,
             state_path,
             output_json,
+            &partition_opts,
             &crate::commands::run::SkipRunOptions::default(),
         )
         .await
