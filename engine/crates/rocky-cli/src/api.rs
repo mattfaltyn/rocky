@@ -812,7 +812,14 @@ async fn full_dag(
     let Some(config_path) = state.config_path.clone() else {
         return Err(ApiError::engine_not_ready());
     };
-    let models_dir = state.models_dir.clone();
+    // Only a models dir the operator actually named is a whole-project
+    // override, the API analogue of `rocky dag --models`. `serve` without
+    // `--models` falls back to `models` internally, and passing that default on
+    // as an override replaced every transformation pipeline's own directory —
+    // reproducing #1261 over HTTP on projects `rocky dag` handled correctly.
+    let models_dir = state
+        .models_dir_is_explicit
+        .then(|| state.models_dir.clone());
     let contracts_dir = state.contracts_dir.clone();
     let state_path = state_path_for(&state);
 
@@ -820,7 +827,7 @@ async fn full_dag(
         dag_output(
             &config_path,
             &state_path,
-            &models_dir,
+            models_dir.as_deref(),
             None, // seeds_dir → falls back to <config_dir>/seeds, matching `rocky dag`
             contracts_dir.as_deref(),
             false, // include_column_lineage
@@ -1762,7 +1769,11 @@ mod tests {
             &dag_output(
                 &config_path,
                 &state_path,
-                &models_dir,
+                // `pinned_server` builds state the way `serve` without
+                // `--models` does, so the reference is `rocky dag` without
+                // `--models` too. Passing an explicit dir on this side only
+                // would compare two different commands.
+                None,
                 None,
                 None,
                 false,
@@ -1771,6 +1782,294 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+    }
+
+    /// A project whose transformation pipeline declares a **custom** model root,
+    /// so the conventional `models/` directory does not exist at all.
+    fn custom_root_dag_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let transforms = dir.path().join("transforms");
+        std::fs::create_dir_all(&transforms).unwrap();
+
+        std::fs::write(transforms.join("stg.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            transforms.join("stg.toml"),
+            "name = \"stg\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+        // A real column dependency, so column lineage has an edge to assert on
+        // rather than only a `Result::is_ok` to check.
+        std::fs::write(transforms.join("fct.sql"), "SELECT id FROM stg").unwrap();
+        std::fs::write(
+            transforms.join("fct.toml"),
+            "name = \"fct\"\ndepends_on = [\"stg\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"fct\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+
+        (dir, config_path)
+    }
+
+    /// `GET /api/v1/dag` must match `rocky dag` on a project whose models live
+    /// somewhere other than `models/`.
+    ///
+    /// This is the case the original `parity_dag` structurally could not see. It
+    /// passed `models = "models/**"` — the conventional root — so the server's
+    /// "override every pipeline with my models dir" behavior picked the same
+    /// directory the pipeline had declared anyway, and passing `true` on both
+    /// sides of the comparison agreed on the same wrong thing. Here the override
+    /// would point at a `models/` that does not exist, so it can only produce an
+    /// empty graph (#1261).
+    ///
+    /// The non-emptiness assertion is load-bearing and comes first: parity
+    /// between two empty DAGs is exactly the failure being tested for.
+    #[tokio::test]
+    async fn parity_dag_custom_models_root() {
+        let (dir, config_path) = custom_root_dag_project();
+        // What `serve` without `--models` holds: the conventional default,
+        // which for this project is a directory that was never created.
+        let default_models_dir = dir.path().join("models");
+        let state_path = pinned_state_path(dir.path());
+        let state = pinned_server(default_models_dir, Some(config_path.clone()), &state_path);
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let api = resp.text().await.unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&api).unwrap();
+        let stg = parsed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["label"] == "stg")
+            .expect("the custom-root model must reach the served DAG");
+
+        // Finding 1: the node existing is not enough. Enrichment reads a flat
+        // name-keyed model list, and deriving that from the fallback `models/`
+        // while building the graph per pipeline produced a correctly-shaped node
+        // whose target and strategy were silently `null`.
+        assert_eq!(
+            stg["target"]["table"], "stg",
+            "node must carry its target, not just its name"
+        );
+        assert_eq!(stg["target"]["schema"], "s");
+        assert!(
+            !stg["strategy"].is_null(),
+            "node must carry its materialization strategy"
+        );
+
+        let reference = reference_bytes(
+            &dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
+        );
+        assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+
+        // A single custom root is still a root the compiler can read, so
+        // `--column-lineage` must keep working here. Asserting on the EDGES,
+        // not on `is_ok`: an empty lineage list is also `Ok`, so a bare
+        // success check would have passed against the pre-fix code that
+        // compiled the wrong directory.
+        let lineage = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("one model root must still compile column lineage")
+            .column_lineage;
+        assert!(
+            lineage
+                .iter()
+                .any(|e| e.source.model == "stg" && e.target.model == "fct"),
+            "expected a stg->fct column edge, got {lineage:?}"
+        );
+    }
+
+    /// A project with no transformation pipeline at all.
+    fn replication_only_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter.local]\ntype = \"duckdb\"\n\n\
+             [pipeline.load]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\n\
+             [pipeline.load.source]\nadapter = \"local\"\n\n\
+             [pipeline.load.source.schema_pattern]\nprefix = \"raw__\"\n\
+             separator = \"__\"\ncomponents = [\"source\"]\n\n\
+             [pipeline.load.target]\nadapter = \"local\"\n\
+             catalog_template = \"warehouse\"\nschema_template = \"analytics\"\n",
+        )
+        .unwrap();
+        (dir, config_path)
+    }
+
+    /// Zero model roots is "no lineage exists", not "lineage is unavailable".
+    ///
+    /// Folding the zero case into the several-roots refusal made
+    /// `rocky dag --column-lineage` fail on every replication-only project with
+    /// a complaint about "different model directories" it does not have — a
+    /// regression against a call that previously succeeded with an empty list.
+    #[tokio::test]
+    async fn dag_column_lineage_allows_project_with_no_models() {
+        let (dir, config_path) = replication_only_project();
+        let state_path = pinned_state_path(dir.path());
+
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("a project with no transformation models must not refuse lineage");
+        assert!(out.column_lineage.is_empty());
+    }
+
+    /// `--column-lineage` must not fail on the ordinary nested layout: staging
+    /// models one level down feeding marts at the root.
+    ///
+    /// The model loader reads the root plus one level below; the lineage compile
+    /// reads only the root. So `fct` is compiled while the `stg` it selects from
+    /// is invisible, and the compiler reports `unknown dependency 'stg'`. That
+    /// is an artifact of the shallower read, not a defect in the project.
+    ///
+    /// A previous revision surfaced that error instead of swallowing it and so
+    /// turned this — the single most common project shape — into a hard
+    /// failure. Compiling the DAG's own model set is the real fix (#1262); until
+    /// then this asserts the tolerance stays.
+    #[tokio::test]
+    async fn dag_column_lineage_tolerates_nested_model_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("transforms");
+        std::fs::create_dir_all(root.join("staging")).unwrap();
+
+        std::fs::write(root.join("staging").join("stg.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            root.join("staging").join("stg.toml"),
+            "name = \"stg\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("fct.sql"), "SELECT id FROM stg").unwrap();
+        std::fs::write(
+            root.join("fct.toml"),
+            "name = \"fct\"\ndepends_on = [\"stg\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"fct\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = pinned_state_path(dir.path());
+
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("the ordinary nested layout must not fail `--column-lineage`");
+        // Both models are in the DAG even though the compile cannot see one.
+        let labels: Vec<&str> = out.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert!(labels.contains(&"stg"), "nested model missing: {labels:?}");
+        assert!(labels.contains(&"fct"), "root model missing: {labels:?}");
+    }
+
+    /// A configured-but-empty root is not a second root.
+    ///
+    /// Counting roots by what *resolves* rather than by what actually yields
+    /// models refuses a project whose only models live under one directory,
+    /// merely because a sibling pipeline points at an empty one.
+    #[tokio::test]
+    async fn dag_column_lineage_ignores_roots_that_contribute_nothing() {
+        let (dir, config_path) = custom_root_dag_project();
+        // A second transformation pipeline whose directory exists but is empty.
+        std::fs::create_dir_all(dir.path().join("unused")).unwrap();
+        let mut cfg = std::fs::read_to_string(&config_path).unwrap();
+        cfg.push_str(
+            "\n[pipeline.empty]\ntype = \"transformation\"\nmodels = \"unused/**\"\n\n\
+             [pipeline.empty.target.governance]\nauto_create_schemas = true\n",
+        );
+        std::fs::write(&config_path, cfg).unwrap();
+
+        let state_path = pinned_state_path(dir.path());
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("an empty root must not count as a second root");
+        assert!(
+            !out.column_lineage.is_empty(),
+            "the contributing root's lineage must still be compiled"
+        );
+    }
+
+    /// Two transformation pipelines whose model roots differ.
+    fn split_root_dag_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        // `fct` in the gold root reads `stg` from the silver root, so the
+        // fixture exercises a cross-PIPELINE edge, not just two islands.
+        for (sub, model, sql, depends) in [
+            ("silver", "stg", "SELECT 1 AS id", ""),
+            (
+                "gold",
+                "fct",
+                "SELECT id FROM stg",
+                "depends_on = [\"stg\"]\n",
+            ),
+        ] {
+            let root = dir.path().join(sub);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(format!("{model}.sql")), sql).unwrap();
+            std::fs::write(
+                root.join(format!("{model}.toml")),
+                format!(
+                    "name = \"{model}\"\n{depends}\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{model}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\nmodels = \"silver/**\"\n\n\
+             [pipeline.silver.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.gold]\ntype = \"transformation\"\nmodels = \"gold/**\"\n\n\
+             [pipeline.gold.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+
+        (dir, config_path)
+    }
+
+    /// Split model roots yield no column lineage, and must not fail the command.
+    ///
+    /// The compiler reads one root (#1262) and there is no root covering both,
+    /// so there are no edges to report. An earlier revision raised a hard error
+    /// here; that broke projects which previously succeeded, and recommended a
+    /// `--models <dir>` workaround that is itself refused for exactly these
+    /// projects. Correctness belongs in #1262 — compiling the DAG's own model
+    /// set instead of re-reading one directory — not in a refusal here.
+    #[tokio::test]
+    async fn dag_column_lineage_is_empty_across_split_model_roots() {
+        let (dir, config_path) = split_root_dag_project();
+        let state_path = pinned_state_path(dir.path());
+
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("split model roots must not fail `--column-lineage`");
+        assert!(out.column_lineage.is_empty());
+
+        // The DAG itself — the thing #1261 is actually about — is complete, with
+        // a node from each root and the cross-pipeline edge between them.
+        let labels: Vec<&str> = out.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert!(labels.contains(&"stg"), "silver root missing: {labels:?}");
+        assert!(labels.contains(&"fct"), "gold root missing: {labels:?}");
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.from.contains("stg") && e.to.contains("fct")),
+            "the cross-pipeline edge must survive: {:?}",
+            out.edges
+        );
     }
 
     /// GET `url`, retrying while the endpoint returns a *documented-retryable*
@@ -2959,6 +3258,7 @@ adapter = "db"
         };
         let state = ServerState::with_auth_and_webhook(
             simple_project_models(),
+            false, // models_dir_is_explicit — irrelevant to webhook ingress
             None,
             Some(config_path),
             None,

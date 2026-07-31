@@ -1247,9 +1247,13 @@ enum Command {
 
     /// Show the full unified DAG (all pipeline stages and dependencies)
     Dag {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory. Omit to use each transformation pipeline's own
+        /// configured `models` location — which is what `rocky run --dag` does,
+        /// and what makes the two agree. Passing this overrides the location
+        /// for EVERY transformation pipeline, so a project with more than one
+        /// is refused rather than silently building each model twice (#1261).
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Seeds directory
         #[arg(long)]
         seeds: Option<PathBuf>,
@@ -1551,9 +1555,15 @@ enum Command {
 
     /// Start HTTP API server exposing the compiler's semantic graph
     Serve {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory (defaults to `models`)
+        ///
+        /// Held as an `Option` rather than carrying `default_value = "models"`
+        /// so the server can tell "the user pointed me at this directory" from
+        /// "nobody said". `GET /api/v1/dag` overrides every transformation
+        /// pipeline's own models directory with this one, and doing that to an
+        /// untouched default reproduced #1261 over HTTP.
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Contracts directory
         #[arg(long)]
         contracts: Option<PathBuf>,
@@ -3552,7 +3562,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => rocky_cli::commands::run_dag(
             &cli.config,
             &state_path,
-            &models,
+            models.as_deref(),
             seeds.as_deref(),
             contracts.as_deref(),
             column_lineage,
@@ -3789,7 +3799,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 None
             };
             rocky_cli::commands::run_serve(
-                &models,
+                // Everything else the server does with this path — compiling,
+                // watching, deriving the default state path — is unchanged by
+                // whether it was typed or defaulted, so it still receives one
+                // concrete directory. Only the DAG projection needs to know.
+                models
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("models")),
+                models.is_some(),
                 contracts.as_deref(),
                 config,
                 host,
