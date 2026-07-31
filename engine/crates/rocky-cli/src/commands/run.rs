@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1443,13 +1443,6 @@ pub async fn run(
     // just the named model. Dagster uses this for per-asset materialization
     // when it controls the DAG scheduling.
     if let Some(target_model) = model_name_filter {
-        let mdir = models_dir.unwrap_or_else(|| Path::new("models"));
-        anyhow::ensure!(
-            mdir.exists(),
-            "models directory '{}' not found (required for --model)",
-            mdir.display()
-        );
-
         let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
         // An explicit `--pipeline` alongside `--model` (also how the unified-DAG
         // sub-runner drives each transformation node) resolves the model against
@@ -1459,46 +1452,71 @@ pub async fn run(
         // `--model` at a non-transformation pipeline fails fast rather than
         // silently running against an unrelated adapter. Bare `rocky run --model
         // <X>` (no `--pipeline`) keeps the fallback via the `else` arm below.
-        let (target_adapter_name, auto_create_schemas) = if let Some(pipeline_name) =
-            pipeline_name_arg
-        {
-            match registry::resolve_pipeline(rocky_cfg, Some(pipeline_name))?.1 {
-                rocky_core::config::PipelineConfig::Transformation(t) => {
-                    (
+        let (target_adapter_name, auto_create_schemas, configured_models_glob) =
+            if let Some(pipeline_name) = pipeline_name_arg {
+                match registry::resolve_pipeline(rocky_cfg, Some(pipeline_name))?.1 {
+                    rocky_core::config::PipelineConfig::Transformation(t) => (
                         t.target.adapter.clone(),
                         t.target.governance.auto_create_schemas,
+                        Some(t.models.as_str()),
+                    ),
+                    pipeline => anyhow::bail!(
+                        "pipeline '{pipeline_name}' is {}, not transformation (required for --model)",
+                        pipeline.pipeline_type_str()
+                    ),
+                }
+            } else {
+                // Without an explicit pipeline, preserve the model-only fallback:
+                // first transformation adapter, then first replication adapter.
+                if let Some(t) = rocky_cfg.pipelines.values().find_map(|p| match p {
+                    rocky_core::config::PipelineConfig::Transformation(t) => Some(t),
+                    _ => None,
+                }) {
+                    (t.target.adapter.clone(), false, Some(t.models.as_str()))
+                } else {
+                    (
+                        rocky_cfg
+                            .pipelines
+                            .values()
+                            .find_map(|p| match p {
+                                rocky_core::config::PipelineConfig::Replication(r) => {
+                                    Some(r.target.adapter.clone())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| "default".to_string()),
+                        false,
+                        None,
                     )
                 }
-                pipeline => anyhow::bail!(
-                    "pipeline '{pipeline_name}' is {}, not transformation (required for --model)",
-                    pipeline.pipeline_type_str()
-                ),
-            }
-        } else {
-            // Without an explicit pipeline, preserve the model-only fallback:
-            // first transformation adapter, then first replication adapter.
+            };
+
+        // An explicit `--models` directory overrides the pipeline's configured
+        // selection. Otherwise a model-scoped run must use the same confined
+        // base *and* resolved file glob as its owning transformation pipeline;
+        // passing only the base recompiles malformed, non-matching siblings.
+        let (mdir, models_glob) = if let Some(dir) = models_dir {
+            (dir.to_path_buf(), None)
+        } else if let Some(glob) = configured_models_glob {
+            let dir = match crate::models_loader::locate_models_dir(glob, config_path)? {
+                crate::models_loader::ModelsDir::Present(dir)
+                | crate::models_loader::ModelsDir::Absent(dir) => dir,
+            };
             (
-                rocky_cfg
-                    .pipelines
-                    .values()
-                    .find_map(|p| match p {
-                        rocky_core::config::PipelineConfig::Transformation(t) => {
-                            Some(t.target.adapter.clone())
-                        }
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        rocky_cfg.pipelines.values().find_map(|p| match p {
-                            rocky_core::config::PipelineConfig::Replication(r) => {
-                                Some(r.target.adapter.clone())
-                            }
-                            _ => None,
-                        })
-                    })
-                    .unwrap_or_else(|| "default".to_string()),
-                false,
+                dir,
+                Some(crate::models_loader::resolved_models_glob(
+                    glob,
+                    config_path,
+                )),
             )
+        } else {
+            (PathBuf::from("models"), None)
         };
+        anyhow::ensure!(
+            mdir.exists(),
+            "models directory '{}' not found (required for --model)",
+            mdir.display()
+        );
 
         let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
 
@@ -1617,7 +1635,8 @@ pub async fn run(
         // governance below, not just a hard `Err`.
         let failures_before = output.tables_failed;
         let exec_result = execute_models(
-            mdir,
+            &mdir,
+            models_glob.as_deref(),
             warehouse.as_ref(),
             state_store.as_ref(),
             partition_opts,
@@ -1905,6 +1924,8 @@ pub async fn run(
                     super::run_local::ModelsDirDecision::Absent(dir)
                 }
             };
+            let models_glob =
+                crate::models_loader::resolved_models_glob(&t.models, config_path);
             let tx_noop = matches!(
                 models_dir_decision,
                 super::run_local::ModelsDirDecision::Absent(_)
@@ -1971,6 +1992,7 @@ pub async fn run(
             }
             let dispatch_result = super::run_local::run_transformation(
                 models_dir_decision,
+                &models_glob,
                 t,
                 rocky_cfg,
                 output_json,
@@ -4752,6 +4774,7 @@ pub async fn run(
                 let warehouse = adapter_registry.warehouse_adapter(&pipeline.target.adapter)?;
                 execute_models(
                     mdir,
+                    None,
                     warehouse.as_ref(),
                     state_store.as_ref(),
                     partition_opts,
@@ -6583,6 +6606,7 @@ pub(crate) async fn execute_backfill_set(
         let failures_before = output.tables_failed;
         let exec_result = execute_models(
             models_dir,
+            None,
             warehouse.as_ref(),
             state_store.as_ref(),
             partition_opts,
@@ -6926,6 +6950,7 @@ pub(crate) async fn reconcile_model_governance(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_models(
     models_dir: &Path,
+    models_glob: Option<&str>,
     warehouse: &dyn rocky_core::traits::WarehouseAdapter,
     state_store: Option<&StateStore>,
     partition_opts: &PartitionRunOptions,
@@ -7101,7 +7126,11 @@ pub(crate) async fn execute_models(
         ..Default::default()
     };
 
-    let mut compile_result = match rocky_compiler::compile::compile(&compile_config) {
+    let compile = match models_glob {
+        Some(glob) => rocky_compiler::compile::compile_matching(&compile_config, glob),
+        None => rocky_compiler::compile::compile(&compile_config),
+    };
+    let mut compile_result = match compile {
         Ok(r) => r,
         Err(e) => {
             // A whole-project compile failure (couldn't even produce a
@@ -7141,7 +7170,16 @@ pub(crate) async fn execute_models(
     // could apply different key columns than were gated. Surface a malformed key
     // spec as a hard failure rather than silently emitting broken SQL. Bare
     // `rocky run` loads exactly once, as before — byte-identical.
-    let surrogate_keys = rocky_core::models::load_surrogate_keys_from_dir(models_dir)
+    let selected_model_paths: std::collections::HashSet<std::path::PathBuf> = compile_result
+        .project
+        .models
+        .iter()
+        .map(|model| std::path::PathBuf::from(&model.file_path))
+        .collect();
+    let surrogate_keys =
+        rocky_core::models::load_surrogate_keys_from_dir_filtered(models_dir, |path| {
+            selected_model_paths.contains(path)
+        })
         .context("invalid surrogate_key configuration")?;
 
     // Freeze fence at the exec-fingerprint choke-point (governed paths): a
@@ -15486,6 +15524,7 @@ timestamp_column = "ts"
         let mut output = RunOutput::new(String::new(), 0, parallel.max(1) as usize);
         let result = super::execute_models(
             models_dir,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &opts,
@@ -15564,6 +15603,7 @@ timestamp_column = "ts"
         let mut output = RunOutput::new(String::new(), 0, 1);
         let ok = super::execute_models(
             &models,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &opts,
@@ -15602,6 +15642,7 @@ timestamp_column = "ts"
         let mut output2 = RunOutput::new(String::new(), 0, 1);
         let err = super::execute_models(
             &models,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &opts,
@@ -15790,6 +15831,7 @@ timestamp_column = "ts"
         let mut output = RunOutput::new(String::new(), 0, 1);
         super::execute_models(
             models_dir,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &PartitionRunOptions::default(),
@@ -16031,6 +16073,7 @@ timestamp_column = "ts"
         let mut output = RunOutput::new(String::new(), 0, 1);
         super::execute_models(
             &models,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &PartitionRunOptions::default(),
@@ -16119,6 +16162,7 @@ timestamp_column = "ts"
         let mut output = RunOutput::new(String::new(), 0, 1);
         super::execute_models(
             &models,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &PartitionRunOptions::default(),
@@ -16176,6 +16220,7 @@ timestamp_column = "ts"
         let mut output = RunOutput::new(String::new(), 0, 1);
         let err = super::execute_models(
             &models,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &PartitionRunOptions::default(),
@@ -16365,6 +16410,7 @@ timestamp_column = "ts"
         };
         let result = super::execute_models(
             models_dir,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &opts,
@@ -16410,6 +16456,7 @@ timestamp_column = "ts"
         };
         let result = super::execute_models(
             models_dir,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             opts,
@@ -16461,6 +16508,7 @@ timestamp_column = "ts"
         };
         let result = super::execute_models(
             models_dir,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &opts,
@@ -18427,6 +18475,7 @@ timestamp_column = "ts"
         let run_vars = rocky_core::run_vars::RunVars::parse_pairs(["region=us"]).unwrap();
         super::execute_models(
             &models_dir,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &opts,
@@ -18536,6 +18585,7 @@ timestamp_column = "ts"
 
         super::execute_models(
             &models_dir,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &opts,
@@ -18660,6 +18710,7 @@ timestamp_column = "ts"
         // exist, so building `down` alone fails on the unresolved upstream.
         let result = super::execute_models(
             &models_dir,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             None,
             &opts,
@@ -18945,6 +18996,7 @@ timestamp_column = "ts"
             let mut output = RunOutput::new(String::new(), 0, parallel.max(1) as usize);
             super::execute_models(
                 models_dir,
+                None,
                 &adapter as &dyn rocky_core::traits::WarehouseAdapter,
                 None,
                 &opts,
@@ -19073,6 +19125,7 @@ timestamp_column = "ts"
         let mut output = RunOutput::new(String::new(), 0, 1);
         super::execute_models(
             models_dir,
+            None,
             &adapter as &dyn rocky_core::traits::WarehouseAdapter,
             Some(state_store),
             &opts,
@@ -20051,6 +20104,7 @@ timestamp_column = "ts"
             let mut output = RunOutput::new(String::new(), 0, parallel.max(1) as usize);
             super::execute_models(
                 &models_dir,
+                None,
                 &adapter as &dyn rocky_core::traits::WarehouseAdapter,
                 Some(&state),
                 &opts,
