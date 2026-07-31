@@ -356,6 +356,7 @@ pub fn compile_project(
     diagnostics.extend(freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
+    diagnostics.extend(target_collision_diagnostics(&project));
 
     let has_errors = diagnostics
         .iter()
@@ -561,6 +562,7 @@ pub fn compile_incremental(
     diagnostics.extend(freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
+    diagnostics.extend(target_collision_diagnostics(&project));
 
     let has_errors = diagnostics
         .iter()
@@ -594,6 +596,40 @@ pub fn compile_incremental(
         timings,
         model_timings,
     })
+}
+
+/// Render each same-physical-target group as one E036 error per participating
+/// model (#1291), so every colliding model lights up in an editor rather than
+/// just the first.
+///
+/// Error severity, not warning: two models writing one table is a
+/// configuration mistake whose survivor depends on scheduling. It is reported
+/// rather than raised as a `ProjectError` so tolerant readers — `ci-diff`
+/// comparing two arbitrary refs, the LSP — keep loading the project; the
+/// execution boundary is what refuses.
+fn target_collision_diagnostics(project: &crate::project::Project) -> Vec<Diagnostic> {
+    project
+        .target_collisions
+        .iter()
+        .flat_map(|c| {
+            let others = c.models.join(", ");
+            c.models.iter().map(move |name| {
+                Diagnostic::error(
+                    "E036",
+                    name,
+                    format!(
+                        "models [{others}] all target '{}' — two models writing one table \
+                         is a configuration error, and which one survives depends on \
+                         execution order",
+                        c.target
+                    ),
+                )
+                .with_suggestion(
+                    "give each model its own `[target] table`, or delete the duplicate model",
+                )
+            })
+        })
+        .collect()
 }
 
 fn validate_all_contracts(
@@ -676,5 +712,65 @@ mod tests {
             }
         );
         assert_eq!(default_type_mapper("unknown_type"), RockyType::Unknown);
+    }
+
+    /// #1291: every model in a colliding group gets its own **E036 error**
+    /// diagnostic naming the whole group.
+    ///
+    /// One diagnostic per participant, not one per group, so each colliding
+    /// model lights up in an editor — and so `run.rs`'s per-model compile-
+    /// failure accounting (which keys on `Diagnostic::model`) excludes all of
+    /// them rather than only the first. Severity is load-bearing: a warning
+    /// would not exclude anything from execution.
+    #[test]
+    fn a_target_collision_becomes_one_e036_error_per_model() {
+        let project = crate::project::Project {
+            models: vec![],
+            dag_nodes: vec![],
+            execution_order: vec![],
+            layers: vec![],
+            lineage_cache: std::collections::HashMap::new(),
+            resolve_diagnostics: vec![],
+            target_collisions: vec![crate::project::TargetCollision {
+                target: "c.s.shared".to_string(),
+                models: vec!["a".to_string(), "b".to_string()],
+            }],
+            unified_dag: None,
+        };
+
+        let diags = target_collision_diagnostics(&project);
+
+        assert_eq!(diags.len(), 2, "one diagnostic per participating model");
+        for d in &diags {
+            assert_eq!(&*d.code, "E036");
+            assert!(
+                d.is_error(),
+                "severity must be Error — a warning excludes nothing from execution"
+            );
+            assert!(d.message.contains("c.s.shared"), "names the shared target");
+            assert!(
+                d.message.contains('a') && d.message.contains('b'),
+                "names every colliding model"
+            );
+        }
+        assert_eq!(diags[0].model, "a");
+        assert_eq!(diags[1].model, "b");
+    }
+
+    /// A project with no collisions emits nothing — guards against the check
+    /// firing on every compile.
+    #[test]
+    fn no_collision_emits_no_diagnostic() {
+        let project = crate::project::Project {
+            models: vec![],
+            dag_nodes: vec![],
+            execution_order: vec![],
+            layers: vec![],
+            lineage_cache: std::collections::HashMap::new(),
+            resolve_diagnostics: vec![],
+            target_collisions: vec![],
+            unified_dag: None,
+        };
+        assert!(target_collision_diagnostics(&project).is_empty());
     }
 }
