@@ -1290,6 +1290,262 @@ auto_create_schemas = true
         .unwrap();
     }
 
+    /// #1292: `--model X --pipeline P` must load X from **P's** models
+    /// directory, not the hardcoded `models`.
+    ///
+    /// The adapter side was already right — the model-only path resolves the
+    /// target adapter from `--pipeline`. The directory side was not: it took
+    /// `--models` or fell back to a literal `models`. So a project whose
+    /// pipelines declare distinct model roots (the shape #1292 describes, and
+    /// the shape `dagster_rocky` materializes asset-by-asset) picked the right
+    /// warehouse and then looked for the model in the wrong place.
+    ///
+    /// Non-vacuous: `gold`'s model lives ONLY in `gold_models/`, and there is a
+    /// same-named decoy in `models/` selecting a different value. Pre-fix the
+    /// run either fails to find the model or builds the decoy's `99`; post-fix
+    /// it builds `7` into gold's own warehouse.
+    #[tokio::test]
+    async fn model_only_run_loads_from_the_named_pipelines_models_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("gold_models")).unwrap();
+        let silver_db = root.join("silver.duckdb");
+        let gold_db = root.join("gold.duckdb");
+
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                r#"
+[adapter.silver_wh]
+type = "duckdb"
+path = "{silver}"
+
+[adapter.gold_wh]
+type = "duckdb"
+path = "{gold}"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "silver_wh"
+
+[pipeline.silver.target.governance]
+auto_create_schemas = true
+
+[pipeline.gold]
+type = "transformation"
+models = "gold_models/**"
+
+[pipeline.gold.target]
+adapter = "gold_wh"
+
+[pipeline.gold.target.governance]
+auto_create_schemas = true
+"#,
+                silver = silver_db.display(),
+                gold = gold_db.display()
+            ),
+        )
+        .unwrap();
+
+        // A DECOY of the same name in the other pipeline's root, selecting a
+        // different value — so "found the model" and "found the RIGHT model"
+        // are distinguishable.
+        for (d, val) in [("models", 99), ("gold_models", 7)] {
+            std::fs::write(
+                root.join(d).join("mart.sql"),
+                format!("SELECT {val} AS v\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(d).join("mart.toml"),
+                "[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"mart\"\n",
+            )
+            .unwrap();
+        }
+
+        super::super::run::run(
+            &root.join("rocky.toml"),
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&root.join("rocky.toml"))
+                    .unwrap(),
+            ),
+            None,
+            Some("gold"), // --pipeline gold
+            &root.join("state.redb"),
+            None,
+            false,
+            None, // NO --models: the pipeline must supply it
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            Some("mart"), // --model mart
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("--model with --pipeline must resolve that pipeline's models dir");
+
+        let gold = DuckDbWarehouseAdapter::open(&gold_db).unwrap();
+        let rows = gold.execute_query("SELECT v FROM main.mart").await.unwrap();
+        assert_eq!(
+            rows.rows[0][0]
+                .as_i64()
+                .or_else(|| rows.rows[0][0].as_str().and_then(|s| s.parse().ok())),
+            Some(7),
+            "gold's own model (7) must be the one built, not the decoy in models/ (99)"
+        );
+        // NOTE: no assertion that silver's DuckDB file is absent.
+        // `AdapterRegistry::from_config` eagerly constructs every configured
+        // adapter, so its file exists regardless of which pipeline runs — a
+        // pre-existing behaviour, unrelated to this fix. Querying gold's
+        // warehouse directly and finding `7` already proves BOTH halves: the
+        // right models directory (7, not the decoy's 99) and the right
+        // adapter (the table is in gold's file at all).
+    }
+
+    /// Write a `full_refresh` model with an explicit `[target] table`.
+    fn write_model_targeting(dir: &Path, name: &str, sql: &str, table: &str) {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n")).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"{table}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Drive `run()` and hand back the `Result`, so a test can assert refusal.
+    async fn try_run(
+        config_path: &Path,
+        state_path: &Path,
+        model_name_filter: Option<&str>,
+    ) -> anyhow::Result<()> {
+        super::super::run::run(
+            config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
+            ),
+            None,
+            Some("gold"),
+            state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            model_name_filter,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// #1292, red-team finding: a named pipeline whose configured models root
+    /// is ABSENT must fail naming that root — never fall back to a
+    /// `models` directory that happens to exist.
+    ///
+    /// `resolve_models_dir` collapses `Absent(path)` to `None`, which dropped
+    /// straight through the `unwrap_or_else` to the CWD-relative `models`. So
+    /// the exact mis-routing this change fixes survived whenever the
+    /// pipeline's own root was missing: a same-named decoy elsewhere would be
+    /// compiled and executed against the named pipeline's adapter. Using
+    /// `locate_models_dir` and passing `Absent`'s path through to the
+    /// existence check is what closes it.
+    ///
+    /// Non-vacuous: the error must name `gold_models`. With the previous
+    /// `resolve_models_dir` call it named `models` instead — a different
+    /// directory, and one whose decoy would have been built had it existed
+    /// relative to the process CWD.
+    #[tokio::test]
+    async fn an_absent_pipeline_models_root_fails_by_name_not_by_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        // NOTE: `gold_models/` is deliberately NOT created.
+        let silver_db = root.join("silver.duckdb");
+        let gold_db = root.join("gold.duckdb");
+
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                r#"
+[adapter.silver_wh]
+type = "duckdb"
+path = "{silver}"
+
+[adapter.gold_wh]
+type = "duckdb"
+path = "{gold}"
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+
+[pipeline.silver.target]
+adapter = "silver_wh"
+
+[pipeline.silver.target.governance]
+auto_create_schemas = true
+
+[pipeline.gold]
+type = "transformation"
+models = "gold_models/**"
+
+[pipeline.gold.target]
+adapter = "gold_wh"
+
+[pipeline.gold.target.governance]
+auto_create_schemas = true
+"#,
+                silver = silver_db.display(),
+                gold = gold_db.display()
+            ),
+        )
+        .unwrap();
+
+        // The decoy that a `models` fallback would find.
+        write_model_targeting(&root.join("models"), "mart", "SELECT 99 AS v", "mart");
+
+        let err = try_run(
+            &root.join("rocky.toml"),
+            &root.join("state.redb"),
+            Some("mart"),
+        )
+        .await
+        .expect_err("an absent pipeline models root must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("gold_models"),
+            "the error must name the PIPELINE's configured root, not a fallback: {msg}"
+        );
+    }
+
     /// The `[run]` block that enables the skip gate + rowcount fallback (a
     /// full_refresh leaf over a raw source has no tracked timestamp column, so
     /// rowcount is the available B3 signal).
