@@ -206,7 +206,33 @@ pub fn is_assignable(from: &RockyType, to: &RockyType) -> bool {
         return true;
     }
 
-    common_supertype(from, to).is_some_and(|sup| sup == *to)
+    let decimal_fits = |from_precision: u8, from_scale: u8, to_precision: u8, to_scale: u8| {
+        from_scale <= to_scale
+            && from_precision
+                .checked_sub(from_scale)
+                .zip(to_precision.checked_sub(to_scale))
+                .is_some_and(|(from_integer, to_integer)| from_integer <= to_integer)
+    };
+
+    match (from, to) {
+        (
+            RockyType::Decimal {
+                precision: from_precision,
+                scale: from_scale,
+            },
+            RockyType::Decimal {
+                precision: to_precision,
+                scale: to_scale,
+            },
+        ) => decimal_fits(*from_precision, *from_scale, *to_precision, *to_scale),
+        (RockyType::Int32, RockyType::Decimal { precision, scale }) => {
+            decimal_fits(10, 0, *precision, *scale)
+        }
+        (RockyType::Int64, RockyType::Decimal { precision, scale }) => {
+            decimal_fits(19, 0, *precision, *scale)
+        }
+        _ => common_supertype(from, to).is_some_and(|sup| sup == *to),
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +317,22 @@ mod tests {
     fn test_is_assignable_widening() {
         assert!(is_assignable(&RockyType::Int32, &RockyType::Int64));
         assert!(!is_assignable(&RockyType::Int64, &RockyType::Int32));
+    }
+
+    #[test]
+    fn test_is_assignable_decimal_capacity() {
+        let decimal = |precision, scale| RockyType::Decimal { precision, scale };
+
+        assert!(is_assignable(&decimal(10, 2), &decimal(10, 2)));
+        assert!(!is_assignable(&decimal(10, 2), &decimal(10, 4)));
+        assert!(is_assignable(&decimal(10, 2), &decimal(12, 4)));
+        assert!(!is_assignable(&decimal(12, 4), &decimal(10, 2)));
+        assert!(!is_assignable(&decimal(2, 4), &decimal(10, 2)));
+        assert!(!is_assignable(&decimal(10, 2), &decimal(2, 4)));
+        assert!(!is_assignable(&RockyType::Int32, &decimal(10, 2)));
+        assert!(is_assignable(&RockyType::Int32, &decimal(12, 2)));
+        assert!(!is_assignable(&RockyType::Int64, &decimal(19, 10)));
+        assert!(is_assignable(&RockyType::Int64, &decimal(29, 10)));
     }
 
     #[test]
