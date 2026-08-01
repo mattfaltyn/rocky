@@ -450,7 +450,79 @@ fn classify_model_changes(
         return changes;
     }
 
+    // Exactly one side compiled (or neither). Status classification below stays
+    // as-is — it deliberately does not trust a single compile to decide Added
+    // vs Removed. But the side that DID compile knows its own models' targets,
+    // and dropping that was pure lossiness: a PR adding the first model to a
+    // project has a HEAD compile that knows the target, and one deleting the
+    // last model has a base compile that does (#1237).
+    //
+    // Only the side consistent with the row's status may supply it. An `Added`
+    // row's model exists in HEAD, a `Removed` row's in base; taking a target
+    // from the other side would name an object this row does not describe.
+    let single_side = match (base_models, head_models) {
+        (Some(base), None) => Some((base, false)),
+        (None, Some(head)) => Some((head, true)),
+        _ => None,
+    };
+    let resolve_target = |path: &str, status: ModelDiffStatus| -> Option<String> {
+        let (models, is_head) = single_side?;
+        let usable = match status {
+            ModelDiffStatus::Added => is_head,
+            ModelDiffStatus::Removed => !is_head,
+            // A modification exists on both sides, so whichever side compiled
+            // describes the same object.
+            ModelDiffStatus::Modified => true,
+            ModelDiffStatus::Unchanged => false,
+        };
+        if !usable {
+            return None;
+        }
+        // Ownership of a path is NOT unique. `orders.contract.toml` is the
+        // ordinary sidecar of `orders.contract.sql` *and* the contract of
+        // `orders.sql`, and `model_owns_file` deliberately matches both —
+        // see `ownership_resolves_contract_stem_and_contract_sidecar`. Taking
+        // the first match would publish an arbitrary one of their targets
+        // under a row that names the other, which breaks the field's contract
+        // that it IS the warehouse object this row describes.
+        //
+        // So resolve every owner and publish only when they agree. Two owners
+        // that happen to share a target still describe that one object, so
+        // uniqueness is on the TARGET, not the model count.
+        let owners = models
+            .iter()
+            .filter(|model| model_matches_path(model, path, models_rel));
+
+        // Every owner must be identifiable AND they must agree. Filtering the
+        // unpublishable ones out FIRST would be wrong: with two owners where
+        // one has a non-identifier target, dropping it leaves exactly one
+        // survivor and the path looks unique when ownership never was. The
+        // ambiguity is about which model the row describes, not about whether
+        // one of them happens to be nameable.
+        //
+        // Uniqueness is on the TARGET, not the owner count — two owners that
+        // agree still describe one object. (#1291 reports two models sharing a
+        // physical target as an E036 compile error, so agreement here is
+        // normally the contract-sidecar overlap rather than a real collision.)
+        let mut targets = Vec::new();
+        for owner in owners {
+            // Same publishability contract as the both-compiled path: a target
+            // that could never name a warehouse object is withheld, not
+            // guessed — and here it withholds the whole row, not just itself.
+            targets.push(publishable_target(owner)?);
+        }
+        targets.sort();
+        targets.dedup();
+        match targets.as_slice() {
+            [single] => Some(single.clone()),
+            // Zero owners, or an ambiguous path: unidentified beats
+            // misidentified.
+            _ => None,
+        }
+    };
+
     let mut statuses = HashMap::new();
+    let mut paths: HashMap<String, String> = HashMap::new();
     for file in files {
         // Fall back to the old path only for a rename, where the model really
         // did move. A copy's source is untouched, so attributing the copy to
@@ -470,6 +542,12 @@ fn classify_model_changes(
             // compile: a rename is one modification at its new path.
             _ => ModelDiffStatus::Modified,
         };
+        // Remember a path per stem so the surviving compile can be asked which
+        // model owns it. A rename resolves against its NEW path, matching the
+        // stem the status was keyed on above.
+        paths
+            .entry(stem.clone())
+            .or_insert_with(|| file.path.clone());
         statuses
             .entry(stem)
             .and_modify(|existing| {
@@ -487,15 +565,20 @@ fn classify_model_changes(
             ModelDiffStatus::Modified => (Some(name.clone()), Some(name.clone())),
             ModelDiffStatus::Unchanged => (None, None),
         };
+        let resolved_target = paths
+            .get(&name)
+            .and_then(|path| resolve_target(path, status));
         changes.insert(
             name.clone(),
             ModelChange {
                 model_name: name,
                 base_schema_name,
                 head_schema_name,
-                // Filename fallback: the key is a stem, not a warehouse
-                // identity. Publishing it as one would be a lie.
-                resolved_target: None,
+                // The key is a stem, never a warehouse identity — publishing
+                // it as one would be a lie. A target only goes out when the
+                // compile that DID succeed resolved it for a model owning this
+                // file, and only from the side the row's status describes.
+                resolved_target,
             },
         );
     }
@@ -1623,6 +1706,187 @@ mod tests {
 
     /// Write a minimal transformation model: `<name>.sql` + sidecar
     /// `<name>.toml`. Mirrors the test helper in `compile.rs`.
+    /// #1237: when only ONE ref compiles, a row still carries the target that
+    /// side knew — status classification is unchanged.
+    ///
+    /// The both-compiled path took the resolved route; otherwise every row
+    /// hard-coded `resolved_target: None`. That was lossiness, not a wrong
+    /// answer: a PR adding the first model to a project has a HEAD compile
+    /// that knows the target, and the empty base cannot compile at all.
+    #[test]
+    fn a_single_sided_compile_still_resolves_the_target_it_knew() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+        write_model(&models, "orders", "SELECT 1 AS id");
+        let head = compile_head(&models, HashMap::new()).expect("head compiles");
+        let head_models: Vec<Model> = head.project.models.clone();
+
+        // HEAD-only: the added row takes HEAD's target.
+        let added = classify_model_changes(
+            &[changed("models/orders.sql", 'A')],
+            Some("models"),
+            None,
+            Some(&head_models),
+        );
+        assert_eq!(
+            added.get("orders").and_then(|c| c.resolved_target.clone()),
+            Some("c.s.orders".to_string()),
+            "an Added row must take the target from the side that compiled"
+        );
+        assert_eq!(added["orders"].base_schema_name, None);
+        assert_eq!(
+            added["orders"].head_schema_name.as_deref(),
+            Some("orders"),
+            "status classification must be unchanged by the enrichment"
+        );
+
+        // Base-only: the removed row takes base's target.
+        let removed = classify_model_changes(
+            &[changed("models/orders.sql", 'D')],
+            Some("models"),
+            Some(&head_models),
+            None,
+        );
+        assert_eq!(
+            removed
+                .get("orders")
+                .and_then(|c| c.resolved_target.clone()),
+            Some("c.s.orders".to_string()),
+            "a Removed row must take the target from the base compile"
+        );
+    }
+
+    /// #1237, red-team finding: a path with MORE THAN ONE owning model must
+    /// not publish an arbitrary one of their targets.
+    ///
+    /// `orders.contract.toml` is the ordinary sidecar of `orders.contract.sql`
+    /// *and* the contract of `orders.sql`; `model_owns_file` deliberately
+    /// matches both (see `ownership_resolves_contract_stem_and_contract_sidecar`).
+    /// Taking the first match would publish one model's warehouse target under
+    /// a row naming the other — a wrong answer, not merely a missing one,
+    /// against a field documented as "the warehouse object this row describes".
+    #[test]
+    fn an_ambiguously_owned_path_publishes_no_target() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+
+        // Two models whose ownership of `orders.contract.toml` overlaps, with
+        // DIFFERENT targets — so picking either one is observably wrong.
+        write_model_with_identity(
+            &models,
+            "orders",
+            "orders",
+            "orders",
+            "SELECT id FROM src_orders",
+        );
+        write_model_with_identity(
+            &models,
+            "orders.contract",
+            "orders_contract",
+            "orders_contract",
+            "SELECT id FROM src_orders",
+        );
+        let compile = compile_head(&models, sources).expect("compile");
+        let head_models: Vec<Model> = compile.project.models.clone();
+
+        let changes = classify_model_changes(
+            &[changed("models/orders.contract.toml", 'A')],
+            Some("models"),
+            None,
+            Some(&head_models),
+        );
+
+        assert_eq!(
+            changes
+                .get("orders")
+                .and_then(|c| c.resolved_target.clone()),
+            None,
+            "two models own this path with different targets, so neither may be \
+             published as the object this row describes"
+        );
+    }
+
+    /// An owner whose target is not a publishable identifier must not be
+    /// silently dropped from the ambiguity check.
+    ///
+    /// Filtering unpublishable owners out BEFORE testing uniqueness would
+    /// leave exactly one survivor for a two-owner path, making it look unique
+    /// and publishing a target for a row whose ownership was never
+    /// established. The ambiguity is about which model the row describes, not
+    /// about whether one of them happens to be nameable.
+    #[test]
+    fn an_unidentifiable_co_owner_still_blocks_the_target() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+
+        // `orders` has a perfectly publishable target; its co-owner of
+        // `orders.contract.toml` does not (a hyphen is not a SQL identifier).
+        write_model_with_identity(
+            &models,
+            "orders",
+            "orders",
+            "orders",
+            "SELECT id FROM src_orders",
+        );
+        write_model_with_identity(
+            &models,
+            "orders.contract",
+            "orders_contract",
+            "not-an-identifier",
+            "SELECT id FROM src_orders",
+        );
+        let compile = compile_head(&models, sources).expect("compile");
+        let head_models: Vec<Model> = compile.project.models.clone();
+
+        let changes = classify_model_changes(
+            &[changed("models/orders.contract.toml", 'A')],
+            Some("models"),
+            None,
+            Some(&head_models),
+        );
+
+        assert_eq!(
+            changes
+                .get("orders")
+                .and_then(|c| c.resolved_target.clone()),
+            None,
+            "an unidentifiable co-owner must withhold the row, not be filtered \
+             out until the remaining owner looks unique"
+        );
+    }
+
+    /// The enrichment must not cross sides: a `Removed` row cannot borrow a
+    /// target from a HEAD-only compile, because the model it describes is
+    /// precisely the one HEAD no longer has.
+    #[test]
+    fn a_single_sided_compile_does_not_supply_the_wrong_sides_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+        write_model(&models, "orders", "SELECT 1 AS id");
+        let head = compile_head(&models, HashMap::new()).expect("head compiles");
+        let head_models: Vec<Model> = head.project.models.clone();
+
+        let removed = classify_model_changes(
+            &[changed("models/orders.sql", 'D')],
+            Some("models"),
+            None,
+            Some(&head_models),
+        );
+        assert_eq!(
+            removed
+                .get("orders")
+                .and_then(|c| c.resolved_target.clone()),
+            None,
+            "a Removed row must not take a target from a HEAD-only compile"
+        );
+    }
+
     fn write_model(dir: &Path, name: &str, sql: &str) {
         write_model_with_identity(dir, name, name, name, sql);
     }
