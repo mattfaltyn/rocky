@@ -41,7 +41,8 @@ use crate::output::{
     BriefCostSection, BriefDecisionEntry, BriefDegradedRule, BriefDriftEntry, BriefDriftSection,
     BriefEscalationsSection, BriefFailedModel, BriefFreshnessEntry, BriefFreshnessSection,
     BriefOutput, BriefPrincipalActivity, BriefQualityEntry, BriefQualitySection, BriefRunCost,
-    BriefRunEntry, BriefRunsSection, BriefSinceMode, SectionAvailability, print_json,
+    BriefRunEntry, BriefRunsSection, BriefSchedulerFailureEntry, BriefSchedulerSection,
+    BriefSinceMode, SectionAvailability, print_json,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -205,6 +206,13 @@ pub fn compute_brief(
     // window and freezes are current, so it reads the full ledger, not the
     // `--since` slice.
     let autonomy = build_autonomy(config_path, &decisions, now);
+    let scheduler = build_scheduler(
+        config_path,
+        &store,
+        since_ts,
+        &crate::commands::scheduler::rocky_dir_for_config(config_path),
+        MAX_HISTORY_SCAN,
+    );
 
     Ok(BriefOutput {
         version: VERSION.to_string(),
@@ -220,6 +228,7 @@ pub fn compute_brief(
         quality,
         cost,
         autonomy,
+        scheduler,
     })
 }
 
@@ -1028,10 +1037,239 @@ fn empty_brief(
         },
         autonomy: BriefAutonomySection {
             availability: SectionAvailability::Unavailable,
-            note: Some(note),
+            note: Some(note.clone()),
             degraded_rules: Vec::new(),
             active_freezes: Vec::new(),
         },
+        scheduler: BriefSchedulerSection {
+            availability: SectionAvailability::Unavailable,
+            note: Some(note),
+            scheduled_pipelines: 0,
+            paused: Vec::new(),
+            consecutive_failures: Vec::new(),
+            runs_in_window: 0,
+            failed_in_window: 0,
+            incident_count: 0,
+            latest_incident: None,
+        },
+    }
+}
+
+/// Scheduler section: a current-state projection over the schedule cursors,
+/// the window's scheduler-triggered runs, and the incident directory. Fails
+/// closed per the template rule — `unavailable` with a note when a source
+/// cannot be read, never a smoothed narrative.
+fn build_scheduler(
+    config_path: &Path,
+    store: &StateStore,
+    since_ts: Option<DateTime<Utc>>,
+    rocky_dir: &Path,
+    scan_cap: usize,
+) -> BriefSchedulerSection {
+    let config = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return BriefSchedulerSection {
+                availability: SectionAvailability::Unavailable,
+                note: Some(format!("config unreadable: {e}")),
+                scheduled_pipelines: 0,
+                paused: Vec::new(),
+                consecutive_failures: Vec::new(),
+                runs_in_window: 0,
+                failed_in_window: 0,
+                incident_count: 0,
+                latest_incident: None,
+            };
+        }
+    };
+    let scheduled: Vec<String> = config
+        .pipelines
+        .iter()
+        .filter(|(_, p)| p.schedule().is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
+    if scheduled.is_empty() {
+        return BriefSchedulerSection {
+            availability: SectionAvailability::NoData,
+            note: None,
+            scheduled_pipelines: 0,
+            paused: Vec::new(),
+            consecutive_failures: Vec::new(),
+            runs_in_window: 0,
+            failed_in_window: 0,
+            incident_count: 0,
+            latest_incident: None,
+        };
+    }
+
+    let mut paused = Vec::new();
+    let mut failures = Vec::new();
+    for name in &scheduled {
+        match store.get_schedule_state(name) {
+            // No cursor yet — the scheduler has never ticked this pipeline.
+            Ok(None) => {}
+            Ok(Some(cursor)) => {
+                if cursor.paused {
+                    paused.push(name.clone());
+                }
+                if cursor.consecutive_failures > 0 {
+                    failures.push(BriefSchedulerFailureEntry {
+                        pipeline: name.clone(),
+                        consecutive_failures: cursor.consecutive_failures,
+                    });
+                }
+            }
+            // A cursor we cannot read must not render as "not paused / no
+            // failures" — that is exactly the smoothed-over narrative the
+            // section rules forbid.
+            Err(e) => {
+                return BriefSchedulerSection {
+                    availability: SectionAvailability::Unavailable,
+                    note: Some(format!("schedule cursor for `{name}` unreadable: {e}")),
+                    scheduled_pipelines: scheduled.len() as u64,
+                    paused: Vec::new(),
+                    consecutive_failures: Vec::new(),
+                    runs_in_window: 0,
+                    failed_in_window: 0,
+                    incident_count: 0,
+                    latest_incident: None,
+                };
+            }
+        }
+    }
+    failures.sort_by_key(|f| std::cmp::Reverse(f.consecutive_failures));
+
+    // Both scheduler-spawned trigger kinds: coordinate demands (cron / after /
+    // freshness) record `Schedule`, webhook-ingress demands record `Webhook`.
+    // Both flow through the same claim machine and incident hook.
+    //
+    // Queried with the predicate BELOW the recency cap (`list_runs_matching`),
+    // never by filtering an already-capped page: on a store where manual runs
+    // outnumber the cap, page-then-filter would report zero scheduler runs —
+    // a false all-clear — while the failed scheduled run sits just past the
+    // page boundary.
+    let sched_runs = match store.list_runs_matching(scan_cap, |r| {
+        matches!(r.trigger, RunTrigger::Schedule | RunTrigger::Webhook)
+            && in_window(r.started_at, since_ts)
+    }) {
+        Ok(runs) => runs,
+        Err(e) => {
+            return BriefSchedulerSection {
+                availability: SectionAvailability::Unavailable,
+                note: Some(format!("run ledger unreadable: {e}")),
+                scheduled_pipelines: scheduled.len() as u64,
+                paused,
+                consecutive_failures: failures,
+                runs_in_window: 0,
+                failed_in_window: 0,
+                incident_count: 0,
+                latest_incident: None,
+            };
+        }
+    };
+    // Failure classes only — the skip statuses did no work and are neither
+    // success nor failure (mirrors `RunStatus::terminal_outcome`).
+    let failed_in_window = sched_runs
+        .iter()
+        .filter(|r| matches!(r.status, RunStatus::Failure | RunStatus::PartialFailure))
+        .count() as u64;
+
+    // Incidents: count only names the incident writer itself produces
+    // (`is_bundle_name`) — a foreign `.json` in the directory is not a
+    // bundle. Newest-last by name (names begin with the UTC timestamp;
+    // 1-second resolution). Per-entry read errors fail the section closed:
+    // an inventory that silently dropped entries could under-report.
+    // An incident-inventory failure marks the section unavailable but must
+    // NOT discard the run counts already soundly computed above — zeroing a
+    // known failed_in_window would be its own smoothed-over story.
+    let runs_in_window = sched_runs.len() as u64;
+    let unavailable =
+        |note: String, paused: Vec<String>, failures: Vec<BriefSchedulerFailureEntry>| {
+            BriefSchedulerSection {
+                availability: SectionAvailability::Unavailable,
+                note: Some(note),
+                scheduled_pipelines: scheduled.len() as u64,
+                paused,
+                consecutive_failures: failures,
+                runs_in_window,
+                failed_in_window,
+                incident_count: 0,
+                latest_incident: None,
+            }
+        };
+    let incidents_dir = rocky_dir.join("incidents");
+    if let Ok(meta) = std::fs::symlink_metadata(&incidents_dir)
+        && meta.file_type().is_symlink()
+    {
+        return unavailable(
+            format!(
+                "{} is a symlink; refusing to read through it",
+                incidents_dir.display()
+            ),
+            paused,
+            failures,
+        );
+    }
+    let (incident_count, latest_incident) = match std::fs::read_dir(&incidents_dir) {
+        Ok(entries) => {
+            let mut names: Vec<String> = Vec::new();
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        return unavailable(
+                            format!("incidents directory unreadable: {e}"),
+                            paused,
+                            failures,
+                        );
+                    }
+                };
+                // Regular files only — a directory or symlink wearing a
+                // bundle-shaped name is not a bundle.
+                let is_file = match entry.file_type() {
+                    Ok(ft) => ft.is_file(),
+                    Err(e) => {
+                        return unavailable(
+                            format!("incidents directory unreadable: {e}"),
+                            paused,
+                            failures,
+                        );
+                    }
+                };
+                if is_file
+                    && let Some(name) = entry.file_name().to_str()
+                    && rocky_core::schedule::incidents::is_bundle_name(name)
+                {
+                    names.push(name.to_string());
+                }
+            }
+            names.sort();
+            // Project-relative (`.rocky/incidents/<name>`): directly openable
+            // from the project root, host-portable, and no absolute-path
+            // disclosure on the MCP surface that reuses this projection.
+            let latest = names.last().map(|n| format!(".rocky/incidents/{n}"));
+            (names.len() as u64, latest)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, None),
+        Err(e) => {
+            return unavailable(
+                format!("incidents directory unreadable: {e}"),
+                paused,
+                failures,
+            );
+        }
+    };
+
+    BriefSchedulerSection {
+        availability: SectionAvailability::Available,
+        note: None,
+        scheduled_pipelines: scheduled.len() as u64,
+        paused,
+        consecutive_failures: failures,
+        runs_in_window,
+        failed_in_window,
+        incident_count,
+        latest_incident,
     }
 }
 
@@ -1279,6 +1517,47 @@ fn render_markdown(out: &BriefOutput) -> String {
         _ => s.push_str(&section_status(
             &out.autonomy.availability,
             &out.autonomy.note,
+        )),
+    }
+
+    // Scheduler — the resident scheduler's posture: holds, failure streaks,
+    // window activity, and the incident spool.
+    s.push_str("\n## Scheduler\n");
+    match out.scheduler.availability {
+        SectionAvailability::Available => {
+            s.push_str(&format!(
+                "{} scheduled pipeline(s); {} scheduler run(s) in window · {} failed\n",
+                out.scheduler.scheduled_pipelines,
+                out.scheduler.runs_in_window,
+                out.scheduler.failed_in_window,
+            ));
+            if !out.scheduler.paused.is_empty() {
+                s.push_str(&format!("Paused: {}\n", out.scheduler.paused.join(", ")));
+            }
+            for f in &out.scheduler.consecutive_failures {
+                s.push_str(&format!(
+                    "- {} — {} consecutive failure(s)\n",
+                    f.pipeline, f.consecutive_failures,
+                ));
+            }
+            if out.scheduler.incident_count > 0 {
+                s.push_str(&format!(
+                    "{} incident bundle(s) on disk{}\n",
+                    out.scheduler.incident_count,
+                    out.scheduler
+                        .latest_incident
+                        .as_deref()
+                        .map(|p| format!(" — latest: {p}"))
+                        .unwrap_or_default(),
+                ));
+            }
+            if let Some(note) = &out.scheduler.note {
+                s.push_str(&format!("_{note}_\n"));
+            }
+        }
+        _ => s.push_str(&section_status(
+            &out.scheduler.availability,
+            &out.scheduler.note,
         )),
     }
 
@@ -1630,6 +1909,17 @@ mod tests {
                 degraded_rules: Vec::new(),
                 active_freezes: Vec::new(),
             },
+            scheduler: BriefSchedulerSection {
+                availability: SectionAvailability::NoData,
+                note: None,
+                scheduled_pipelines: 0,
+                paused: Vec::new(),
+                consecutive_failures: Vec::new(),
+                runs_in_window: 0,
+                failed_in_window: 0,
+                incident_count: 0,
+                latest_incident: None,
+            },
         };
         let md = render_markdown(&out);
         assert!(md.starts_with("# Rocky estate brief"));
@@ -1682,5 +1972,234 @@ mod tests {
             out.agent_activity.total, 0,
             "agent activity reports the window, not all history"
         );
+    }
+
+    /// Scheduler-section fixture: a config with two scheduled pipelines and
+    /// one unscheduled, returning the config path.
+    fn scheduler_project(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let config = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.alpha]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.alpha.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.alpha.schedule]\ncron = \"* * * * *\"\ntimezone = \"UTC\"\n\n\
+             [pipeline.beta]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.beta.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.beta.schedule]\ncron = \"0 * * * *\"\ntimezone = \"UTC\"\n\n\
+             [pipeline.gamma]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.gamma.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        config
+    }
+
+    /// The full projection: holds and failure streaks from the cursors,
+    /// scheduler-spawned runs (schedule AND webhook triggers) from the window,
+    /// manual runs excluded, skip statuses not counted as failures, and the
+    /// incident spool surfaced with its newest bundle.
+    #[test]
+    fn scheduler_section_projects_holds_streaks_window_and_incidents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = scheduler_project(&tmp);
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+
+        let paused_rec = rocky_core::schedule::record::ScheduleStateRecord {
+            paused: true,
+            ..Default::default()
+        };
+        store.put_schedule_state("alpha", &paused_rec).unwrap();
+        let failing_rec = rocky_core::schedule::record::ScheduleStateRecord {
+            consecutive_failures: 3,
+            ..Default::default()
+        };
+        store.put_schedule_state("beta", &failing_rec).unwrap();
+
+        let mut sched_fail = run("r1", RunStatus::Failure, vec![]);
+        sched_fail.trigger = RunTrigger::Schedule;
+        let mut hook_ok = run("r2", RunStatus::Success, vec![]);
+        hook_ok.trigger = RunTrigger::Webhook;
+        let mut sched_skip = run("r3", RunStatus::SkippedIdempotent, vec![]);
+        sched_skip.trigger = RunTrigger::Schedule;
+        let manual_fail = run("r4", RunStatus::Failure, vec![]);
+        for r in [&sched_fail, &hook_ok, &sched_skip, &manual_fail] {
+            store.record_run(r).unwrap();
+        }
+
+        let rocky_dir = tmp.path().join(".rocky");
+        let incidents = rocky_dir.join("incidents");
+        std::fs::create_dir_all(&incidents).unwrap();
+        std::fs::write(incidents.join("20260101T000000Z-beta-aaaaaaaa.json"), "{}").unwrap();
+        std::fs::write(incidents.join("20260102T000000Z-beta-bbbbbbbb.json"), "{}").unwrap();
+        std::fs::write(incidents.join("notes.txt"), "ignored").unwrap();
+
+        let s = build_scheduler(&config, &store, Some(ts(1)), &rocky_dir, MAX_HISTORY_SCAN);
+        assert!(matches!(s.availability, SectionAvailability::Available));
+        assert_eq!(s.scheduled_pipelines, 2, "gamma has no [schedule]");
+        assert_eq!(s.paused, vec!["alpha".to_string()]);
+        assert_eq!(s.consecutive_failures.len(), 1);
+        assert_eq!(s.consecutive_failures[0].pipeline, "beta");
+        assert_eq!(s.consecutive_failures[0].consecutive_failures, 3);
+        assert_eq!(
+            s.runs_in_window, 3,
+            "schedule + webhook + skipped; manual excluded"
+        );
+        assert_eq!(s.failed_in_window, 1, "skip statuses are not failures");
+        assert_eq!(s.incident_count, 2, "non-json files ignored");
+        assert_eq!(
+            s.latest_incident.as_deref(),
+            Some(".rocky/incidents/20260102T000000Z-beta-bbbbbbbb.json"),
+            "project-relative, never an absolute host path"
+        );
+
+        // The markdown surfaces the hold and the streak.
+        let mut out = empty_brief(ts(12), BriefSince::Hours24, Some(ts(1)), "x");
+        out.scheduler = s;
+        let md = render_markdown(&out);
+        assert!(md.contains("## Scheduler"), "{md}");
+        assert!(md.contains("Paused: alpha"), "{md}");
+        assert!(md.contains("beta — 3 consecutive failure(s)"), "{md}");
+        assert!(md.contains("2 incident bundle(s)"), "{md}");
+    }
+
+    /// No `[schedule]` block anywhere → `no_data`, never a fabricated zero row.
+    #[test]
+    fn scheduler_section_is_no_data_without_schedules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.gamma]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.gamma.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        let s = build_scheduler(
+            &config,
+            &store,
+            None,
+            &tmp.path().join(".rocky"),
+            MAX_HISTORY_SCAN,
+        );
+        assert!(matches!(s.availability, SectionAvailability::NoData));
+        assert_eq!(s.scheduled_pipelines, 0);
+    }
+
+    /// An unreadable config fails the section closed with a note — the digest
+    /// must never render "no holds" out of a config it could not read.
+    #[test]
+    fn scheduler_section_fails_closed_on_unreadable_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        let s = build_scheduler(
+            &tmp.path().join("missing.toml"),
+            &store,
+            None,
+            &tmp.path().join(".rocky"),
+            MAX_HISTORY_SCAN,
+        );
+        assert!(matches!(s.availability, SectionAvailability::Unavailable));
+        assert!(
+            s.note.as_deref().unwrap().contains("config unreadable"),
+            "{:?}",
+            s.note
+        );
+    }
+
+    /// The run query must filter BELOW the recency cap: a scheduled failure
+    /// older than a flood of newer manual runs still surfaces even when the
+    /// scan cap is smaller than the flood. Page-then-filter would return a
+    /// false all-clear here.
+    #[test]
+    fn scheduler_section_finds_runs_past_a_manual_flood() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = scheduler_project(&tmp);
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+
+        let mut sched_fail = run("sched-old", RunStatus::Failure, vec![]);
+        sched_fail.trigger = RunTrigger::Schedule;
+        sched_fail.started_at = ts(2);
+        store.record_run(&sched_fail).unwrap();
+        for i in 0..3 {
+            let mut manual = run(&format!("manual-{i}"), RunStatus::Success, vec![]);
+            manual.started_at = ts(5 + i);
+            store.record_run(&manual).unwrap();
+        }
+
+        // Cap smaller than the manual flood: a capped page of the newest 2
+        // runs contains only manual successes.
+        let s = build_scheduler(&config, &store, Some(ts(1)), &tmp.path().join(".rocky"), 2);
+        assert_eq!(s.runs_in_window, 1, "the scheduled failure must be found");
+        assert_eq!(s.failed_in_window, 1);
+    }
+
+    /// Foreign `.json` files in `.rocky/incidents/` are not bundles and must
+    /// not be counted or reported as the newest incident.
+    #[test]
+    fn scheduler_section_counts_only_real_bundle_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = scheduler_project(&tmp);
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        let incidents = tmp.path().join(".rocky").join("incidents");
+        std::fs::create_dir_all(&incidents).unwrap();
+        std::fs::write(incidents.join("20260101T000000Z-beta-aaaaaaaa.json"), "{}").unwrap();
+        std::fs::write(incidents.join("zzz-notes.json"), "{}").unwrap();
+        std::fs::create_dir_all(incidents.join("20260103T000000Z-fake-dirbundle.json")).unwrap();
+
+        let s = build_scheduler(
+            &config,
+            &store,
+            None,
+            &tmp.path().join(".rocky"),
+            MAX_HISTORY_SCAN,
+        );
+        assert_eq!(
+            s.incident_count, 1,
+            "foreign json and bundle-named directories are not bundles"
+        );
+        assert_eq!(
+            s.latest_incident.as_deref(),
+            Some(".rocky/incidents/20260101T000000Z-beta-aaaaaaaa.json"),
+            "a foreign name sorting last must not become the newest incident"
+        );
+    }
+
+    /// A symlinked incidents directory fails the section closed instead of
+    /// reading (and later sweeping) through it.
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_section_refuses_a_symlinked_incidents_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = scheduler_project(&tmp);
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        std::fs::create_dir_all(&rocky_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, rocky_dir.join("incidents")).unwrap();
+
+        let mut sched_fail = run("r-sched", RunStatus::Failure, vec![]);
+        sched_fail.trigger = RunTrigger::Schedule;
+        store.record_run(&sched_fail).unwrap();
+
+        let s = build_scheduler(&config, &store, None, &rocky_dir, MAX_HISTORY_SCAN);
+        assert!(matches!(s.availability, SectionAvailability::Unavailable));
+        assert!(
+            s.note.as_deref().unwrap().contains("symlink"),
+            "{:?}",
+            s.note
+        );
+        assert_eq!(
+            s.failed_in_window, 1,
+            "an inventory failure must not zero the run counts already computed"
+        );
+        assert_eq!(s.runs_in_window, 1);
     }
 }
