@@ -1889,6 +1889,94 @@ mod tests {
         );
     }
 
+    /// Column lineage must be compiled from the same glob-selected model
+    /// objects as the DAG, not by re-reading their whole base directory.
+    ///
+    /// Before #1293 the graph correctly excluded `customers` after full-glob
+    /// matching was added, but the lineage path compiled `models/` again. A
+    /// valid excluded model leaked an edge into the output; making that same
+    /// sidecar malformed erased the selected `orders` lineage instead.
+    #[tokio::test]
+    async fn dag_column_lineage_uses_only_glob_selected_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+
+        for (name, sql, depends) in [
+            // A bare run variable must be substituted before dependency and
+            // lineage parsing, just like the normal directory compiler does.
+            ("orders", "SELECT @var(seed) AS id", ""),
+            (
+                "orders_rollup",
+                "SELECT id FROM orders",
+                "depends_on = [\"orders\"]\n",
+            ),
+            (
+                "customers",
+                "SELECT id FROM orders",
+                "depends_on = [\"orders\"]\n",
+            ),
+        ] {
+            std::fs::write(models.join(format!("{name}.sql")), sql).unwrap();
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n{depends}\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/ord*.sql\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = pinned_state_path(dir.path());
+
+        let output = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("glob-selected DAG lineage must compile");
+        let transformation_models: std::collections::HashSet<&str> = output
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "transformation")
+            .map(|node| node.label.as_str())
+            .collect();
+        assert_eq!(
+            transformation_models,
+            std::collections::HashSet::from(["orders", "orders_rollup"])
+        );
+        assert!(
+            output.column_lineage.iter().any(|edge| {
+                edge.source.model == "orders" && edge.target.model == "orders_rollup"
+            }),
+            "selected-model lineage must remain visible: {:?}",
+            output.column_lineage
+        );
+        for edge in &output.column_lineage {
+            assert!(
+                transformation_models.contains(edge.source.model.as_str())
+                    && transformation_models.contains(edge.target.model.as_str()),
+                "lineage endpoint absent from DAG: {edge:?}"
+            );
+        }
+
+        std::fs::write(models.join("customers.toml"), "name = [\n").unwrap();
+        let after_malformed = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("a malformed excluded sidecar must not erase selected lineage");
+        assert!(
+            after_malformed.column_lineage.iter().any(|edge| {
+                edge.source.model == "orders" && edge.target.model == "orders_rollup"
+            }),
+            "selected lineage disappeared after excluded sidecar broke: {:?}",
+            after_malformed.column_lineage
+        );
+    }
+
     /// A project with no transformation pipeline at all.
     fn replication_only_project() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1926,15 +2014,16 @@ mod tests {
     /// `--column-lineage` must not fail on the ordinary nested layout: staging
     /// models one level down feeding marts at the root.
     ///
-    /// The model loader reads the root plus one level below; the lineage compile
-    /// reads only the root. So `fct` is compiled while the `stg` it selects from
-    /// is invisible, and the compiler reports `unknown dependency 'stg'`. That
-    /// is an artifact of the shallower read, not a defect in the project.
+    /// The lineage compile now uses the DAG's OWN already-loaded model set
+    /// (`compile_preloaded_models`) rather than re-reading the models
+    /// directory, so `stg` is no longer invisible to it and the compiler no
+    /// longer reports `unknown dependency 'stg'` for this shape.
     ///
     /// A previous revision surfaced that error instead of swallowing it and so
     /// turned this — the single most common project shape — into a hard
-    /// failure. Compiling the DAG's own model set is the real fix (#1262); until
-    /// then this asserts the tolerance stays.
+    /// failure. That tolerance is still asserted, but the edge itself is now
+    /// pinned too: checking node labels alone would stay green if the lineage
+    /// silently regressed to the old root-only read.
     #[tokio::test]
     async fn dag_column_lineage_tolerates_nested_model_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -1972,6 +2061,21 @@ mod tests {
         let labels: Vec<&str> = out.nodes.iter().map(|n| n.label.as_str()).collect();
         assert!(labels.contains(&"stg"), "nested model missing: {labels:?}");
         assert!(labels.contains(&"fct"), "root model missing: {labels:?}");
+
+        // The point of compiling the DAG's own model set: the nested `stg` is
+        // visible to lineage, so the `stg -> fct` edge exists. Labels alone
+        // would not catch a regression to the old root-only read.
+        let edges: Vec<(&str, &str)> = out
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str()))
+            .collect();
+        assert!(
+            edges
+                .iter()
+                .any(|(f, t)| f.contains("stg") && t.contains("fct")),
+            "the nested model must contribute a lineage edge, not just a node: {edges:?}"
+        );
     }
 
     /// A configured-but-empty root is not a second root.
