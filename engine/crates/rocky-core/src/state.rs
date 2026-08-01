@@ -562,6 +562,13 @@ pub struct StateWriterLock {
 /// lock lives on `<path>.redb.lock` (never the state file), so the caller may
 /// atomically `rename` a new state file into `path` while holding this guard.
 pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateError> {
+    let (file, lock_path) = open_lock_file(path)?;
+    lock_once(&file, path, &lock_path)?;
+    Ok(StateWriterLock { _file: file })
+}
+
+/// Open (creating if absent) the sidecar lock file for `path`.
+fn open_lock_file(path: &Path) -> Result<(std::fs::File, std::path::PathBuf), StateError> {
     let lock_path = path.with_extension("redb.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -573,7 +580,12 @@ pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateErro
             path: lock_path.display().to_string(),
             source: e,
         })?;
-    FileExt::try_lock(&file).map_err(|e| match e {
+    Ok((file, lock_path))
+}
+
+/// One non-blocking `flock` attempt on an already-open lock file.
+fn lock_once(file: &std::fs::File, path: &Path, lock_path: &Path) -> Result<(), StateError> {
+    FileExt::try_lock(file).map_err(|e| match e {
         fs4::TryLockError::WouldBlock => StateError::LockHeldByOther {
             path: path.display().to_string(),
         },
@@ -581,8 +593,53 @@ pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateErro
             path: lock_path.display().to_string(),
             source,
         },
-    })?;
-    Ok(StateWriterLock { _file: file })
+    })
+}
+
+/// Acquire the advisory writer lock, retrying a *transient* holder on the same
+/// budget [`open_redb_with_retry`] already uses for the redb open directly
+/// below it (#1234).
+///
+/// The asymmetry this removes: the redb open retried contention while the lock
+/// acquire immediately below it made exactly one attempt, so any momentary
+/// holder became a hard `LockHeldByOther`. The holder is momentary far more
+/// often than it looks — a `flock` on a lock file this process itself created
+/// can be briefly contended when another *thread* of the same binary spawns a
+/// child process, because the descriptor is inherited across the fork window.
+/// That is why `cargo test` (threads in one process) saw it and `cargo nextest`
+/// (a process per test) did not, and why the exposure is not test-only: the
+/// end-of-run retention sweep opens the store the same way and swallows this
+/// error as a warning, so the sweep silently did not happen.
+///
+/// The retry re-attempts the lock on the ALREADY-OPEN file rather than
+/// reopening it, so a genuine external holder is not raced against.
+///
+/// Deliberately private and used only by [`StateStore::open_inner`]. The public
+/// [`try_acquire_writer_lock`] keeps its single-attempt, non-blocking contract —
+/// `state_sync`'s download path and the apply seam rely on it to fail fast
+/// rather than block.
+fn acquire_writer_lock_with_retry(path: &Path) -> Result<StateWriterLock, StateError> {
+    let (file, lock_path) = open_lock_file(path)?;
+    for attempt in 0..REDB_OPEN_RETRY_ATTEMPTS {
+        match lock_once(&file, path, &lock_path) {
+            Ok(()) => return Ok(StateWriterLock { _file: file }),
+            // Only a *contended* lock is retryable; an I/O error is terminal.
+            Err(e @ StateError::LockHeldByOther { .. }) => {
+                #[cfg(test)]
+                LOCK_RETRY_OBSERVER.with(|o| {
+                    if let Some(counter) = o.borrow().as_ref() {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+                if attempt + 1 == REDB_OPEN_RETRY_ATTEMPTS {
+                    return Err(e);
+                }
+                std::thread::sleep(REDB_OPEN_RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the final attempt returns rather than falling through")
 }
 
 /// Embedded state store backed by redb for tracking watermarks and run history.
@@ -844,7 +901,7 @@ impl StateStore {
         // of them reaches the lock check. Read-only opens skip the lock. Shared
         // with `state_sync`'s publish path via [`try_acquire_writer_lock`].
         let lock = if matches!(mode, OpenMode::ReadWrite) {
-            Some(try_acquire_writer_lock(path)?)
+            Some(acquire_writer_lock_with_retry(path)?)
         } else {
             None
         };
@@ -1388,6 +1445,13 @@ thread_local! {
     /// entered, instead of sleeping a fixed duration and racing the retry
     /// budget — see `open_read_only_retries_and_succeeds_after_brief_hold`.
     static REDB_RETRY_OBSERVER: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// The same hook for the ADVISORY-LOCK retry in
+    /// [`acquire_writer_lock_with_retry`], for the same reason: a test that
+    /// sleeps a fixed duration and hopes the release lands inside the budget
+    /// is itself load-sensitive — which is the defect class #1234 is about.
+    static LOCK_RETRY_OBSERVER: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -7735,6 +7799,66 @@ mod tests {
         assert!(
             super::try_acquire_writer_lock(&path).is_ok(),
             "the guard must release the lock on drop"
+        );
+    }
+
+    /// #1234: `StateStore::open`'s ADVISORY-LOCK acquire retries a transient
+    /// holder instead of failing on the first attempt.
+    ///
+    /// The acquire made exactly one attempt while the redb open immediately
+    /// below it already retried, so any momentary holder became a hard
+    /// `LockHeldByOther`. In production that silently skipped the end-of-run
+    /// retention sweep, which swallows the error as a warning.
+    ///
+    /// Deterministic on purpose. The holder releases the moment it observes
+    /// the opener has entered the retry loop, rather than sleeping a fixed
+    /// duration and racing the 5x50ms budget — a timing-raced test would
+    /// itself be load-sensitive, which is the very defect class this fixes.
+    #[test]
+    fn open_retries_the_advisory_lock_and_succeeds_after_brief_hold() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+
+        let lock_acquired = Arc::new(Barrier::new(2));
+        let retries = Arc::new(AtomicUsize::new(0));
+
+        let holder = {
+            let path = path.clone();
+            let lock_acquired = Arc::clone(&lock_acquired);
+            let retries = Arc::clone(&retries);
+            thread::spawn(move || {
+                // Take the advisory lock directly — the same thing a second
+                // writer process does.
+                let guard = try_acquire_writer_lock(&path).unwrap();
+                lock_acquired.wait();
+                let mut waited = Duration::ZERO;
+                while retries.load(Ordering::SeqCst) == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                    waited += Duration::from_millis(1);
+                    assert!(
+                        waited < Duration::from_secs(5),
+                        "opener never hit lock contention — it did not retry"
+                    );
+                }
+                drop(guard);
+            })
+        };
+
+        lock_acquired.wait();
+        LOCK_RETRY_OBSERVER.with(|o| *o.borrow_mut() = Some(Arc::clone(&retries)));
+        let opened = StateStore::open(&path);
+        LOCK_RETRY_OBSERVER.with(|o| *o.borrow_mut() = None);
+        holder.join().unwrap();
+
+        opened.expect("a holder released inside the retry budget must be waited out");
+        assert!(
+            retries.load(Ordering::SeqCst) > 0,
+            "the test must have exercised the retry path, not raced past it"
         );
     }
 
