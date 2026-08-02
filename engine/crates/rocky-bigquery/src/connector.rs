@@ -282,11 +282,11 @@ impl BigQueryAdapter {
     /// adapter-tagged child span when traced. Mirrors the OTel
     /// `<verb>.<resource>` shape used by the `materialize.table` parent.
     async fn run_query(&self, sql: &str) -> Result<BigQueryResponse, BigQueryError> {
-        // `statement.kind = "query"` is a best-effort default — BigQuery
-        // routes DDL, DML, and SELECT through the same `jobs.query`
-        // endpoint and the wire request doesn't surface the parsed
-        // statement kind. TODO: classify via `rocky-sql` if downstream
-        // consumers need to filter ddl/dml from query traffic.
+        // BigQuery routes DDL, DML, and SELECT through the same
+        // `jobs.query` endpoint, so the kind is classified from the SQL
+        // text — the same keyword matcher the Snowflake and Databricks
+        // connectors use (#897), keeping `statement.kind` filterable
+        // uniformly across every warehouse adapter.
         //
         // Span attribute schema unification: emit the canonical
         // `rocky.*` keys alongside the bespoke `adapter` /
@@ -295,12 +295,13 @@ impl BigQueryAdapter {
         // aliases. `rocky.warehouse.query_id` starts empty and is
         // filled by `Span::record` once BigQuery returns the
         // `JobReference.job_id`. See `rocky_observe::span_attrs`.
+        let kind = classify_statement_kind(sql);
         let span = info_span!(
             "statement.execute",
             adapter = "bigquery",
-            statement.kind = "query",
+            statement.kind = kind,
             "rocky.adapter.name" = "bigquery",
-            "rocky.statement.kind" = "query",
+            "rocky.statement.kind" = kind,
             "rocky.warehouse.name" = %self.project_id,
             "rocky.warehouse.query_id" = field::Empty,
             "rocky.warehouse.bytes_scanned" = field::Empty,
@@ -2200,5 +2201,101 @@ mod tests {
 
         let unknown = classify_bigquery_failure(&AdapterError::msg("not a bigquery error"));
         assert_eq!(unknown, FailureClass::Unknown);
+    }
+}
+
+/// Classify a SQL statement for the `statement.kind` span attribute —
+/// `query` / `dml` / `ddl` / `other`. Mirrors the Snowflake and Databricks
+/// connectors' matcher so dashboards filter uniformly across adapters
+/// (#897). Divergence, on purpose: this stripper also handles BigQuery's
+/// `#` line comments and `/* */` blocks; the sibling strippers handle only
+/// `--` and share the `/* */` gap — tracked separately so the parity story
+/// stays explicit rather than silently uneven.
+fn classify_statement_kind(sql: &str) -> &'static str {
+    let sql = strip_leading_sql_comments_and_whitespace(sql);
+    let keyword = sql
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("");
+
+    match keyword.to_ascii_uppercase().as_str() {
+        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "EXPLAIN" => "query",
+        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" | "TRUNCATE" => "dml",
+        "CREATE" | "ALTER" | "DROP" | "GRANT" | "REVOKE" => "ddl",
+        _ => "other",
+    }
+}
+
+fn strip_leading_sql_comments_and_whitespace(mut sql: &str) -> &str {
+    loop {
+        let trimmed = sql.trim_start();
+        // BigQuery accepts `--` AND `#` line comments plus `/* … */` blocks
+        // (GoogleSQL lexical rules) — a statement led by any of them must
+        // still classify by its first keyword.
+        if let Some(body) = trimmed
+            .strip_prefix("--")
+            .or_else(|| trimmed.strip_prefix('#'))
+        {
+            sql = match body.find('\n') {
+                Some(line_end) => &body[line_end + 1..],
+                None => "",
+            };
+            continue;
+        }
+        if let Some(body) = trimmed.strip_prefix("/*") {
+            sql = match body.find("*/") {
+                Some(end) => &body[end + 2..],
+                // Unterminated block comment: nothing classifiable follows.
+                None => "",
+            };
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+#[cfg(test)]
+mod statement_kind_tests {
+    use super::classify_statement_kind;
+
+    #[test]
+    fn classifies_query_dml_ddl_and_other() {
+        for (sql, expected) in [
+            ("SELECT 1", "query"),
+            ("  with cte AS (SELECT 1) SELECT * FROM cte", "query"),
+            ("EXPLAIN SELECT 1", "query"),
+            ("INSERT INTO t VALUES (1)", "dml"),
+            ("merge INTO t USING s ON t.id = s.id", "dml"),
+            ("TRUNCATE TABLE t", "dml"),
+            ("CREATE TABLE t (id INT64)", "ddl"),
+            ("alter table t ADD COLUMN c STRING", "ddl"),
+            ("DROP SCHEMA s", "ddl"),
+            ("VACUUM t", "other"),
+        ] {
+            assert_eq!(classify_statement_kind(sql), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn leading_comments_do_not_hide_the_keyword() {
+        assert_eq!(
+            classify_statement_kind("-- provisioning\n-- second line\nCREATE TABLE t (id INT64)"),
+            "ddl"
+        );
+        // BigQuery-specific `#` line comments and `/* */` blocks.
+        assert_eq!(
+            classify_statement_kind("# provisioning\nINSERT INTO t VALUES (1)"),
+            "dml"
+        );
+        assert_eq!(
+            classify_statement_kind("/* multi\nline */ SELECT 1"),
+            "query"
+        );
+        assert_eq!(
+            classify_statement_kind("/* a */ -- b\n# c\nDROP TABLE t"),
+            "ddl"
+        );
+        assert_eq!(classify_statement_kind("-- only a comment"), "other");
+        assert_eq!(classify_statement_kind("/* unterminated"), "other");
     }
 }
