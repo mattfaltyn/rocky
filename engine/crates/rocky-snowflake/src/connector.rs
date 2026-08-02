@@ -568,8 +568,21 @@ impl SnowflakeConnector {
 ///
 /// Counts semicolons that terminate distinct statements, then adds 1 for the
 /// final un-terminated statement. Skips semicolons inside SQL string literals
-/// (`'...'`) and single-line comments (`-- ...`). Rocky-generated SQL never
-/// embeds semicolons in identifiers, so identifier-quoting is not considered.
+/// (`'...'`), double-quoted identifiers (`"..."`, `""` escape), single-line
+/// comments (`-- ...` and `// ...` — Snowflake accepts both), and `/* ... */`
+/// block comments (flat scan: Snowflake's lexer ends a block comment at the
+/// FIRST `*/`; an inner `/*` is inert text — live-verified). A miscount here
+/// is not cosmetic: Snowflake rejects a submission whose real statement count
+/// differs from `MULTI_STATEMENT_COUNT` (#1365).
+///
+/// Dollar-quoted string constants (`$$ ... $$` — bare form only; a `$tag$`
+/// opener is a syntax error, live-verified) are opaque: comment markers,
+/// quotes, and semicolons inside them are literal text. `$$` opens a string
+/// only at a TOKEN BOUNDARY: `$` is a valid identifier character, so
+/// `a$$b` and `a$$` are single identifiers (live-verified), while after a
+/// bare numeric token `1$$` the server DOES open a string (live-verified:
+/// unterminated parse error) — tracked via which character started the
+/// current word token.
 ///
 /// Trailing-only whitespace after the last semicolon counts the same as a
 /// terminator (one fewer statement). Empty / whitespace-only input returns 0.
@@ -577,10 +590,44 @@ fn count_statements(sql: &str) -> usize {
     let mut count = 0usize;
     let mut chars = sql.chars().peekable();
     let mut in_string = false;
+    let mut in_dquote = false;
+    let mut in_dollar = false;
+    // `prev_word` — the previous char continues a word token (alnum/_/$);
+    // `word_absorbs_dollar` — that token began with a letter or `_`, so a
+    // following `$$` is identifier continuation, not a string opener.
+    let mut prev_word = false;
+    let mut word_absorbs_dollar = false;
     let mut saw_non_ws_since_terminator = false;
     while let Some(c) = chars.next() {
+        if in_dollar {
+            if c == '$' && chars.peek() == Some(&'$') {
+                chars.next();
+                in_dollar = false;
+                prev_word = false;
+            }
+            continue;
+        }
+        if in_dquote {
+            if c == '"' {
+                // `""` escapes a quote inside a quoted identifier.
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                } else {
+                    in_dquote = false;
+                    prev_word = false;
+                }
+            }
+            continue;
+        }
         if in_string {
-            if c == '\'' {
+            if c == '\\' {
+                // Snowflake string constants also escape with backslash
+                // (`\'`, `\\`, …) — the next char is literal, so `\'` must
+                // not close the string (live-verified: `'a\'$$; x'` is ONE
+                // string; before this arm the dollar opener fired inside it
+                // and swallowed the real terminator).
+                chars.next();
+            } else if c == '\'' {
                 // Snowflake doubles single quotes to escape (`''`); treat as
                 // staying inside the literal.
                 if chars.peek() == Some(&'\'') {
@@ -595,6 +642,18 @@ fn count_statements(sql: &str) -> usize {
             '\'' => {
                 in_string = true;
                 saw_non_ws_since_terminator = true;
+                prev_word = false;
+            }
+            '"' => {
+                in_dquote = true;
+                saw_non_ws_since_terminator = true;
+                prev_word = false;
+            }
+            '$' if chars.peek() == Some(&'$') && !(prev_word && word_absorbs_dollar) => {
+                chars.next();
+                in_dollar = true;
+                saw_non_ws_since_terminator = true;
+                prev_word = false;
             }
             '-' if chars.peek() == Some(&'-') => {
                 // Skip to end of line.
@@ -603,16 +662,52 @@ fn count_statements(sql: &str) -> usize {
                         break;
                     }
                 }
+                prev_word = false;
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                // Skip to end of line.
+                for nc in chars.by_ref() {
+                    if nc == '\n' {
+                        break;
+                    }
+                }
+                prev_word = false;
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Skip to the first `*/` (flat — see the doc comment);
+                // unterminated swallows the rest, matching the lexer.
+                chars.next();
+                let mut prev = ' ';
+                for nc in chars.by_ref() {
+                    if prev == '*' && nc == '/' {
+                        break;
+                    }
+                    prev = nc;
+                }
+                prev_word = false;
             }
             ';' => {
                 if saw_non_ws_since_terminator {
                     count += 1;
                 }
                 saw_non_ws_since_terminator = false;
+                prev_word = false;
             }
-            c if c.is_whitespace() => {}
+            c if c.is_whitespace() => {
+                prev_word = false;
+            }
             _ => {
                 saw_non_ws_since_terminator = true;
+                if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+                    if !prev_word {
+                        // A word token starts here; only letter/underscore
+                        // starts can absorb a later `$$`.
+                        word_absorbs_dollar = c.is_ascii_alphabetic() || c == '_';
+                    }
+                    prev_word = true;
+                } else {
+                    prev_word = false;
+                }
             }
         }
     }
@@ -640,11 +735,16 @@ fn classify_statement_kind(sql: &str) -> &'static str {
 fn strip_leading_sql_comments_and_whitespace(mut sql: &str) -> &str {
     loop {
         let trimmed = sql.trim_start();
-        // `--` line comments AND `/* … */` block comments — a statement led
-        // by either must still classify by its first keyword (#1363; the
-        // BigQuery connector strips the same forms plus its dialect-specific
-        // `#`).
-        if let Some(body) = trimmed.strip_prefix("--") {
+        // `--` AND `//` line comments AND `/* … */` block comments — a
+        // statement led by any of them must still classify by its first
+        // keyword (#1363; the BigQuery connector strips `--`/`/* */` plus
+        // its dialect-specific `#`). `//` is Snowflake-specific too:
+        // live-verified accepted by the SQL API, and neither Spark SQL nor
+        // GoogleSQL documents it.
+        if let Some(body) = trimmed
+            .strip_prefix("--")
+            .or_else(|| trimmed.strip_prefix("//"))
+        {
             sql = match body.find('\n') {
                 Some(line_end) => &body[line_end + 1..],
                 None => "",
@@ -912,6 +1012,133 @@ mod tests {
     fn test_count_statements_ignores_semicolon_in_line_comment() {
         let sql = "-- here; is; a; comment\nSELECT 1; SELECT 2";
         assert_eq!(count_statements(sql), 2);
+        let sql = "// here; too\nSELECT 1; SELECT 2";
+        assert_eq!(count_statements(sql), 2);
+        // The comment swallows the terminator; the statement still counts
+        // once via the trailing non-terminated arm.
+        assert_eq!(count_statements("SELECT 1 // trail;"), 1);
+    }
+
+    #[test]
+    fn test_count_statements_dollar_quoted_bodies_are_opaque() {
+        // Everything inside bare $$ ... $$ is literal text (live-verified:
+        // each of these executes; if the server commented inside them the
+        // closer would be swallowed and the statement would fail).
+        assert_eq!(count_statements("SELECT $$ a -- b $$ AS c"), 1);
+        assert_eq!(count_statements("SELECT $$ x; // y /* z; */ $$ AS c"), 1);
+        assert_eq!(count_statements("SELECT $$ a // b $$; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT $$ don't $$ AS c"), 1);
+        // $$ inside a normal string is just characters.
+        assert_eq!(count_statements("SELECT '$$'; SELECT 2"), 2);
+        // Empty dollar string; adjacent openers/closers pair in order.
+        assert_eq!(count_statements("SELECT $$$$ AS e"), 1);
+        // Unterminated dollar string swallows the rest (the server errors
+        // on the statement itself; we still declare the one statement).
+        assert_eq!(count_statements("SELECT $$ a; "), 1);
+    }
+
+    #[test]
+    fn test_count_statements_dollar_in_identifiers_not_a_string_opener() {
+        // `$` is a valid identifier character: `a$$b` and `a$$` are single
+        // identifiers (live-verified), so `$$` there must NOT open a
+        // string and swallow the real terminator.
+        assert_eq!(count_statements("SELECT 1 AS a$$b; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT 1 AS a$$; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT t.col$$x FROM t; SELECT 2"), 2);
+        // Positional reference: a lone `$` never opens anything.
+        assert_eq!(count_statements("SELECT $1; SELECT 2"), 2);
+        // After a bare numeric token the server DOES open a dollar string
+        // (live-verified: `1$$` is an unterminated-string parse error), so
+        // the counter opens too and the inner `;` stays inert.
+        assert_eq!(count_statements("SELECT 1$$ a; $$"), 1);
+        // Token boundaries that DO open: whitespace and punctuation.
+        assert_eq!(count_statements("SELECT ($$x; $$); SELECT 2"), 2);
+        // Session variables do NOT absorb a following $$ — the server
+        // opens a string there (live-verified: `SELECT $a$$ x $$` fails
+        // with "unexpected '$$ x $$'", i.e. `$a` + a lexed string; and
+        // `SELECT $a$$b` is an unterminated-string parse error). The
+        // scanner mirrors both, so declared counts match the lexer.
+        assert_eq!(count_statements("SELECT $a$$ x; $$; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT $a$$b; swallowed"), 1);
+    }
+
+    #[test]
+    fn test_count_statements_quoted_identifiers_are_opaque() {
+        // Double-quoted identifiers may contain `;`, `$$`, and `""`-escaped
+        // quotes (live-verified: SELECT 1 AS "a;b$$c""d" executes).
+        assert_eq!(count_statements(r#"SELECT 1 AS "a;b"; SELECT 2"#), 2);
+        assert_eq!(count_statements(r#"SELECT 1 AS "a$$b"; SELECT 2"#), 2);
+        assert_eq!(count_statements(r#"SELECT 1 AS "a;b$$c""d"; SELECT 2"#), 2);
+        // Comment markers inside a quoted identifier are literal too
+        // (live-verified: SELECT 1 AS "/*x*/" executes).
+        assert_eq!(count_statements(r#"SELECT 1 AS "/*"; SELECT 2"#), 2);
+        assert_eq!(count_statements(r#"SELECT 1 AS "//"; SELECT 2"#), 2);
+        // Backslash is LITERAL in a quoted identifier — no escape forms
+        // there, only `""` (live-verified: SELECT 1 AS "a\" executes, the
+        // quote after the backslash closes it).
+        assert_eq!(count_statements(r#"SELECT 1 AS "a\"; SELECT 2"#), 2);
+    }
+
+    #[test]
+    fn test_count_statements_backslash_escapes_in_strings() {
+        // Snowflake strings escape with backslash as well as `''`
+        // (live-verified: SELECT 'a\'$$; still string' executes as ONE
+        // string). `\'` must not close the string, or the following $$
+        // opens a phantom dollar-quote and swallows the real terminator.
+        assert_eq!(
+            count_statements("SELECT 'a\\'$$; still string'; SELECT 2"),
+            2
+        );
+        // Escaped backslash then a REAL close (live-verified: 'a\\').
+        assert_eq!(count_statements("SELECT 'a\\\\'; SELECT 2"), 2);
+        // A backslash-escaped semicolon shape: the string stays open
+        // across the escape, so the inner `;` is literal.
+        assert_eq!(count_statements("SELECT 'a\\' ; '; SELECT 2"), 2);
+    }
+
+    #[test]
+    fn test_count_statements_wrapped_transaction_with_protected_regions() {
+        // The submission path prepends ALTER SESSION … and RECOUNTS the
+        // wrapped SQL (see submit above): for a body whose statements
+        // carry protected lexical regions, the declared
+        // MULTI_STATEMENT_COUNT must be the real count + 1 — neither
+        // swallowed (comment arms firing inside $$/"…") nor inflated
+        // (semicolons inside them counted).
+        let body = "BEGIN;\nCREATE FUNCTION f() RETURNS INT AS $$ SELECT 1; -- x\n $$;\nSELECT 1 AS \"/*\";\nCOMMIT;";
+        assert_eq!(count_statements(body), 4);
+        let wrapped = format!("ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = TRUE;\n{body}");
+        assert_eq!(count_statements(&wrapped), 5);
+    }
+
+    #[test]
+    fn test_count_statements_ignores_semicolon_in_block_comment() {
+        // The motivating #1365 shape: a semicolon inside a block comment
+        // over-counted, so MULTI_STATEMENT_COUNT overshot the real count
+        // and Snowflake rejected the whole submission.
+        assert_eq!(count_statements("/* note; kept */ SELECT 1"), 1);
+        assert_eq!(count_statements("/* a; */ SELECT 1; /* b; */ SELECT 2"), 2);
+        // Multi-line block with internal stars.
+        assert_eq!(count_statements("/* l1;\n * l2;\n */ SELECT 1"), 1);
+        // Flat close: the FIRST */ ends the comment (live-verified — an
+        // inner /* is inert), so the semicolon after it is real again.
+        assert_eq!(count_statements("/* a /* b */ SELECT 1; SELECT 2"), 2);
+        // Unterminated block swallows everything after it.
+        assert_eq!(count_statements("/* a; b; c"), 0);
+        assert_eq!(count_statements("SELECT 1; /* tail; never closes"), 1);
+        // A comment-lookalike inside a string literal is still literal text.
+        assert_eq!(count_statements("SELECT '/* not; a comment */'"), 1);
+    }
+
+    #[test]
+    fn test_classify_statement_kind_skips_slash_line_comments() {
+        // Snowflake accepts `//` line comments (live-verified via the SQL
+        // API); a statement led by one must classify by its real keyword.
+        assert_eq!(classify_statement_kind("// note\nSELECT 1"), "query");
+        assert_eq!(
+            classify_statement_kind("// a\n-- b\n/* c */ INSERT INTO t VALUES (1)"),
+            "dml"
+        );
+        assert_eq!(classify_statement_kind("// only a comment"), "other");
     }
 
     #[test]
