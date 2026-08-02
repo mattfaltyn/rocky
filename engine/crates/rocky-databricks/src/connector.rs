@@ -1354,14 +1354,100 @@ fn classify_statement_kind(sql: &str) -> &'static str {
 fn strip_leading_sql_comments_and_whitespace(mut sql: &str) -> &str {
     loop {
         let trimmed = sql.trim_start();
-        let Some(comment_body) = trimmed.strip_prefix("--") else {
-            return trimmed;
-        };
+        // `--` line comments AND `/* … */` block comments — a statement led
+        // by either must still classify by its first keyword (#1363; the
+        // BigQuery connector strips the same forms plus its dialect-specific
+        // `#`).
+        if let Some(body) = trimmed.strip_prefix("--") {
+            sql = match body.find('\n') {
+                Some(line_end) => &body[line_end + 1..],
+                None => "",
+            };
+            continue;
+        }
+        if let Some(body) = trimmed.strip_prefix("/*") {
+            // Spark SQL block comments NEST. Snowflake and BigQuery scan
+            // flat instead — there the comment ends at the FIRST `*/` and
+            // an inner `/*` is inert text (live-verified on both: the
+            // nested probe errors "unexpected 'still'", and
+            // `/* a /* b */ SELECT 1` parses clean) — so track depth here
+            // and only here.
+            // Single pass over bytes, O(n): a rescan-from-start loop is
+            // quadratic on adversarial comment content, and generated SQL
+            // can be large enough for that to stall before submission.
+            let bytes = body.as_bytes();
+            let mut depth: usize = 1;
+            let mut i = 0usize;
+            while i + 1 < bytes.len() {
+                match &bytes[i..i + 2] {
+                    b"/*" => {
+                        depth += 1;
+                        i += 2;
+                    }
+                    b"*/" => {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            sql = if depth == 0 { &body[i..] } else { "" };
+            continue;
+        }
+        return trimmed;
+    }
+}
 
-        sql = match comment_body.find('\n') {
-            Some(line_end) => &comment_body[line_end + 1..],
-            None => "",
-        };
+#[cfg(test)]
+mod statement_kind_tests {
+    use super::classify_statement_kind;
+
+    #[test]
+    fn classifies_and_strips_both_comment_forms() {
+        assert_eq!(classify_statement_kind("SELECT 1"), "query");
+        assert_eq!(
+            classify_statement_kind("MERGE INTO t USING s ON 1=1"),
+            "dml"
+        );
+        assert_eq!(
+            classify_statement_kind("-- generated\nCREATE TABLE t (id INT)"),
+            "ddl"
+        );
+        assert_eq!(
+            classify_statement_kind("/* multi\nline */ SELECT 1"),
+            "query"
+        );
+        assert_eq!(
+            classify_statement_kind("/* a */ -- b\nINSERT INTO t VALUES (1)"),
+            "dml"
+        );
+        assert_eq!(classify_statement_kind("/* unterminated"), "other");
+        // Spark SQL nests block comments.
+        assert_eq!(
+            classify_statement_kind("/* outer /* inner */ still-comment */ SELECT 1"),
+            "query"
+        );
+        assert_eq!(
+            classify_statement_kind("/* outer /* unterminated inner */"),
+            "other"
+        );
+        // Inner block closes, outer never does: the trailing SELECT is
+        // still inside the comment — fail closed, not "query".
+        assert_eq!(
+            classify_statement_kind("/* outer /* inner */ SELECT 1"),
+            "other"
+        );
+        // Overlap pins: each delimiter consumes BOTH its bytes. If the
+        // opener consumed one, `/*/` would double as open+close and the
+        // outer block would look terminated (→ "query"); if the closer
+        // consumed one, its trailing `/` would fuse with the next `*`
+        // into a phantom opener and the run of closers would look
+        // unterminated (→ "other").
+        assert_eq!(classify_statement_kind("/* /*/ */ SELECT 1"), "other");
+        assert_eq!(classify_statement_kind("/* /* */*/ SELECT 1"), "query");
     }
 }
 
