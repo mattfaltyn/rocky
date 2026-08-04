@@ -314,16 +314,12 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
     }
 }
 
-/// Compare two normalized [`RockyType`]s for contract purposes.
-///
-/// Returns `true` (a match, so no violation) when either side is
-/// [`RockyType::Unknown`] — an un-normalizable type is never a false
-/// failure. Otherwise compares by equality.
 /// Whether a landed column type conforms to a contract's expected type: the
 /// landed type must be *assignable to* (fit within) the expected type, so a
 /// narrower landed type (e.g. `INT32`) satisfies a wider contract (`BIGINT`),
-/// but a wider landed type does not satisfy a narrower contract. `Unknown` on
-/// either side passes (never a false failure) — `is_assignable` handles both.
+/// but a wider landed type does not satisfy a narrower contract. Decimal
+/// assignments must preserve fractional scale and integer-digit capacity.
+/// `Unknown` on either side passes to avoid a false failure.
 fn landed_type_conforms(landed: &RockyType, expected: &RockyType) -> bool {
     is_assignable(landed, expected)
 }
@@ -656,6 +652,37 @@ mod tests {
         let result = validate_contract_typed(&contract, &landed);
         assert!(!result.passed);
         assert_eq!(result.violations[0].rule, "required_column_type");
+    }
+
+    #[test]
+    fn test_typed_decimal_contract_checks_full_capacity() {
+        for (landed_type, expected_type, should_pass) in [
+            ("DECIMAL(10,2)", "DECIMAL(10,4)", false),
+            ("DECIMAL(10,2)", "DECIMAL(12,4)", true),
+            ("INTEGER", "DECIMAL(10,2)", false),
+            ("INTEGER", "DECIMAL(12,2)", true),
+            ("BIGINT", "DECIMAL(19,10)", false),
+            ("BIGINT", "DECIMAL(29,10)", true),
+        ] {
+            let contract = ContractConfig {
+                required_columns: vec![RequiredColumn {
+                    name: "amount".into(),
+                    data_type: expected_type.into(),
+                    nullable: true,
+                }],
+                ..Default::default()
+            };
+            let result = validate_contract_typed(&contract, &[col_n("amount", landed_type, true)]);
+
+            assert_eq!(
+                result.passed, should_pass,
+                "landed {landed_type}, expected {expected_type}: {:?}",
+                result.violations
+            );
+            if !should_pass {
+                assert_eq!(result.violations[0].rule, "required_column_type");
+            }
+        }
     }
 
     #[test]
