@@ -57,6 +57,25 @@ NOT SUPPORTED (yet)
 See `docs/reference/filters` for the full reference and more examples.
 ";
 
+/// `--parallel`'s default for the non-`--dag` path.
+///
+/// Applied at the consumer rather than by `clap`, because `--dag` has to
+/// distinguish an unset flag (keep its historical unbounded node fan-out) from
+/// an explicit `--parallel 4` (bound it to 4) — a `default_value` erases that
+/// difference before any handler sees it (#1288).
+const DEFAULT_PARALLEL: u32 = 4;
+
+/// `--parallel` as the non-`--dag` execution path sees it.
+///
+/// A named function rather than an inline `unwrap_or` so a test can assert the
+/// *production* default rather than restating it. Review caught that an
+/// assertion written as `parse(..).unwrap_or(DEFAULT_PARALLEL) == 4` proves
+/// nothing: it re-applies the default itself, so changing this one would leave
+/// it green.
+fn effective_parallel(flag: Option<u32>) -> u32 {
+    flag.unwrap_or(DEFAULT_PARALLEL)
+}
+
 #[derive(Parser)]
 #[command(name = "rocky", version, about = "Rust SQL transformation engine")]
 struct Cli {
@@ -920,20 +939,29 @@ enum Command {
         #[arg(long)]
         lookback: Option<u32>,
         /// Concurrency for warehouse-bound work (default 4; pass
-        /// `--parallel 1` to force fully serial, or any N to override).
+        /// `--parallel 1` for one model or partition at a time, or any N to
+        /// override). It does NOT bound a replication pipeline's table
+        /// fan-out, which comes from that pipeline's `[execution] concurrency`
+        /// (default 32).
         /// Drives both per-partition execution for `time_interval` models
         /// and intra-layer concurrency for transformation models: models in
         /// the same dependency layer run up to N at a time, with a barrier
         /// at each layer boundary. Warehouse-query parallelism only — state
         /// writes serialize through redb, and DuckDB always runs serial.
         ///
-        /// NOT honored under `--dag`: that path runs every node in a layer
-        /// concurrently and does not currently cap that fan-out, and its
-        /// sub-runs execute one partition at a time regardless of this flag.
-        /// `--parallel 1` therefore does not force `--dag` serial. Tracked
-        /// as #1288.
-        #[arg(long, default_value = "4")]
-        parallel: u32,
+        /// Under `--dag` it bounds how many NODES run at once — each sub-run
+        /// executes one partition at a time, so the flag is not multiplied
+        /// inside a node. It is a ceiling on nodes, not on every warehouse
+        /// query: a replication node still uses its pipeline's `[execution]
+        /// concurrency` for table fan-out, which `--parallel` has never
+        /// governed on either path (#1288).
+        ///
+        /// Left unset, `--dag` keeps its historical UNBOUNDED node fan-out
+        /// rather than adopting the default of 4 — capping a wide DAG that
+        /// runs today would be a silent slowdown, so the bound applies only
+        /// when you ask for it. The non-`--dag` default is unchanged at 4.
+        #[arg(long)]
+        parallel: Option<u32>,
 
         /// Run all pipelines as a unified DAG, in dependency order.
         /// Each pipeline is a node; cross-pipeline `depends_on` edges define
@@ -3359,7 +3387,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 latest,
                 missing,
                 lookback,
-                parallel,
+                // The non-`--dag` default is 4, unchanged. `--dag` needs to
+                // tell "unset" from "explicitly 4", so the flag stays an
+                // `Option` up to here and the default is applied at its one
+                // consumer rather than by clap (#1288).
+                parallel: effective_parallel(parallel),
             };
 
             let defer_opts = rocky_cli::commands::DeferOptions {
@@ -3417,6 +3449,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &partition_opts,
                     &skip_opts,
                     shadow_config.as_ref(),
+                    // The raw flag, NOT `partition_opts.parallel` — that one
+                    // has the default folded in and can no longer say whether
+                    // the caller asked for a bound (#1288).
+                    parallel,
                 );
                 tokio::select! {
                     result = run_future => result,
@@ -4993,27 +5029,55 @@ mod tests {
         assert_eq!(parallel, 4);
     }
 
-    /// `rocky run` defaults `--parallel` to a modest concurrent value (4),
-    /// while `--parallel 1` still forces serial and an explicit `N` overrides.
+    /// `rocky run`'s effective `--parallel` default is still 4, and the flag
+    /// still reports an explicit value — but the CLI layer now preserves
+    /// "unset" so `--dag` can tell it from an explicit `4` (#1288).
+    ///
+    /// Both halves are asserted deliberately. Moving a default from `clap` to
+    /// its consumer is exactly the refactor that silently drops it, so the
+    /// effective-default case below is the guarantee the previous version of
+    /// this test provided and must keep providing.
     #[test]
-    fn run_parallel_defaults_to_four_and_is_overridable() {
-        fn run_parallel(args: &[&str]) -> u32 {
+    fn run_parallel_preserves_unset_and_still_defaults_to_four() {
+        fn run_parallel(args: &[&str]) -> Option<u32> {
             match try_parse_with_big_stack(args).command {
                 Command::Run { parallel, .. } => parallel,
                 _ => panic!("expected Run subcommand"),
             }
         }
 
-        assert_eq!(run_parallel(&["rocky", "run"]), 4, "default should be 4");
+        assert_eq!(
+            run_parallel(&["rocky", "run"]),
+            None,
+            "an absent --parallel must stay absent: `--dag` keeps its unbounded \
+             node fan-out only when it can see the flag was not passed"
+        );
+        assert_eq!(
+            effective_parallel(run_parallel(&["rocky", "run"])),
+            4,
+            "the EFFECTIVE non-dag default must still be 4 — asserted through \
+             the production fold, not by re-applying the default here"
+        );
+        assert_eq!(
+            effective_parallel(run_parallel(&["rocky", "run", "--parallel", "1"])),
+            1,
+            "an explicit value must survive the fold"
+        );
         assert_eq!(
             run_parallel(&["rocky", "run", "--parallel", "1"]),
-            1,
-            "--parallel 1 must still force serial"
+            Some(1),
+            "--parallel 1 must still reach execution as 1"
         );
         assert_eq!(
             run_parallel(&["rocky", "run", "--parallel", "8"]),
-            8,
+            Some(8),
             "explicit value must override the default"
+        );
+        assert_eq!(
+            run_parallel(&["rocky", "run", "--parallel", "4"]),
+            Some(4),
+            "an explicit 4 must be distinguishable from an unset flag — the \
+             whole reason the default moved out of clap"
         );
     }
 }

@@ -128,16 +128,29 @@ pub struct DagExecutor<D: NodeDispatcher> {
 }
 
 impl<D: NodeDispatcher + 'static> DagExecutor<D> {
-    pub fn new(dispatcher: D) -> Self {
+    /// Build an executor with an explicit node-fan-out bound.
+    ///
+    /// `max_concurrency` is a required argument rather than a builder step so
+    /// that not bounding is a **decision** in the source rather than a missing
+    /// call. Review found that deleting a `.with_max_concurrency(..)` from the
+    /// production path left every test green, because a DAG runs identically
+    /// whether it is unbounded or bounded above its node count (#1288); an
+    /// argument cannot be dropped that quietly.
+    pub fn new(dispatcher: D, max_concurrency: Option<usize>) -> Self {
         Self {
             dispatcher: Arc::new(dispatcher),
-            max_concurrency: None,
+            max_concurrency,
         }
     }
 
-    pub fn with_max_concurrency(mut self, n: usize) -> Self {
-        self.max_concurrency = Some(n);
-        self
+    /// The configured node-fan-out bound, or `None` for unbounded.
+    ///
+    /// Exists so a caller's *wiring* can be asserted without executing a DAG:
+    /// `run_with_dag` deciding not to apply a bound is invisible to any test
+    /// that only drives execution, since unbounded and
+    /// bounded-above-the-node-count behave identically (#1288).
+    pub fn max_concurrency(&self) -> Option<usize> {
+        self.max_concurrency
     }
 
     /// Execute the entire DAG, layer by layer.
@@ -379,6 +392,76 @@ mod tests {
         }
     }
 
+    /// Records the highest number of nodes in flight at once.
+    struct PeakConcurrencyDispatcher {
+        in_flight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl NodeDispatcher for PeakConcurrencyDispatcher {
+        fn dispatch(&self, _id: &NodeId, _kind: NodeKind, _label: &str) -> Option<NodeFuture> {
+            let in_flight = Arc::clone(&self.in_flight);
+            let peak = Arc::clone(&self.peak);
+            Some(Box::pin(async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Yield so a genuinely unbounded executor has the chance to
+                // start every sibling before any of them finishes. Without
+                // this the futures could complete in dispatch order and an
+                // unbounded run would report a peak of 1, making the test pass
+                // for the wrong reason.
+                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }))
+        }
+    }
+
+    async fn peak_concurrency_over_one_layer(max: Option<usize>) -> usize {
+        let dag = UnifiedDag {
+            nodes: vec![
+                n("a", NodeKind::Transformation),
+                n("b", NodeKind::Transformation),
+                n("c", NodeKind::Transformation),
+            ],
+            edges: vec![],
+        };
+        let peak = Arc::new(AtomicUsize::new(0));
+        let dispatcher = PeakConcurrencyDispatcher {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        };
+        let executor = DagExecutor::new(dispatcher, max);
+        executor.execute(&dag).await.expect("execute");
+        peak.load(Ordering::SeqCst)
+    }
+
+    /// The bound `--parallel` reaches under `--dag` (#1288) actually bounds.
+    ///
+    /// Three independent nodes share one layer, so the executor is free to run
+    /// all three at once. The unbounded control is what makes the bounded case
+    /// meaningful: without it, a peak of 1 could mean "the bound worked" or
+    /// "these futures never overlapped anyway".
+    #[tokio::test]
+    async fn max_concurrency_bounds_intra_layer_fan_out() {
+        assert_eq!(
+            peak_concurrency_over_one_layer(Some(1)).await,
+            1,
+            "a limit of 1 must serialize a layer"
+        );
+        assert_eq!(
+            peak_concurrency_over_one_layer(Some(2)).await,
+            2,
+            "a limit of 2 must admit exactly two at a time"
+        );
+        assert_eq!(
+            peak_concurrency_over_one_layer(None).await,
+            3,
+            "unbounded must run the whole layer at once — the control"
+        );
+    }
+
     fn n(id: &str, kind: NodeKind) -> UnifiedNode {
         UnifiedNode {
             id: NodeId(id.into()),
@@ -406,7 +489,7 @@ mod tests {
         let dispatcher = CountingDispatcher {
             dispatched: Arc::clone(&counter),
         };
-        let executor = DagExecutor::new(dispatcher);
+        let executor = DagExecutor::new(dispatcher, None);
         let result = executor.execute(&dag).await.unwrap();
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
@@ -435,7 +518,7 @@ mod tests {
         let dispatcher = CountingDispatcher {
             dispatched: Arc::clone(&counter),
         };
-        let executor = DagExecutor::new(dispatcher);
+        let executor = DagExecutor::new(dispatcher, None);
         let result = executor.execute(&dag).await.unwrap();
 
         assert!(result.had_failures());
@@ -465,7 +548,7 @@ mod tests {
         let dispatcher = CountingDispatcher {
             dispatched: Arc::clone(&counter),
         };
-        let executor = DagExecutor::new(dispatcher);
+        let executor = DagExecutor::new(dispatcher, None);
         let result = executor.execute(&dag).await.unwrap();
 
         assert_eq!(counter.load(Ordering::SeqCst), 4);
@@ -493,7 +576,7 @@ mod tests {
         let dispatcher = CountingDispatcher {
             dispatched: Arc::clone(&counter),
         };
-        let executor = DagExecutor::new(dispatcher);
+        let executor = DagExecutor::new(dispatcher, None);
         let result = executor.execute(&dag).await.unwrap();
 
         // a, c, d all dispatched (b skipped). 3 dispatches.

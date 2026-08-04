@@ -56,7 +56,8 @@ type SubRunner = Arc<
 ///
 /// Every sub-run drives [`super::run::run`], which holds the state store's
 /// exclusive writer flock for its **whole duration**, and the executor
-/// dispatches a layer's nodes concurrently with no bound. Without a turnstile
+/// dispatches a layer's nodes concurrently, bounded only when `--parallel`
+/// asks for it (#1288) and unbounded otherwise. Without a turnstile
 /// the first sub-run to open the store wins and every same-layer sibling
 /// sharing the state file dies on `LockHeldByOther` — deterministically, for a
 /// project as small as two independent `SELECT 1` models. The flock-side retry
@@ -175,6 +176,13 @@ fn default_sub_runner() -> SubRunner {
 /// per-pipeline sub-run is driven through `run()` against this same path, so
 /// the unified-DAG path shares the project's canonical state with every other
 /// `rocky run` invocation — it must never invent its own `.rocky_state` file.
+// Eight parameters, one over clippy's threshold. Grouping them into a struct
+// would be a wider change than #1288 warrants and would obscure the one
+// property that matters here: `node_concurrency` is passed SEPARATELY from
+// `partition_opts`, so a caller cannot accidentally hand over the
+// default-folded value. `super::run::run` carries the same allow for the same
+// reason.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with_dag(
     config_path: &Path,
     // The caller's ONE fingerprinted config snapshot (#1120). Taken as a
@@ -194,7 +202,8 @@ pub async fn run_with_dag(
     // The caller's time-interval partition options. Every sub-run must receive
     // the same *selection*; otherwise an explicit historical partition silently
     // degrades to `Latest` (#1283). The `parallel` field is deliberately not
-    // honored here — see [`sub_run_partition_opts`].
+    // honored *per sub-run* — see [`sub_run_partition_opts`]; it is honored
+    // once, here, as a bound on node fan-out (`node_concurrency` below).
     partition_opts: &PartitionRunOptions,
     // Build-escape-hatch overlay (`--force-rebuild` / `--no-reuse`). Threaded
     // into every sub-run so `rocky run --dag --force-rebuild` actually forces a
@@ -207,6 +216,16 @@ pub async fn run_with_dag(
     // isolation that pipeline kind supports — and the kinds that support none
     // now refuse rather than write production.
     shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    // `--parallel` as the caller spelled it: `None` when the flag was not
+    // passed. It bounds how many NODES execute at once.
+    //
+    // Deliberately NOT `partition_opts.parallel`, which has the non-`--dag`
+    // default of 4 folded in and so cannot say whether a bound was requested.
+    // Adopting that default here would cap a wide DAG that runs unbounded
+    // today — a silent slowdown for a correctness fix, which is why #1288 was
+    // split out of #1290 rather than ridden along with it. Unset therefore
+    // keeps the historical unbounded fan-out.
+    node_concurrency: Option<u32>,
 ) -> Result<()> {
     // Under `-o json` the orchestrator contract is that stdout is exactly one
     // JSON document (the `DagRunOutput` below). Sub-runs are dispatched with
@@ -363,7 +382,7 @@ pub async fn run_with_dag(
         sub_runner: default_sub_runner(),
         state_turns: StateTurnstile::new(),
     };
-    let executor = DagExecutor::new(dispatcher);
+    let executor = dag_executor_with_bound(dispatcher, node_concurrency);
     let result = executor
         .execute(&dag)
         .await
@@ -612,20 +631,71 @@ struct CliDispatcher {
 /// them is what made `rocky run --dag --partition 2020-01-01` rebuild the
 /// latest partition and exit 0 (#1283).
 ///
-/// `--parallel` chooses *how many* warehouse queries run at once, and the DAG
-/// already owns that dimension — it dispatches every node in a layer
-/// concurrently. Honoring the flag per sub-run on top of that would give
-/// node-fan-out × per-partition-fan-out, and `run_with_dag` builds its
-/// [`DagExecutor`] with no `max_concurrency`, so the left-hand factor is
-/// unbounded. `rocky run` refuses that multiplication by construction:
+/// `--parallel` chooses *how many* things run at once, and the DAG owns that
+/// dimension at the node level — [`run_with_dag`] now applies the flag there
+/// (#1288). Honoring it per sub-run *as well* would give node-fan-out ×
+/// per-partition-fan-out, so the narrowing below stays exactly as it was:
+/// applying one bound twice is what makes it a multiplication.
+/// `rocky run` refuses that multiplication by construction:
 /// `super::run::execute_models` excludes `time_interval` from concurrent model
 /// execution precisely because it "already self-parallelizes per-partition".
 /// The DAG must not reintroduce what the non-DAG path is careful to avoid, so
 /// per-sub-run concurrency stays at 1 — byte-identical to the value the DAG
 /// passed before any selection was threaded.
 ///
-/// Giving `--parallel` a single meaning on both paths — by bounding node
-/// fan-out here rather than partition fan-out below — is #1288.
+/// `--parallel` now has a single meaning on both paths, and this function is
+/// still where the DAG half is *refused*: the bound is applied once, to node
+/// fan-out, in [`run_with_dag`]. Threading it here as well is what would give
+/// node-fan-out x per-partition-fan-out (#1288).
+/// The node-fan-out bound to replay from a stored plan's `parallel` field.
+///
+/// `rocky plan`'s own `--parallel` is `default_value = "1"`, so a stored **1**
+/// cannot be told apart from a flag the planner never typed — bounding on it
+/// would serialize every plan whose author simply omitted it, which is most of
+/// them. Any other value can only have been typed, and discarding it ignores an
+/// intent the plan unambiguously records.
+///
+/// Lives here, beside [`node_concurrency_limit`], rather than inline at the
+/// `apply` call site, so the rule has one definition that a test can call.
+pub(crate) fn replayed_node_concurrency(stored: u32) -> Option<u32> {
+    (stored != 1).then_some(stored)
+}
+
+/// Build the DAG executor with the caller's node-fan-out bound applied.
+///
+/// Separate from [`run_with_dag`] so the wiring is assertable: dropping the
+/// bound here is invisible to any test that merely executes a DAG, because
+/// unbounded and bounded-above-the-node-count run identically.
+fn dag_executor_with_bound<D: rocky_core::dag_executor::NodeDispatcher + 'static>(
+    dispatcher: D,
+    node_concurrency: Option<u32>,
+) -> DagExecutor<D> {
+    DagExecutor::new(dispatcher, node_concurrency_limit(node_concurrency))
+}
+
+/// How many DAG nodes may execute at once, from `--parallel` as the caller
+/// spelled it.
+///
+/// One bound, applied once. Each sub-run executes a single partition at a time
+/// ([`sub_run_partition_opts`] pins it to 1), so this is a ceiling on *nodes*
+/// and the flag is not additionally multiplied inside each one.
+///
+/// It is **not** a ceiling on warehouse queries in general, and the difference
+/// matters for a replication node: `run` builds its own table-level semaphore
+/// from `[execution] concurrency` (default 32), which `--parallel` has never
+/// governed on either path. So `--parallel 1` under `--dag` admits one node at
+/// a time; a replication Load node may still run many tables inside it.
+///
+/// - `None` (flag absent) keeps the historical **unbounded** fan-out. Adopting
+///   the non-`--dag` default of 4 here would silently cap a wide DAG that runs
+///   today, which is why #1288 was split out of #1290 instead of riding along.
+/// - `Some(0)` becomes 1. A zero-permit semaphore never admits anyone, so the
+///   run would hang; `--parallel 0` reads as "no concurrency", never as
+///   "unbounded", and the neighbouring meaning is the safe one.
+fn node_concurrency_limit(parallel: Option<u32>) -> Option<usize> {
+    parallel.map(|n| n.max(1) as usize)
+}
+
 fn sub_run_partition_opts(caller: &PartitionRunOptions) -> PartitionRunOptions {
     // Destructured field-by-field rather than `..caller.clone()` ON PURPOSE.
     // Struct-update syntax would silently thread any field added later, which
@@ -931,12 +1001,13 @@ mod run_opts_threading_tests {
         assert!(opts.missing);
         assert_eq!(opts.lookback, Some(2));
         // ...and concurrency does not. The dispatcher holds 3; the sub-run
-        // must see 1, because the DAG already fans out per node and does not
-        // cap that fan-out. Threading it wholesale makes this 3.
+        // must see 1, because the DAG applies the bound ONCE, at the node
+        // level (#1288). Threading it wholesale makes this 3 — the same bound
+        // applied twice, which is a multiplication.
         assert_eq!(
             opts.parallel, 1,
-            "--parallel must NOT reach the sub-run: the DAG owns node fan-out \
-             and does not bound it, so honoring it here multiplies (#1288)"
+            "--parallel must NOT reach the sub-run: the DAG already applies it \
+             to node fan-out, so applying it again here multiplies (#1288)"
         );
         assert!(
             got[0].2.force_rebuild,
@@ -1231,6 +1302,109 @@ mod tests {
 
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
+    /// `--parallel` bounds DAG node fan-out, and an absent flag does not.
+    ///
+    /// Before #1288 `run_with_dag` built its executor with no bound at all, so
+    /// `rocky run --dag --parallel 1` ran every node in a layer concurrently —
+    /// the flag documented as "pass `--parallel 1` to force fully serial" did
+    /// not force anything. The `None` case is the control *and* the
+    /// compatibility guarantee: adopting the non-`--dag` default of 4 would cap
+    /// a wide DAG that runs unbounded today.
+    ///
+    /// Mutation that must turn this red: `parallel.map(|n| n.max(1) as usize)`
+    /// → `Some(parallel.unwrap_or(4).max(1) as usize)`, i.e. folding in the
+    /// non-`--dag` default.
+    #[test]
+    fn parallel_bounds_node_fan_out_only_when_it_is_asked_for() {
+        assert_eq!(
+            node_concurrency_limit(None),
+            None,
+            "an absent --parallel must keep the historical unbounded fan-out"
+        );
+        assert_eq!(node_concurrency_limit(Some(1)), Some(1));
+        assert_eq!(node_concurrency_limit(Some(8)), Some(8));
+    }
+
+    /// The bound reaches the executor `run_with_dag` actually builds.
+    ///
+    /// Review caught that `node_concurrency_limit` alone proves nothing about
+    /// production: deleting the `with_max_concurrency` call left every test
+    /// green, because a DAG executes identically whether it is unbounded or
+    /// bounded above its node count. This asserts the wiring itself.
+    ///
+    /// Mutation that must turn this red: drop the `Some(n) =>` arm of
+    /// `dag_executor_with_bound` so it always builds an unbounded executor.
+    #[test]
+    fn the_bound_reaches_the_executor_that_is_built() {
+        struct NoopDispatcher;
+        impl rocky_core::dag_executor::NodeDispatcher for NoopDispatcher {
+            fn dispatch(
+                &self,
+                _id: &rocky_core::unified_dag::NodeId,
+                _kind: rocky_core::unified_dag::NodeKind,
+                _label: &str,
+            ) -> Option<rocky_core::dag_executor::NodeFuture> {
+                None
+            }
+        }
+
+        assert_eq!(
+            dag_executor_with_bound(NoopDispatcher, Some(3)).max_concurrency(),
+            Some(3),
+            "an explicit --parallel must reach the executor"
+        );
+        assert_eq!(
+            dag_executor_with_bound(NoopDispatcher, Some(0)).max_concurrency(),
+            Some(1),
+            "--parallel 0 must reach it as 1, not as unbounded"
+        );
+        assert_eq!(
+            dag_executor_with_bound(NoopDispatcher, None).max_concurrency(),
+            None,
+            "an absent --parallel must leave the executor unbounded"
+        );
+    }
+
+    /// A stored plan's `--parallel` is replayed when it carries intent.
+    ///
+    /// `rocky plan`'s own `--parallel` is `default_value = "1"`, so a stored
+    /// **1** cannot be told from a flag the planner never typed — bounding on
+    /// it would serialize every plan whose author simply omitted it. Any other
+    /// value can only have been typed, and discarding it ignores an intent the
+    /// plan unambiguously records. Review caught the first revision discarding
+    /// *all* stored values on the strength of the ambiguous one.
+    ///
+    /// Mutation that must turn this red: replay unconditionally
+    /// (`Some(parallel)`), or discard unconditionally (`None`).
+    #[test]
+    fn a_planned_bound_is_replayed_unless_it_is_the_ambiguous_default() {
+        use super::replayed_node_concurrency as replayed;
+
+        assert_eq!(
+            replayed(1),
+            None,
+            "a stored 1 is indistinguishable from an omitted flag and must not \
+             silently serialize a plan whose author never asked"
+        );
+        assert_eq!(
+            replayed(2),
+            Some(2),
+            "an unambiguous bound must be replayed"
+        );
+        assert_eq!(replayed(8), Some(8));
+    }
+
+    /// `--parallel 0` is one, never unbounded.
+    ///
+    /// `DagExecutor` turns the limit into a semaphore, and a zero-permit
+    /// semaphore admits nobody — the run would hang rather than go fast. Of the
+    /// two neighbouring readings, "no concurrency" is the safe one, and it is
+    /// also what `--parallel 0` says.
+    #[test]
+    fn a_zero_parallel_is_serial_not_unbounded() {
+        assert_eq!(node_concurrency_limit(Some(0)), Some(1));
+    }
+
     /// The one config snapshot every [`run_with_dag`] caller must supply
     /// (#1289). Production callers get theirs from the apply gate; a test that
     /// is not exercising the gate loads it the same way `rocky run --dag`
@@ -1421,6 +1595,9 @@ mod tests {
             &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             None,
+            // Unbounded node fan-out: these tests predate `--parallel`
+            // bounding it and do not exercise concurrency (#1288).
+            None,
         )
         .await
         .expect("run --dag should succeed");
@@ -1520,6 +1697,9 @@ mod tests {
             &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             None,
+            // Unbounded node fan-out: these tests predate `--parallel`
+            // bounding it and do not exercise concurrency (#1288).
+            None,
         )
         .await
         .expect("the non-shadow DAG seeds production");
@@ -1544,6 +1724,9 @@ mod tests {
             &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             Some(&shadow_config),
+            // Unbounded node fan-out: these tests predate `--parallel`
+            // bounding it and do not exercise concurrency (#1288).
+            None,
         )
         .await
         .expect_err("a shadow DAG containing a seed must be refused");
@@ -1629,6 +1812,9 @@ mod tests {
             &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             None,
+            // Unbounded node fan-out: these tests predate `--parallel`
+            // bounding it and do not exercise concurrency (#1288).
+            None,
         )
         .await
         .expect("the non-shadow DAG builds production");
@@ -1650,6 +1836,9 @@ mod tests {
             &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             Some(&shadow_config),
+            // Unbounded node fan-out: these tests predate `--parallel`
+            // bounding it and do not exercise concurrency (#1288).
+            None,
         )
         .await
         .expect_err("a shadow DAG must be refused, not silently mis-isolated");
@@ -1740,6 +1929,9 @@ mod tests {
             false,
             &partition_opts,
             &SkipRunOptions::default(),
+            None,
+            // Unbounded node fan-out: these tests predate `--parallel`
+            // bounding it and do not exercise concurrency (#1288).
             None,
         )
         .await
@@ -1924,6 +2116,9 @@ mod tests {
             &PartitionRunOptions::default(),
             &SkipRunOptions::default(),
             None,
+            // Unbounded node fan-out: these tests predate `--parallel`
+            // bounding it and do not exercise concurrency (#1288).
+            None,
         )
         .await
         .expect("a two-transformation-pipeline DAG must build and run");
@@ -2006,6 +2201,9 @@ mod tests {
             false,
             &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
+            None,
+            // Unbounded node fan-out: these tests predate `--parallel`
+            // bounding it and do not exercise concurrency (#1288).
             None,
         )
         .await
