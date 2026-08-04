@@ -68,6 +68,13 @@ pub enum StateSyncError {
     #[error("state retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
 
+    #[error("ledger-seam transition failed: {0}")]
+    /// A [`LedgerSeamSession`] caller's transition closure failed for a
+    /// domain reason (authorization refused, proof no longer holds, execution
+    /// error). The session aborts WITHOUT publishing — the remote winner is
+    /// untouched — and the caller re-wraps this into its own error context.
+    SeamTransition(String),
+
     #[error(
         "state compare-and-swap conflict on '{key}': another writer committed since this run \
          downloaded state; refusing to overwrite the winner (fail-closed)"
@@ -811,7 +818,21 @@ impl LedgerSeamSession {
             let store = StateStore::open(&self.state_path)?;
             let result = attempt(&store, base.as_ref()).await;
             drop(store);
-            let output = result?;
+            let output = match result {
+                Ok(output) => output,
+                Err(e) => {
+                    // The attempt mutated the freshly downloaded LOCAL file
+                    // before failing (e.g. a post-transition fence refusal
+                    // after rows were written). Read-only consumers such as
+                    // audit, brief, and `restore plan` open the local file
+                    // without downloading, so a transition that never
+                    // committed must not remain locally visible — restore the
+                    // remote winner before propagating.
+                    self.restore_remote_winner("failed ledger-seam transition")
+                        .await;
+                    return Err(e);
+                }
+            };
 
             match upload_state_cas(&upload_cfg, &self.state_path, base.as_ref()).await {
                 Ok(()) => return Ok(output),
@@ -830,27 +851,81 @@ impl LedgerSeamSession {
                     tokio::time::sleep(backoff).await;
                 }
                 Err(StateSyncError::CasConflict { key }) => {
-                    // Read-only consumers such as audit and brief open the local file
-                    // without downloading, so a transition that never committed must not
-                    // remain locally visible.
-                    if let Err(error) = download_state(&self.cfg, &self.state_path).await {
-                        warn!(
-                            key = %key,
-                            error = %error,
-                            "failed to restore the remote ledger winner after ledger-seam \
-                             conflict exhaustion"
-                        );
-                    }
+                    // Same local-visibility rule at conflict exhaustion.
+                    self.restore_remote_winner("ledger-seam conflict exhaustion")
+                        .await;
                     return Err(StateSyncError::LedgerSeamConflict {
                         key,
                         attempts: LEDGER_SEAM_MAX_ATTEMPTS,
                     });
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A non-conflict upload failure (transport) also leaves
+                    // the attempt's mutations local-only — same rule.
+                    self.restore_remote_winner("failed ledger-seam upload")
+                        .await;
+                    return Err(e);
+                }
             }
         }
 
         unreachable!("ledger-seam attempt loop always returns within the for body")
+    }
+}
+
+impl LedgerSeamSession {
+    /// Re-establish committed truth locally after a terminal seam failure,
+    /// closing the recovery window: the attempt's uncommitted local file is
+    /// QUARANTINED FIRST (an atomic rename — after this instant no
+    /// path-opening reader can observe rows that never committed), and only
+    /// then is the remote winner re-downloaded into a fresh file. On a
+    /// successful restore the quarantined copy is deleted; if the download
+    /// fails, it is kept for forensics and readers see absence (fail-closed
+    /// — audit, brief, and `restore plan` error on a missing store instead
+    /// of planning against ghosts; the next command's start-download
+    /// recreates the file). Failures are logged, never masked — the
+    /// caller's original error is what propagates.
+    async fn restore_remote_winner(&self, context: &str) {
+        let quarantine = self
+            .state_path
+            .with_extension(format!("redb.unpublished-{}", std::process::id()));
+        let quarantined = match std::fs::rename(&self.state_path, &quarantine) {
+            Ok(()) => true,
+            Err(rename_error) => {
+                warn!(
+                    rename_error = %rename_error,
+                    context,
+                    "could not quarantine the uncommitted local ledger before \
+                     restoring the winner; a concurrent reader may observe \
+                     uncommitted rows until the re-download completes"
+                );
+                false
+            }
+        };
+        match download_state(&self.cfg, &self.state_path).await {
+            Ok(_) => {
+                if quarantined && let Err(remove_error) = std::fs::remove_file(&quarantine) {
+                    warn!(
+                        remove_error = %remove_error,
+                        quarantine = %quarantine.display(),
+                        "restored the remote winner but could not delete the \
+                         quarantined uncommitted copy"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    context,
+                    quarantined_to = %quarantine.display(),
+                    quarantined,
+                    "failed to restore the remote ledger winner after a terminal \
+                     ledger-seam failure; the uncommitted local file stays \
+                     quarantined aside (fail-closed: readers see absence, not \
+                     ghosts)"
+                );
+            }
+        }
     }
 }
 
@@ -3522,7 +3597,10 @@ fn is_transient(err: &StateSyncError) -> bool {
         // the same stale base would just conflict again and burn the budget.
         // Fail closed immediately.
         | StateSyncError::CasConflict { .. }
-        | StateSyncError::LedgerSeamConflict { .. } => false,
+        | StateSyncError::LedgerSeamConflict { .. }
+        // A seam-transition failure is a domain refusal from the caller's
+        // closure, not a transport fault — retrying cannot change it.
+        | StateSyncError::SeamTransition(_) => false,
     }
 }
 

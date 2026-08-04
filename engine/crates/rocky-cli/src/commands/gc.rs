@@ -1493,6 +1493,103 @@ pub(crate) fn gc_models_dir(
 /// Once cleared, [`execute_gc_apply`] re-verifies each planned eviction against
 /// the live ledger before evicting anything (tombstone + retired ledger row;
 /// no physical byte deletion follows).
+/// Per-attempt policy re-gate for the gc CAS seam (#1242).
+///
+/// The session contract requires every dynamic authorization check to re-run
+/// per attempt. Markers live under their own object keys (blob CAS cannot see
+/// one landing mid-seam) and freeze/budget ROWS live in the ledger blob a
+/// conflict replay freshly downloads — and marker writes are OPTIONAL
+/// (default off), so a marker-only fence misses a ledger-only freeze. This
+/// re-runs the REAL gate: a fresh marker LIST plus
+/// [`evaluate_apply_policy_core`] over the fresh store's decision snapshot,
+/// with principal/scope matching intact (an unrelated marker no longer
+/// refuses). `record` publishes the attempt's decision rows into the fresh
+/// store, so the audit trail lands atomically with the winning attempt's
+/// evictions — the pre-seam gate's local rows are overwritten by each
+/// attempt's download and must not be the trail of record.
+///
+/// `prior_decisions` is the snapshot taken BEFORE this attempt recorded
+/// anything (the pre-publish recheck must not read the attempt's own rows
+/// back as budget history). A LIST failure refuses fail-closed.
+#[allow(clippy::too_many_arguments)]
+async fn gc_seam_regate(
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    plan_id: &str,
+    principal: rocky_core::config::PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    prior_decisions: &[rocky_core::state::PolicyDecisionRecord],
+    fresh_store: Option<&StateStore>,
+    stage: &str,
+) -> Result<(), rocky_core::state_sync::StateSyncError> {
+    use rocky_core::state_sync::StateSyncError;
+    let Some(cfg) = cfg else {
+        return Ok(());
+    };
+    let Some(policy) = cfg.policy.as_ref() else {
+        return Ok(());
+    };
+    let fresh_markers = crate::commands::apply::marker_freezes_before_gate(cfg, touched)
+        .await
+        .map_err(|e| {
+            StateSyncError::SeamTransition(format!(
+                "freeze-marker LIST failed {stage} (fail-closed): {e:#}"
+            ))
+        })?;
+    let (policy, attrs_map) = match crate::commands::apply::resolve_policy_and_attrs(
+        Some(policy),
+        touched,
+        models_dir,
+        models_glob,
+    ) {
+        Ok(pair) => pair,
+        // The resolver's error IS a gate outcome. Mirror the pre-seam
+        // treatment: only a Deny blocks gc (require_review is satisfied by
+        // the hard review gate the command already passed).
+        Err(PolicyGate::Deny {
+            model,
+            rule_id,
+            reason,
+        }) => {
+            let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+            return Err(StateSyncError::SeamTransition(format!(
+                "policy DENIES gc plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
+            )));
+        }
+        Err(_) => return Ok(()),
+    };
+    let gate = crate::commands::apply::evaluate_apply_policy_core(
+        &policy,
+        plan_id,
+        principal,
+        touched,
+        &attrs_map,
+        prior_decisions,
+        &fresh_markers,
+        false,
+        |record| {
+            if let Some(store) = fresh_store {
+                // Best-effort audit into the attempt's store — the gate below
+                // is the safety boundary; gc has no budget-paired custody row.
+                let _ = store.record_policy_decision(record);
+            }
+        },
+    );
+    if let PolicyGate::Deny {
+        model,
+        rule_id,
+        reason,
+    } = gate
+    {
+        let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+        return Err(StateSyncError::SeamTransition(format!(
+            "policy DENIES gc plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_gc_apply_in(
     root: &Path,
     config_path: &Path,
@@ -1512,7 +1609,7 @@ pub(crate) async fn run_gc_apply_in(
         state_path,
         runtime_principal,
         json,
-        &ManifestLivenessOracle,
+        std::sync::Arc::new(ManifestLivenessOracle),
     )
     .await
 }
@@ -1526,7 +1623,7 @@ pub(crate) async fn run_gc_apply_in_with(
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
     json: bool,
-    oracle: &dyn LivenessOracle,
+    oracle: std::sync::Arc<dyn LivenessOracle>,
 ) -> Result<()> {
     let plan_record =
         read_plan(root, plan_id).with_context(|| format!("failed to read gc plan '{plan_id}'"))?;
@@ -1700,27 +1797,122 @@ pub(crate) async fn run_gc_apply_in_with(
         );
     }
 
-    let store = StateStore::open(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let output = execute_gc_apply(&store, oracle, plan_id, &plan, Utc::now()).await?;
-    // Drop the store to release the advisory lock / flush the file before upload.
-    drop(store);
+    let seam_cas = remote_state && rocky_core::state_sync::cas_effective(&state_cfg);
+    let output = if seam_cas {
+        // CAS ledger seam (#1242; ADR-CONCURRENCY D1 seam class = RETRY): the
+        // whole transition replays per attempt against the freshly downloaded
+        // winner. `execute_gc_apply` re-derives candidates, refcounts, and
+        // both liveness reads from that fresh store — a winner that re-added
+        // the Delta path legitimately flips this attempt's eviction into a
+        // refusal — and the FULL policy gate re-runs per attempt (fresh
+        // marker LIST + the fresh store's freeze/budget rows; marker writes
+        // are optional, so a marker-only fence would miss a ledger-only
+        // freeze) with an enforcement-only recheck after the transition, so
+        // the ungated window shrinks to the CAS upload itself. gc's
+        // mutations are redb rows inside the blob being CAS-published
+        // (`physical_delete = true` was refused above); a refused or failed
+        // attempt's local rows are rolled back by the session's
+        // restore-the-winner-on-terminal-failure rule, so no side effect
+        // outlives a discarded attempt, remotely OR locally.
+        let session = rocky_core::state_sync::LedgerSeamSession::new(&state_cfg, state_path);
+        // The attempt future must OWN everything it touches (the session's
+        // `for<'a>` bound): master copies move into the closure, and each
+        // attempt clones what its future needs.
+        let seam_cfg = loaded_cfg.clone();
+        let seam_touched = touched.clone();
+        let seam_models_dir = models_dir.clone();
+        let seam_models_glob = models_glob.clone();
+        let seam_principal = plan_record.enforcement_principal(runtime_principal);
+        let seam_plan = plan.clone();
+        let seam_plan_id = plan_id.to_string();
+        let seam_oracle = std::sync::Arc::clone(&oracle);
+        session
+            .execute(move |fresh_store, _fresh_base| {
+                let cfg = seam_cfg.clone();
+                let touched = seam_touched.clone();
+                let models_dir = seam_models_dir.clone();
+                let models_glob = seam_models_glob.clone();
+                let principal = seam_principal;
+                let plan = seam_plan.clone();
+                let plan_id = seam_plan_id.clone();
+                let oracle = std::sync::Arc::clone(&seam_oracle);
+                Box::pin(async move {
+                    // Snapshot BEFORE this attempt records anything: the
+                    // pre-publish recheck must not read the attempt's own
+                    // rows back as budget/freeze history.
+                    let prior_decisions = fresh_store.list_policy_decisions().map_err(|e| {
+                        rocky_core::state_sync::StateSyncError::SeamTransition(format!(
+                            "could not snapshot the fresh decision ledger: {e:#}"
+                        ))
+                    })?;
+                    gc_seam_regate(
+                        cfg.as_ref(),
+                        &plan_id,
+                        principal,
+                        &touched,
+                        &models_dir,
+                        models_glob.as_deref(),
+                        &prior_decisions,
+                        Some(fresh_store),
+                        "during this gc apply",
+                    )
+                    .await?;
+                    let out =
+                        execute_gc_apply(fresh_store, oracle.as_ref(), &plan_id, &plan, Utc::now())
+                            .await
+                            .map_err(|e| {
+                                rocky_core::state_sync::StateSyncError::SeamTransition(format!(
+                                    "{e:#}"
+                                ))
+                            })?;
+                    // Pre-publish recheck: markers may have moved during the
+                    // eviction work; enforcement-only (no re-record), same
+                    // pre-attempt snapshot.
+                    gc_seam_regate(
+                        cfg.as_ref(),
+                        &plan_id,
+                        principal,
+                        &touched,
+                        &models_dir,
+                        models_glob.as_deref(),
+                        &prior_decisions,
+                        None,
+                        "after eviction, before publish",
+                    )
+                    .await?;
+                    Ok(out)
+                })
+            })
+            .await
+            .with_context(|| {
+                format!("failed to commit gc apply '{plan_id}' to shared remote state")
+            })?
+    } else {
+        let store = StateStore::open(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        let output = execute_gc_apply(&store, oracle.as_ref(), plan_id, &plan, Utc::now()).await?;
+        // Drop the store to release the advisory lock / flush the file before upload.
+        drop(store);
 
-    // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Durability is the whole point
-    // of the seam: an eviction that commits locally but never reaches the remote
-    // would be silently reverted by the next run's start-download while this
-    // command reported success. So the upload is forced to `Fail` regardless of
-    // the configured `on_upload_failure` (default `skip`) — a failed upload
-    // aborts (finding 5).
-    if remote_state {
-        // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
-        // policy (previously a local `StateConfig` clone here).
-        rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
-            &state_cfg, state_path, "gc apply",
-        )
-        .await
-        .with_context(|| "failed to upload remote state after gc apply")?;
-    }
+        // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Durability is the whole
+        // point of the seam: an eviction that commits locally but never reaches
+        // the remote would be silently reverted by the next run's start-download
+        // while this command reported success. So the upload is forced to `Fail`
+        // regardless of the configured `on_upload_failure` (default `skip`) — a
+        // failed upload aborts (finding 5). Without effective CAS this remains
+        // the legacy last-writer-wins half-seam (#1228's residual exposure —
+        // keep one writer per `[state]` prefix).
+        if remote_state {
+            // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
+            // policy (previously a local `StateConfig` clone here).
+            rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
+                &state_cfg, state_path, "gc apply",
+            )
+            .await
+            .with_context(|| "failed to upload remote state after gc apply")?;
+        }
+        output
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -2793,7 +2985,8 @@ auto_create_schemas = true
         // review/policy gate + eviction wiring are exercised without a live
         // Delta log (the real `ManifestLivenessOracle` would hold everything
         // creds-free — correct, but it would mask the review-gate assertion).
-        let oracle = FixedLivenessOracle::reclaimable();
+        let oracle: std::sync::Arc<dyn LivenessOracle> =
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable());
 
         // No marker → refuse.
         let err = run_gc_apply_in_with(
@@ -2803,7 +2996,7 @@ auto_create_schemas = true
             &state_path,
             PolicyPrincipal::Human,
             true,
-            &oracle,
+            oracle.clone(),
         )
         .await
         .expect_err("apply must refuse an unreviewed gc plan");
@@ -2827,7 +3020,7 @@ auto_create_schemas = true
             &state_path,
             PolicyPrincipal::Human,
             true,
-            &oracle,
+            oracle.clone(),
         )
         .await
         .unwrap();
@@ -2868,7 +3061,8 @@ auto_create_schemas = true
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, "{}").unwrap();
 
-        let oracle = FixedLivenessOracle::reclaimable();
+        let oracle: std::sync::Arc<dyn LivenessOracle> =
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable());
         let err = run_gc_apply_in_with(
             dir.path(),
             &config,
@@ -2876,7 +3070,7 @@ auto_create_schemas = true
             &state_path,
             PolicyPrincipal::Human,
             true,
-            &oracle,
+            oracle.clone(),
         )
         .await
         .expect_err("a remote-backend gc apply must abort when the state backend is unreachable");
@@ -3822,5 +4016,754 @@ auto_create_schemas = true
         record_run(&store, "run-04", "fct_orders");
 
         eprintln!("seeded demo ledger at {path}");
+    }
+
+    /// #1242's exact loss scenario, fully sequenced: the run winner commits
+    /// AFTER the gc seam's first download and BEFORE its publish. One armed
+    /// conflict rejects attempt 1; the liveness oracle — which runs INSIDE
+    /// each attempt, between its download and its CAS put — publishes the
+    /// winner on attempt 2's first read, so attempt 2's put loses a GENUINE
+    /// race by construction and attempt 3 re-derives on the winner. Every
+    /// step is ordered by the attempt's own execution: no tasks, no
+    /// deadlines, no scheduler dependence. The final published blob holds
+    /// BOTH effects; the counting pins 2 liveness reads × 3 attempts. Under
+    /// the legacy half-seam this schedule silently erased the winner
+    /// (#1228): forcing `seam_cas = false` leaves the oracle at 2 calls (no
+    /// winner ever injected, no CAS puts), failing the put-count assertion
+    /// fast.
+    #[tokio::test]
+    async fn gc_cas_seam_preserves_a_run_writer_landing_mid_seam() {
+        struct WinnerInjectingOracle {
+            calls: std::sync::atomic::AtomicUsize,
+            cfg: rocky_core::config::StateConfig,
+            path: std::path::PathBuf,
+        }
+        #[async_trait]
+        impl LivenessOracle for WinnerInjectingOracle {
+            async fn reclaim_verdict(&self, _sp: &str, _fp: &str, _cv: u64) -> ReclaimVerdict {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                // Calls 1-2 = attempt 1 (pre/post proofs). Call 3 = attempt
+                // 2's first read — after ITS download, before ITS put: the
+                // winner published here makes that put a genuine conflict.
+                if n == 3 {
+                    let _authority = rocky_core::state_sync::download_state(&self.cfg, &self.path)
+                        .await
+                        .unwrap();
+                    {
+                        let store = StateStore::open(&self.path).unwrap();
+                        seed(
+                            &store,
+                            "r-winner",
+                            "winner_model",
+                            "SELECT 2 AS id",
+                            &[],
+                            HB,
+                            700,
+                            Utc::now(),
+                        );
+                        record_run(&store, "r-winner", "winner_model");
+                    }
+                    rocky_core::state_sync::upload_state(&self.cfg, &self.path)
+                        .await
+                        .unwrap();
+                }
+                ReclaimVerdict::Reclaimable { head_version: 0 }
+            }
+        }
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+
+        // Publish G0 (candidate present, no winner rows yet).
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        harness.faults.arm_precondition_failures(&object_key, 1);
+        let baseline_updates = harness
+            .faults
+            .put_count(&object_key, rocky_core::fault_store::PutKind::Update);
+
+        let oracle = std::sync::Arc::new(WinnerInjectingOracle {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            cfg: harness.pod_a.cfg.clone(),
+            path: harness.pod_a.state_path.clone(),
+        });
+        let config = write_cas_config(root.path());
+        run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            oracle.clone(),
+        )
+        .await
+        .expect("the replay on the winner must commit");
+
+        // 2 oracle reads per attempt (the paired pre/post liveness proofs —
+        // probed empirically at a single attempt) × THREE attempts: armed
+        // conflict, oracle-injected genuine conflict, success. If this
+        // fails with 2, the replay re-published without re-deriving — the
+        // #1242 defect; if the per-attempt read count legitimately changes,
+        // update both constants.
+        assert_eq!(
+            harness
+                .faults
+                .put_count(&object_key, rocky_core::fault_store::PutKind::Update)
+                - baseline_updates,
+            3,
+            "armed + injected genuine conflict must force exactly three CAS attempts"
+        );
+        assert_eq!(
+            oracle.calls.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "the replay must re-derive on the winner, not re-publish attempt 1's rows"
+        );
+
+        // Read back the PUBLISHED blob (fresh pod_a download), not local files.
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        let tombs = published.list_tombstones().unwrap();
+        assert_eq!(tombs.len(), 1, "the candidate must be tombstoned");
+        assert_eq!(tombs[0].blake3_hash, HA);
+        assert_eq!(
+            published.refcount_for_hash(HB).unwrap(),
+            1,
+            "the mid-seam run winner's artifact must survive the gc publish (#1228)"
+        );
+    }
+
+    /// Two armed CAS conflicts force three full replays; the command still
+    /// succeeds, never issues an unconditional blob put, and the eviction is
+    /// present exactly once in the final published state.
+    #[tokio::test]
+    async fn gc_cas_conflicts_replay_the_full_transition_and_commit() {
+        use rocky_core::fault_store::PutKind;
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        let baseline_updates = harness.faults.put_count(&object_key, PutKind::Update);
+        let baseline_unconditional = harness
+            .faults
+            .put_count(&object_key, PutKind::Unconditional);
+        harness.faults.arm_precondition_failures(&object_key, 2);
+
+        let config = write_cas_config(root.path());
+        run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
+        )
+        .await
+        .expect("the third attempt must commit");
+
+        assert_eq!(
+            harness.faults.put_count(&object_key, PutKind::Update) - baseline_updates,
+            3,
+            "two conflicts must force exactly three CAS attempts"
+        );
+        assert_eq!(
+            harness
+                .faults
+                .put_count(&object_key, PutKind::Unconditional)
+                - baseline_unconditional,
+            0,
+            "the CAS seam must never fall back to an unconditional blob put"
+        );
+
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert_eq!(published.list_tombstones().unwrap().len(), 1);
+    }
+
+    /// Exhaustion (three straight conflicts) exits nonzero with the typed
+    /// seam-conflict error and PRESERVES the remote winner — no tombstone is
+    /// force-published over it.
+    #[tokio::test]
+    async fn gc_cas_exhaustion_is_nonzero_and_preserves_the_winner() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        harness.faults.arm_precondition_failures(&object_key, 3);
+
+        let config = write_cas_config(root.path());
+        let err = run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
+        )
+        .await
+        .expect_err("exhaustion must fail the command");
+        let cause = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<rocky_core::state_sync::StateSyncError>());
+        assert!(
+            matches!(
+                cause,
+                Some(rocky_core::state_sync::StateSyncError::LedgerSeamConflict { .. })
+            ),
+            "got: {err:#}"
+        );
+
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(
+            published.list_tombstones().unwrap().is_empty(),
+            "the remote winner must be preserved on exhaustion — never overwritten"
+        );
+    }
+
+    /// The per-attempt re-gate evaluates the REAL policy gate: a ledger-only
+    /// freeze row (marker writes are optional and default off) denies; a
+    /// marker scoped to the OTHER principal passes (principal/scope matching
+    /// — an unrelated marker no longer refuses); a matching marker denies;
+    /// a LIST transport failure refuses fail-closed.
+    #[tokio::test]
+    async fn gc_seam_regate_denies_ledger_freezes_and_matches_marker_scope() {
+        use rocky_core::fault_store::{FaultMode, FaultOp};
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+        let cfg_path = root.path().join("rocky.toml");
+        std::fs::write(
+            &cfg_path,
+            "[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\nconcurrency_control = \"cas\"\n\n[policy]\nversion = 1\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path).unwrap();
+        let mut touched: BTreeMap<String, PolicyCapability> = BTreeMap::new();
+        touched.insert("orders".into(), PolicyCapability::Gc);
+        let models_dir = root.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+
+        // No freezes anywhere → pass.
+        gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            None,
+            &[],
+            None,
+            "unit",
+        )
+        .await
+        .expect("nothing to deny");
+
+        // A ledger-only freeze row for THIS principal → deny. This is the
+        // marker-blind bypass the review caught: no marker exists at all.
+        let freeze = rocky_core::state::PolicyDecisionRecord {
+            timestamp: Utc::now(),
+            plan_id: "freeze:unit".to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::Apply,
+            model: "any".to_string(),
+            effect: rocky_core::config::PolicyEffect::Deny,
+            rule_id: None,
+            reason: "unit ledger-only freeze".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+        let err = gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            None,
+            std::slice::from_ref(&freeze),
+            None,
+            "unit",
+        )
+        .await
+        .expect_err("a ledger-only freeze must deny the replay");
+        assert!(err.to_string().contains("DENIES"), "got: {err}");
+
+        // A durable marker scoped to the OTHER principal → pass (the old
+        // ID-diff fence refused here; the real gate matches principal).
+        let other = rocky_core::freeze_marker::FreezeMarker {
+            freeze_id: "agent-only".to_string(),
+            principal: PolicyPrincipal::Agent,
+            scope: "any".to_string(),
+            reason: "unit".to_string(),
+            created_at: Utc::now(),
+        };
+        rocky_core::freeze_marker::write_freeze_marker(&harness.provider, &other)
+            .await
+            .unwrap();
+        gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            None,
+            &[],
+            None,
+            "unit",
+        )
+        .await
+        .expect("an Agent-scoped marker must not deny a Human gc");
+
+        // A marker matching THIS principal → deny.
+        let mine = rocky_core::freeze_marker::FreezeMarker {
+            freeze_id: "human-any".to_string(),
+            principal: PolicyPrincipal::Human,
+            scope: "any".to_string(),
+            reason: "unit".to_string(),
+            created_at: Utc::now(),
+        };
+        rocky_core::freeze_marker::write_freeze_marker(&harness.provider, &mine)
+            .await
+            .unwrap();
+        let err = gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            None,
+            &[],
+            None,
+            "unit",
+        )
+        .await
+        .expect_err("a matching marker must deny");
+        assert!(err.to_string().contains("DENIES"), "got: {err}");
+
+        // LIST transport failure → fail-closed refusal.
+        harness.faults.arm(FaultOp::List, FaultMode::FailAll);
+        let err = gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            None,
+            &[],
+            None,
+            "unit",
+        )
+        .await
+        .expect_err("a LIST failure must refuse, not read as no-markers");
+        assert!(err.to_string().contains("fail-closed"), "got: {err}");
+        harness.faults.clear();
+    }
+
+    /// Finding 1+3 integration (round 1's blocking pair): the mid-seam
+    /// winner carries a LEDGER-ONLY freeze row (no marker anywhere), fully
+    /// sequenced: the oracle publishes the freeze-carrying winner on attempt
+    /// 2's first read (after ITS download, before ITS put), so attempt 2
+    /// loses a genuine race and attempt 3's fresh download carries the
+    /// freeze — its attempt-start re-gate must refuse, the command exits
+    /// nonzero, and the session restores the winner locally: no ghost
+    /// tombstone stays visible to path-opening readers like `restore plan`.
+    #[tokio::test]
+    async fn gc_cas_replay_refuses_ledger_freeze_and_restores_winner_locally() {
+        struct FreezeInjectingOracle {
+            calls: std::sync::atomic::AtomicUsize,
+            cfg: rocky_core::config::StateConfig,
+            path: std::path::PathBuf,
+        }
+        #[async_trait]
+        impl LivenessOracle for FreezeInjectingOracle {
+            async fn reclaim_verdict(&self, _sp: &str, _fp: &str, _cv: u64) -> ReclaimVerdict {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n == 3 {
+                    let _authority = rocky_core::state_sync::download_state(&self.cfg, &self.path)
+                        .await
+                        .unwrap();
+                    {
+                        let store = StateStore::open(&self.path).unwrap();
+                        store
+                            .record_policy_decision(&rocky_core::state::PolicyDecisionRecord {
+                                timestamp: Utc::now(),
+                                plan_id: "freeze:mid-seam".to_string(),
+                                principal: PolicyPrincipal::Human,
+                                capability: PolicyCapability::Apply,
+                                model: "any".to_string(),
+                                effect: rocky_core::config::PolicyEffect::Deny,
+                                rule_id: None,
+                                reason: "kill switch engaged mid-seam".to_string(),
+                                verify_after: Vec::new(),
+                                auto_apply: None,
+                            })
+                            .unwrap();
+                    }
+                    rocky_core::state_sync::upload_state(&self.cfg, &self.path)
+                        .await
+                        .unwrap();
+                }
+                ReclaimVerdict::Reclaimable { head_version: 0 }
+            }
+        }
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        harness.faults.arm_precondition_failures(&object_key, 1);
+
+        let oracle = std::sync::Arc::new(FreezeInjectingOracle {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            cfg: harness.pod_a.cfg.clone(),
+            path: harness.pod_a.state_path.clone(),
+        });
+        let config = write_cas_policy_config(root.path());
+        let err = run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            oracle.clone(),
+        )
+        .await
+        .expect_err("the replay must refuse under the winner's ledger freeze");
+        assert!(format!("{err:#}").contains("DENIES"), "got: {err:#}");
+        // Attempt 3 is denied at its START gate, before any oracle read:
+        // exactly 2 attempts consulted the oracle.
+        assert_eq!(
+            oracle.calls.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "attempts 1-2 read the oracle; the denied attempt 3 must not"
+        );
+
+        // Ghost-state check: the LOCAL file must be the restored winner —
+        // freeze row present, NO tombstone from the refused attempt.
+        let local = StateStore::open(&harness.pod_b.state_path).unwrap();
+        assert!(
+            local.list_tombstones().unwrap().is_empty(),
+            "a refused attempt's eviction must not stay locally visible"
+        );
+        assert!(
+            local
+                .list_policy_decisions()
+                .unwrap()
+                .iter()
+                .any(|d| d.plan_id == "freeze:mid-seam"),
+            "the restored local ledger must be the winner's (freeze row present)"
+        );
+
+        // And remote is untouched by the refused seam: no tombstones there.
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(published.list_tombstones().unwrap().is_empty());
+    }
+
+    /// The restore-failure contract: when the winner CANNOT be re-downloaded
+    /// after a refused post-mutation attempt, the local file is QUARANTINED
+    /// aside — a path-opening reader sees absence, never ghost tombstones.
+    /// Fully sequenced: the oracle writes the denying marker AND arms a
+    /// total GET outage before returning, so the pre-publish re-gate refuses
+    /// fail-closed and the session's restore download fails.
+    #[tokio::test]
+    async fn gc_cas_quarantines_local_state_when_winner_restore_fails() {
+        struct OutageOracle {
+            provider: rocky_core::object_store::ObjectStoreProvider,
+            faults: rocky_core::fault_store::FaultHandle,
+            wrote: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl LivenessOracle for OutageOracle {
+            async fn reclaim_verdict(&self, _sp: &str, _fp: &str, _cv: u64) -> ReclaimVerdict {
+                if !self.wrote.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    rocky_core::freeze_marker::write_freeze_marker(
+                        &self.provider,
+                        &rocky_core::freeze_marker::FreezeMarker {
+                            freeze_id: "mid-transition-outage".to_string(),
+                            principal: PolicyPrincipal::Human,
+                            scope: "any".to_string(),
+                            reason: "freeze + backend outage".to_string(),
+                            created_at: Utc::now(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    self.faults.arm(
+                        rocky_core::fault_store::FaultOp::Get,
+                        rocky_core::fault_store::FaultMode::FailAll,
+                    );
+                }
+                ReclaimVerdict::Reclaimable { head_version: 0 }
+            }
+        }
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let config = write_cas_policy_config(root.path());
+        let err = run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            std::sync::Arc::new(OutageOracle {
+                provider: harness.provider.clone(),
+                faults: harness.faults.clone(),
+                wrote: std::sync::atomic::AtomicBool::new(false),
+            }),
+        )
+        .await
+        .expect_err("the outage must refuse the seam");
+        harness.faults.clear();
+
+        // The quarantine contract: the state file is gone (readers see
+        // absence, not ghosts) and the quarantined copy sits beside it.
+        assert!(
+            !harness.pod_b.state_path.exists(),
+            "the unpublishable local file must be quarantined aside: {err:#}"
+        );
+        let parent = harness.pod_b.state_path.parent().unwrap();
+        let quarantined: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains("unpublished"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantined copy");
+
+        // Remote untouched (the GET outage blocks reads, not this check —
+        // faults were cleared above).
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(published.list_tombstones().unwrap().is_empty());
+    }
+
+    /// Binds the session's restore-the-winner-on-terminal-failure arm: the
+    /// freeze marker lands MID-TRANSITION (written by the liveness oracle
+    /// itself, which runs between the attempt-start gate and the pre-publish
+    /// recheck — deterministic, no timing). The recheck denies AFTER the
+    /// eviction mutated the attempt's local store, so without the restore
+    /// the refused tombstone stays visible to path-opening readers
+    /// (`restore plan` would plan from a ghost eviction).
+    #[tokio::test]
+    async fn gc_cas_post_eviction_marker_denies_and_rolls_back_local() {
+        struct MarkerWritingOracle {
+            provider: rocky_core::object_store::ObjectStoreProvider,
+            wrote: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl LivenessOracle for MarkerWritingOracle {
+            async fn reclaim_verdict(&self, _sp: &str, _fp: &str, _cv: u64) -> ReclaimVerdict {
+                if !self.wrote.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    rocky_core::freeze_marker::write_freeze_marker(
+                        &self.provider,
+                        &rocky_core::freeze_marker::FreezeMarker {
+                            freeze_id: "mid-transition".to_string(),
+                            principal: PolicyPrincipal::Human,
+                            scope: "any".to_string(),
+                            reason: "landed during eviction".to_string(),
+                            created_at: Utc::now(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                ReclaimVerdict::Reclaimable { head_version: 0 }
+            }
+        }
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let config = write_cas_policy_config(root.path());
+        let err = run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            std::sync::Arc::new(MarkerWritingOracle {
+                provider: harness.provider.clone(),
+                wrote: std::sync::atomic::AtomicBool::new(false),
+            }),
+        )
+        .await
+        .expect_err("the pre-publish recheck must refuse the mid-transition freeze");
+        assert!(
+            format!("{err:#}").contains("after eviction, before publish"),
+            "the deny must come from the PRE-PUBLISH recheck, not attempt start: {err:#}"
+        );
+
+        // The refused attempt HAD evicted locally; the session must have
+        // restored the winner — no ghost tombstone for path-opening readers.
+        let local = StateStore::open(&harness.pod_b.state_path).unwrap();
+        assert!(
+            local.list_tombstones().unwrap().is_empty(),
+            "a refused post-eviction attempt must not leave a local ghost tombstone"
+        );
+
+        // Remote untouched.
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(published.list_tombstones().unwrap().is_empty());
+    }
+
+    fn write_cas_policy_config(root: &Path) -> std::path::PathBuf {
+        let path = root.join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\nconcurrency_control = \"cas\"\non_upload_failure = \"skip\"\n\n[state.retry]\nmax_retries = 0\n\n[policy]\nversion = 1\n",
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_cas_config(root: &Path) -> std::path::PathBuf {
+        let path = root.join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\nconcurrency_control = \"cas\"\non_upload_failure = \"skip\"\n\n[state.retry]\nmax_retries = 0\n",
+        )
+        .unwrap();
+        path
     }
 }
