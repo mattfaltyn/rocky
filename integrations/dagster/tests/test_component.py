@@ -68,6 +68,219 @@ def test_build_defs_from_none_state():
     assert list(defs.assets or []) == []
 
 
+def test_dag_failure_does_not_silently_load_the_legacy_graph(discover_json: str, tmp_path: Path):
+    """#1341: a recorded `rocky dag` failure must fail the load, not fall back.
+
+    The discover-based fallback is not a degraded version of the DAG graph — it
+    has different assets and different dependencies. Falling back produces a
+    code location that loads, looks plausible, and materializes a plan the
+    project does not describe. Before this fix that was a log warning.
+
+    Reachable in practice: `rocky dag` exits non-zero for any project with two
+    or more transformation pipelines (#1348), so those users were the ones
+    getting the silently-wrong graph.
+    """
+    state = {
+        "discover": json.loads(discover_json),
+        # No "dag" key, but the write recorded WHY.
+        "dag_status": "failed",
+        "dag_error": {"message": "RockyCliError: model 'a' is claimed by two pipelines"},
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True)
+    with pytest.raises(dg.Failure) as excinfo:
+        component.build_defs_from_state(context=None, state_path=state_file)
+
+    # The recorded cause must reach the operator — a refusal that does not say
+    # why sends them to the logs of a build that already finished.
+    assert "claimed by two pipelines" in str(excinfo.value.description)
+
+
+def test_a_state_written_with_dag_mode_off_is_not_reused_as_a_dag(
+    discover_json: str, tmp_path: Path
+):
+    """The third case review found: the state key ignores `dag_mode`.
+
+    `defs_state_config` keys on `RockyComponent[<config_path>]` only, so turning
+    `dag_mode` on does not invalidate a state written with it off. That state has
+    no `dag` and no failure — and under the first version of this fix it was
+    markerless, so it fell back to the discover graph. Same wrong-graph bug,
+    reached by a different route.
+    """
+    state = {"discover": json.loads(discover_json), "dag_status": "disabled"}
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True)
+    with pytest.raises(dg.Failure) as excinfo:
+        component.build_defs_from_state(context=None, state_path=state_file)
+    assert "dag_mode off" in str(excinfo.value.description)
+
+
+def test_a_legacy_state_without_provenance_still_falls_back(discover_json: str, tmp_path: Path):
+    """Back-compat control. A state written before `dag_status` existed carries
+    no provenance, and its cause genuinely cannot be recovered — "predates DAG
+    support" and "the old writer swallowed a failure" are identical on disk.
+
+    Failing closed here would break every existing deployment on upgrade, so it
+    warns and falls back. This is the documented residual: it resolves the first
+    time the state is rewritten, because the writer now always records a status.
+    """
+    state = {"discover": json.loads(discover_json)}  # no dag, no dag_status
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True)
+    defs = component.build_defs_from_state(context=None, state_path=state_file)
+    assert len(list(defs.assets or [])) > 0
+
+
+def test_strict_build_refuses_an_unprovenanced_legacy_state(discover_json: str, tmp_path: Path):
+    """`strict_build` adopters opted into "fail rather than ship a partial
+    graph", so they get the safe answer for the ambiguous legacy case that the
+    default path tolerates."""
+    state = {"discover": json.loads(discover_json)}
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True, strict_build=True)
+    with pytest.raises(dg.Failure):
+        component.build_defs_from_state(context=None, state_path=state_file)
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["weird-value", 7, ["failed"], None],
+    ids=["unrecognised", "int", "list", "explicit-null"],
+)
+def test_an_unrecognised_dag_status_fails_closed(status, discover_json: str, tmp_path: Path):
+    """A `dag_status` this writer never emits must refuse, not fall back.
+
+    Treating an unknown value as "no failure recorded" is the same
+    unknown-reads-as-safe mistake the whole change exists to remove — it is how
+    a state written by a newer version, or hand-edited, would silently load the
+    discover graph.
+
+    `explicit-null` is the subtle one: `raw.get("dag_status")` cannot tell a key
+    present with a JSON null from a key that is absent, so the loader tests
+    membership instead. Found by enumerating state shapes against the running
+    loader, not by reading it.
+    """
+    state = {"discover": json.loads(discover_json), "dag_status": status}
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True)
+    with pytest.raises(dg.Failure) as excinfo:
+        component.build_defs_from_state(context=None, state_path=state_file)
+    assert "unrecognised dag_status" in str(excinfo.value.description)
+
+
+def test_a_malformed_dag_error_still_refuses(discover_json: str, tmp_path: Path):
+    """A non-mapping `dag_error` must not crash with `AttributeError` on `.get`,
+    and must not fall through either — the status is what decides."""
+    state = {
+        "discover": json.loads(discover_json),
+        "dag_status": "failed",
+        "dag_error": "not a mapping",
+    }
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True)
+    with pytest.raises(dg.Failure) as excinfo:
+        component.build_defs_from_state(context=None, state_path=state_file)
+    assert "malformed" in str(excinfo.value.description)
+
+
+def test_a_dag_failure_is_recorded_in_the_written_state(tmp_path: Path):
+    """The write side of #1341: the failure must be *recorded*, not just survived.
+
+    Without `strict_build` the write still succeeds — persistence must not
+    depend on the binary being reachable — but it has to leave evidence, or the
+    load cannot tell this state from one that predates DAG support.
+
+    This is the wiring test. The load-path test above builds its state file by
+    hand, so it stays green even if the writer records nothing at all; only
+    driving `write_state_to_path` proves the two halves are connected.
+    """
+    from unittest.mock import MagicMock
+
+    rocky = MagicMock()
+    rocky.discover.return_value = MagicMock(
+        model_dump_json=MagicMock(return_value='{"version":"0","command":"discover","sources":[]}')
+    )
+    rocky.dag.side_effect = RuntimeError("rocky dag exploded")
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True)
+    component._get_rocky_resource = lambda: rocky  # type: ignore[method-assign]
+
+    state_file = tmp_path / "state.json"
+    component.write_state_to_path(state_path=state_file)
+
+    written = json.loads(state_file.read_text())
+    assert "dag" not in written, "a failed dag must not leave a partial slot"
+    assert written["dag_status"] == "failed"
+    assert "rocky dag exploded" in written["dag_error"]["message"], (
+        "the write must record WHY the slot is absent, or the load reads it as "
+        "a pre-DAG payload and silently falls back"
+    )
+
+
+def test_dag_mode_off_records_disabled_provenance(tmp_path: Path):
+    """The write side of the mode-toggle case.
+
+    Without this, the loader test above stays green while the writer records
+    nothing at all — it builds its state file by hand. That is the same wiring
+    gap the failure-marker test exists to close, one branch over: a hand-built
+    fixture proves the loader reads a value, never that anything writes it.
+    """
+    from unittest.mock import MagicMock
+
+    rocky = MagicMock()
+    rocky.discover.return_value = MagicMock(
+        model_dump_json=MagicMock(return_value='{"version":"0","command":"discover","sources":[]}')
+    )
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=False)
+    component._get_rocky_resource = lambda: rocky  # type: ignore[method-assign]
+
+    state_file = tmp_path / "state.json"
+    component.write_state_to_path(state_path=state_file)
+
+    written = json.loads(state_file.read_text())
+    assert written["dag_status"] == "disabled", (
+        "a state written with dag_mode off must say so, or turning the mode on "
+        "reuses it as though a DAG had been attempted"
+    )
+    assert "dag" not in written
+    rocky.dag.assert_not_called()
+
+
+def test_strict_build_reraises_a_dag_failure_at_write_time(tmp_path: Path):
+    """`strict_build` fails the deploy rather than persisting a broken graph.
+
+    Mirrors the discover slot, and for the same stated reason: under
+    `dag_mode` the DAG slot *is* the asset graph, so it is not one of the
+    best-effort augmentation slots (`compile`, `optimize`).
+    """
+    from unittest.mock import MagicMock
+
+    rocky = MagicMock()
+    rocky.discover.return_value = MagicMock(
+        model_dump_json=MagicMock(return_value='{"version":"0","command":"discover","sources":[]}')
+    )
+    rocky.dag.side_effect = RuntimeError("rocky dag exploded")
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True, strict_build=True)
+    component._get_rocky_resource = lambda: rocky  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="rocky dag exploded"):
+        component.write_state_to_path(state_path=tmp_path / "state.json")
+
+
 def test_dag_mode_fallback_does_not_mutate_config(discover_json: str, tmp_path: Path):
     """When ``dag_mode=True`` but the cached state predates DAG mode (no ``dag``
     key), ``build_defs_from_state`` must fall back without mutating
