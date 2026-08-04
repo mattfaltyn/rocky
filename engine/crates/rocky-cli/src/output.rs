@@ -5328,9 +5328,11 @@ pub struct DagSummaryOutput {
 pub struct DagRunOutput {
     pub version: String,
     pub command: String,
-    /// Scheduling warnings from physical-read edge derivation: mutual reads
-    /// serialized by a deterministic order, models whose SQL could not be
-    /// parsed for reads, and colliding targets. Empty when none.
+    /// Scheduling warnings from dependency inference — physical-read
+    /// derivation (mutual reads serialized deterministically, unparseable
+    /// models, colliding targets) and label inference (label collisions
+    /// where only one claimant orders the reader, unparseable models).
+    /// Empty when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// Total nodes across all layers.
@@ -9124,6 +9126,11 @@ pub struct PreviewDiffOutput {
     pub command: String,
     pub branch_name: String,
     pub base_ref: String,
+    /// Present when no run was recorded on `base_ref`: the diff is NOT
+    /// computed against any stand-in (an empty summary is returned) and this
+    /// note explains the absence and the remedy (#1345).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_note: Option<String>,
     pub summary: PreviewDiffSummary,
     pub models: Vec<PreviewModelDiff>,
     /// Pre-rendered Markdown suitable for posting as a GitHub PR comment.
@@ -9466,6 +9473,7 @@ impl PreviewDiffOutput {
     pub fn new(
         branch_name: String,
         base_ref: String,
+        base_note: Option<String>,
         summary: PreviewDiffSummary,
         models: Vec<PreviewModelDiff>,
         markdown: String,
@@ -9475,6 +9483,7 @@ impl PreviewDiffOutput {
             command: "preview-diff".to_string(),
             branch_name,
             base_ref,
+            base_note,
             summary,
             models,
             markdown,

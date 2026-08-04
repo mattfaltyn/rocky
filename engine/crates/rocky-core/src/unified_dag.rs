@@ -918,10 +918,16 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
 /// Augment a DAG with edges inferred from model SQL `FROM` references.
 ///
 /// `build_unified_dag` resolves only edges from explicit `depends_on` config.
-/// This pass parses each model's SQL, extracts the tables it references, and
-/// adds [`EdgeType::DataDependency`] edges from the producing nodes (other
-/// transformations, seeds, replication loads) to the consuming model — even
-/// when no explicit `depends_on` is declared.
+/// This pass parses each model's SQL, extracts the tables it references by
+/// bare name, and adds an [`EdgeType::DataDependency`] edge from ONE
+/// producing node per referenced label — the last claimant in build order,
+/// byte-for-byte the single-slot heuristic's graph — to the consuming model.
+/// When several nodes claim one label, the OTHERS are deliberately not
+/// ordered: every scheme for ordering them was shown to be able to suppress
+/// exact physical-pass evidence until the cross-pass provenance contract
+/// exists (#1357). The collision is reported instead, alongside models
+/// whose SQL could not be parsed, via the returned
+/// [`LabelInferenceReport`].
 ///
 /// `model_sql_by_name` maps model name → compiled SQL text. The caller is
 /// responsible for compiling models first; this function does no IO.
@@ -931,19 +937,41 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
 pub fn infer_runtime_dependencies(
     dag: &mut UnifiedDag,
     model_sql_by_name: &HashMap<String, String>,
-) {
+) -> LabelInferenceReport {
+    let mut report = LabelInferenceReport::default();
     // Build a set of producing node names (everything that creates a table:
-    // transformations, seeds, loads). Maps logical table name → NodeId.
-    let mut producers: HashMap<String, NodeId> = HashMap::new();
+    // transformations, seeds, loads). Maps logical table name → the FULL set
+    // of claimants — used as a COLLISION DETECTOR only: edges derive solely
+    // from the legacy winner (last in build order, identical to the old
+    // single-slot map), and colliding claimants are reported, not ordered
+    // (#1351 observability; ordering them awaits #1357).
+    let mut producers: HashMap<String, Vec<(NodeId, NodeKind)>> = HashMap::new();
     for node in &dag.nodes {
         match node.kind {
             NodeKind::Transformation | NodeKind::Seed | NodeKind::Load | NodeKind::Replication => {
                 // Index by lowercase label so case-insensitive SQL refs match.
-                producers.insert(node.label.to_lowercase(), node.id.clone());
+                producers
+                    .entry(node.label.to_lowercase())
+                    .or_default()
+                    .push((node.id.clone(), node.kind));
             }
             _ => {}
         }
     }
+    let mut legacy_winner: HashMap<&str, NodeId> = HashMap::new();
+    for (label, claimants) in &producers {
+        if claimants.len() > 1 {
+            report
+                .label_collisions
+                .push((label.clone(), claimants.len()));
+        }
+        // The single-slot map's insert order made the LAST claimant the one
+        // whose edges the old code produced.
+        if let Some((last, _)) = claimants.last() {
+            legacy_winner.insert(label.as_str(), last.clone());
+        }
+    }
+    report.label_collisions.sort();
 
     // Existing edges as a set so we don't double-add.
     let mut existing: HashSet<(NodeId, NodeId)> = dag
@@ -951,9 +979,19 @@ pub fn infer_runtime_dependencies(
         .iter()
         .map(|e| (e.from.clone(), e.to.clone()))
         .collect();
-
+    // The graph below is byte-for-byte the single-slot heuristic's: only the
+    // legacy winner's edges derive, unguarded, so genuine reciprocal label
+    // reads keep their loud refusal exactly as before.
     let mut new_edges = Vec::new();
 
+    // Resolve every reader's candidates once, splitting legacy from fan-out.
+    // TWO-PHASE insertion: all legacy edges first (unguarded — byte-for-byte
+    // the graph the single-slot heuristic produced, so refusals are exactly
+    // the old refusals), THEN the fan-out additions guarded against the
+    // COMPLETE graph. Interleaving would let an earlier reader's fan-out
+    // edge make a later reader's unguarded legacy edge closing — a refusal
+    // the old behavior never had.
+    let mut legacy_candidates: Vec<(NodeId, String, NodeId)> = Vec::new();
     for node in &dag.nodes {
         if node.kind != NodeKind::Transformation {
             continue;
@@ -961,8 +999,15 @@ pub fn infer_runtime_dependencies(
         let Some(sql) = model_sql_by_name.get(&node.label) else {
             continue;
         };
-        let Ok(refs) = rocky_sql::lineage::referenced_tables(sql) else {
-            continue;
+        let refs = match rocky_sql::lineage::referenced_tables(sql) {
+            Ok(refs) => refs,
+            // A model whose reads cannot be extracted derives no edges here —
+            // it may be co-scheduled with an unordered upstream. Surfaced,
+            // never silent (#1351).
+            Err(_) => {
+                report.unparsed.push(node.label.clone());
+                continue;
+            }
         };
         for table_name in refs {
             // Match by the bare table name (last segment of any qualified ref).
@@ -971,25 +1016,87 @@ pub fn infer_runtime_dependencies(
                 .next()
                 .unwrap_or(&table_name)
                 .to_lowercase();
-            let Some(producer_id) = producers.get(&bare) else {
+            let Some(claimants) = producers.get(&bare) else {
                 continue;
             };
-            // Skip self-references and already-known edges.
-            if *producer_id == node.id {
-                continue;
-            }
-            let key = (producer_id.clone(), node.id.clone());
-            if existing.insert(key) {
-                new_edges.push(UnifiedEdge {
-                    from: producer_id.clone(),
-                    to: node.id.clone(),
-                    edge_type: EdgeType::DataDependency,
-                });
+            // ONLY the legacy winner's edge is derived — byte-for-byte the
+            // single-slot heuristic's graph. Ordering readers after the
+            // OTHER claimants was tried and reverted four review rounds
+            // running: any edge added beyond main's graph can suppress an
+            // exact physical dependency through the shared cycle guards
+            // until the cross-pass provenance contract exists (#1357). The
+            // collision is REPORTED so the un-ordered claimants are visible
+            // instead of silent.
+            for (producer_id, _kind) in claimants {
+                if *producer_id == node.id {
+                    continue;
+                }
+                if legacy_winner.get(bare.as_str()) == Some(producer_id) {
+                    legacy_candidates.push((
+                        node.id.clone(),
+                        node.label.clone(),
+                        producer_id.clone(),
+                    ));
+                }
             }
         }
     }
 
+    // Phase 1 — legacy edges, unguarded (status-quo graph; genuine SQL
+    // cycles keep their loud refusal).
+    for (reader_id, _label, producer_id) in legacy_candidates {
+        let key = (producer_id.clone(), reader_id.clone());
+        if !existing.insert(key) {
+            continue;
+        }
+        new_edges.push(UnifiedEdge {
+            from: producer_id,
+            to: reader_id,
+            edge_type: EdgeType::DataDependency,
+        });
+    }
+
     dag.edges.extend(new_edges);
+    report.unparsed.sort();
+    report
+}
+
+/// What [`infer_runtime_dependencies`] could not resolve — surfaced by the
+/// `run --dag` caller as scheduling warnings instead of silently dropping
+/// edges (#1351).
+#[derive(Debug, Default)]
+pub struct LabelInferenceReport {
+    /// Lowercased labels claimed by more than one producing node, with the
+    /// claimant count. Readers of such a label are ordered after ONE of
+    /// them (the last in build order); the rest are NOT ordered — the
+    /// collision is surfaced so the ambiguity is visible (#1357 owns
+    /// actually ordering them).
+    pub label_collisions: Vec<(String, usize)>,
+    /// Transformation labels whose SQL failed table-reference extraction.
+    pub unparsed: Vec<String>,
+}
+
+impl LabelInferenceReport {
+    /// Render operator-facing warnings; empty when nothing was unresolved.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        for (label, n) in &self.label_collisions {
+            w.push(format!(
+                "label '{label}' is produced by {n} nodes — label inference orders readers \
+                 after ONE of them (the last in build order); the others are NOT ordered. \
+                 Rename the colliding producers so each label is unique (depends_on cannot \
+                 order a model against a seed or load)"
+            ));
+        }
+        for m in &self.unparsed {
+            w.push(format!(
+                "model '{m}': SQL could not be parsed for table references — label-based \
+                 ordering could not be derived for it"
+            ));
+        }
+        w
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3072,5 +3179,94 @@ mod tests {
                 .unwrap()
         };
         assert!(pos("a") < pos("b"), "consistent with the intermediate path");
+    }
+
+    /// #1351: a transformation whose SQL cannot be parsed is REPORTED, not
+    /// silently skipped.
+    #[test]
+    fn unparseable_sql_is_reported_by_label_inference() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut broken = model("broken", vec![], vec![]);
+        broken.sql = "SELEC x FRM (".into();
+        let by_pipeline = owned_by_sole_transformation(&config, vec![broken.clone()]);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        let sql: HashMap<String, String> =
+            HashMap::from([("broken".to_string(), broken.sql.clone())]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(report.unparsed, vec!["broken".to_string()]);
+        assert!(!report.warnings().is_empty());
+    }
+
+    /// #1351 observability: a label collision derives ONLY the legacy
+    /// winner's edge (byte-for-byte main's graph — no new edges until the
+    /// #1357 provenance contract exists) and REPORTS the collision so the
+    /// un-ordered claimants are visible instead of silent.
+    #[test]
+    fn label_collisions_are_reported_and_only_the_legacy_edge_derives() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut reader = model("reader", vec![], vec![]);
+        reader.sql = "SELECT x FROM shared".into();
+        let by_pipeline = owned_by_sole_transformation(&config, vec![reader.clone()]);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        let p0 = NodeId("p0:shared".to_string());
+        let p1 = NodeId("p1:shared".to_string());
+        dag.nodes.push(UnifiedNode {
+            id: p0.clone(),
+            kind: NodeKind::Seed,
+            label: "shared".into(),
+            pipeline: Some("t".into()),
+        });
+        dag.nodes.push(UnifiedNode {
+            id: p1.clone(),
+            kind: NodeKind::Load,
+            label: "shared".into(),
+            pipeline: Some("t".into()),
+        });
+        let sql: HashMap<String, String> =
+            HashMap::from([("reader".to_string(), reader.sql.clone())]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(report.label_collisions, vec![("shared".to_string(), 2)]);
+        assert!(!report.warnings().is_empty());
+        let reader_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "reader" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        let from_p0 = dag.edges.iter().any(|e| e.from == p0 && e.to == reader_id);
+        let from_p1 = dag.edges.iter().any(|e| e.from == p1 && e.to == reader_id);
+        assert!(
+            !from_p0 && from_p1,
+            "exactly the legacy (last) claimant's edge — main's graph"
+        );
+    }
+
+    /// Status quo pinned: genuinely reciprocal label reads REFUSE loudly
+    /// (as the single-slot heuristic always did) — the guard must not
+    /// downgrade a real SQL cycle into a silent stale-read success.
+    #[test]
+    fn mutual_label_reads_still_refuse_loudly() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut a = model("a", vec![], vec![]);
+        a.sql = "SELECT x FROM b".into();
+        let mut b = model("b", vec![], vec![]);
+        b.sql = "SELECT y FROM a".into();
+        let models = vec![a.clone(), b.clone()];
+        let by_pipeline = owned_by_sole_transformation(&config, models);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        let sql: HashMap<String, String> = HashMap::from([
+            ("a".to_string(), a.sql.clone()),
+            ("b".to_string(), b.sql.clone()),
+        ]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        assert!(
+            report.label_collisions.is_empty() && report.unparsed.is_empty(),
+            "nothing to report for a clean mutual pair: {report:?}"
+        );
+        assert!(
+            execution_phases(&dag).is_err(),
+            "a genuine SQL cycle keeps its loud refusal"
+        );
     }
 }
