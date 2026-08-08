@@ -60,7 +60,7 @@ Runs `rocky plan` and returns the planned SQL statements without executing them.
 | `pipeline` | `str \| None` | `None` | Pipeline name (required when multiple pipelines are defined) |
 | `env` | `str \| None` | `None` | Optional environment name |
 
-### `run(filter, governance_override=None, *, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
+### `run(filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
 
 Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution result including materializations, check results, drift detection, and permission changes.
 
@@ -70,6 +70,7 @@ Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution re
 |---|---|---|---|
 | `filter` | `str` | required | Component filter (e.g. `"tenant=acme"`) |
 | `governance_override` | `dict \| None` | `None` | Per-run governance config (workspace_ids, grants), merged with `rocky.toml` defaults |
+| `pipeline` | `str \| None` | `None` | Pipeline name (required when multiple pipelines are defined) |
 | `run_models` | `bool` | `False` | Also execute compiled models (passes `--models` and `--all`) |
 | `partition` | `str \| None` | `None` | Single partition key (e.g. `"2026-04-07"`) |
 | `partition_from` | `str \| None` | `None` | Lower bound of a partition range (requires `partition_to`) |
@@ -79,7 +80,7 @@ Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution re
 | `lookback` | `int \| None` | `None` | Recompute the previous N partitions in addition to the selected ones |
 | `parallel` | `int \| None` | `None` | Run N partitions concurrently. Left as `None`, the `--parallel` flag is omitted and the engine applies its own default of 4 concurrent partitions (earlier engine versions defaulted to serial). Pass `1` to run one partition at a time — note this does not bound a replication pipeline's table fan-out, which comes from its `[execution] concurrency`. DuckDB runs serially regardless. |
 
-### `run_streaming(context, filter, governance_override=None, *, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
+### `run_streaming(context, filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
 
 Pipes-style execution with live stderr streaming to `context.log`. Same semantics as `run()` but spawns the binary via `subprocess.Popen` and forwards Rocky's stderr (tracing output) to `context.log.info` line-by-line as the run progresses. Use this from inside a Dagster `@multi_asset` or `@op` for runs longer than a few seconds.
 
@@ -98,7 +99,7 @@ def replicate(context: dg.AssetExecutionContext, rocky: RockyResource):
     return result.tables_copied
 ```
 
-### `run_pipes(context, filter, governance_override=None, *, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None, pipes_client=None) -> PipesClientCompletedInvocation`
+### `run_pipes(context, filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None, pipes_client=None) -> PipesClientCompletedInvocation`
 
 Full Dagster Pipes execution with structured event streaming. Spawns `rocky plan` followed by `rocky apply <plan-id>` via `PipesSubprocessClient`, which sets the `DAGSTER_PIPES_CONTEXT` / `DAGSTER_PIPES_MESSAGES` env vars on the apply subprocess. The engine emits one Pipes message per materialization, asset check, and log line, so the run viewer gets `MaterializationEvent` and `AssetCheckEvaluation` events in real time. The plan id is attached via `extras={"plan_id": plan_id}`, so Dagster surfaces it as run metadata in the run viewer.
 

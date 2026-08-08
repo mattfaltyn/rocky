@@ -1288,8 +1288,8 @@ def test_run_rocky_buffered_path_hard_kills_hung_binary(tmp_path: Path):
     )
 
 
-def test_run_streaming_threads_partition_flags():
-    """run_streaming accepts the same partition kwargs as run() and
+def test_run_streaming_threads_all_routing_flags():
+    """run_streaming accepts the same routing kwargs as run() and
     threads them onto its single ``rocky run`` spawn."""
     rocky = RockyResource()
     context = _captured_log_context()
@@ -1308,6 +1308,7 @@ def test_run_streaming_threads_partition_flags():
         rocky.run_streaming(
             context,
             filter="tenant=acme",
+            pipeline="bronze",
             partition="2026-04-08",
             lookback=2,
             parallel=4,
@@ -1317,6 +1318,8 @@ def test_run_streaming_threads_partition_flags():
     assert len(captured_cmd) == 1
     run_cmd = captured_cmd[0]
     assert "run" in run_cmd
+    pipeline_idx = run_cmd.index("--pipeline")
+    assert run_cmd[pipeline_idx + 1] == "bronze"
     assert "--partition" in run_cmd
     assert "2026-04-08" in run_cmd
     assert "--lookback" in run_cmd
@@ -1344,7 +1347,15 @@ def test_run_streaming_default_omits_partition_flags():
         rocky.run_streaming(context, filter="tenant=acme")
 
     run_cmd = captured_cmd[0]
-    for flag in ("--partition", "--from", "--to", "--latest", "--missing", "--lookback"):
+    for flag in (
+        "--pipeline",
+        "--partition",
+        "--from",
+        "--to",
+        "--latest",
+        "--missing",
+        "--lookback",
+    ):
         assert flag not in run_cmd
 
 
@@ -1404,8 +1415,8 @@ def test_run_pipes_calls_pipes_client_with_built_command():
     assert call_kwargs.get("extras") == {"plan_id": plan_id}
 
 
-def test_run_pipes_threads_all_partition_flags():
-    """run_pipes() threads partition kwargs through to the plan-phase
+def test_run_pipes_threads_all_routing_flags():
+    """run_pipes() threads routing kwargs through to the plan-phase
     subprocess argv (Phase 5 — apply-phase argv is just ``apply <plan_id>``).
     """
     rocky = RockyResource()
@@ -1423,6 +1434,7 @@ def test_run_pipes_threads_all_partition_flags():
         rocky.run_pipes(
             context,
             filter="tenant=acme",
+            pipeline="bronze",
             partition_from="2026-04-01",
             partition_to="2026-04-08",
             lookback=2,
@@ -1432,6 +1444,8 @@ def test_run_pipes_threads_all_partition_flags():
 
     plan_args = captured_plan_args[0]
     assert "plan" in plan_args
+    pipeline_idx = plan_args.index("--pipeline")
+    assert plan_args[pipeline_idx + 1] == "bronze"
     assert "--from" in plan_args
     assert "2026-04-01" in plan_args
     assert "--to" in plan_args
@@ -1440,6 +1454,24 @@ def test_run_pipes_threads_all_partition_flags():
     assert "2" in plan_args
     assert "--parallel" in plan_args
     assert "4" in plan_args
+
+
+def test_run_pipes_default_omits_pipeline():
+    """pipeline=None preserves the existing unscoped plan argv."""
+    rocky = RockyResource()
+    context = MagicMock(spec=dg.AssetExecutionContext)
+    fake_client = MagicMock(spec=dg.PipesSubprocessClient)
+    fake_client.run = MagicMock(return_value=MagicMock())
+    captured_plan_args: list[list[str]] = []
+
+    def fake_run_rocky(self, args, *, allow_partial=False, timeout_seconds=None):
+        captured_plan_args.append(args)
+        return _plan_json()
+
+    with patch.object(RockyResource, "_run_rocky", autospec=True, side_effect=fake_run_rocky):
+        rocky.run_pipes(context, filter="tenant=acme", pipes_client=fake_client)
+
+    assert "--pipeline" not in captured_plan_args[0]
 
 
 def test_run_pipes_constructs_default_client_when_none_passed():
