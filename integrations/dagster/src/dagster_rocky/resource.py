@@ -860,6 +860,7 @@ class RockyResource(dg.ConfigurableResource):
             filter: Component filter (e.g. ``"client=acme"``).
             governance_override: Optional per-run governance config (workspace_ids,
                 grants), merged additively with ``rocky.toml`` defaults.
+            pipeline: Pipeline name (required when multiple pipelines are defined).
             run_models: If ``True``, also execute compiled models.
             partition / partition_from / partition_to / latest / missing /
                 lookback / parallel: Partition selection flags.
@@ -917,6 +918,7 @@ class RockyResource(dg.ConfigurableResource):
         filter: str,
         governance_override: dict | None = None,
         *,
+        pipeline: str | None = None,
         run_models: bool = False,
         partition: str | None = None,
         partition_from: str | None = None,
@@ -964,6 +966,7 @@ class RockyResource(dg.ConfigurableResource):
             return self._get_client().run(
                 filter,
                 governance_override=resolved.get("governance_override"),
+                pipeline=pipeline,
                 run_models=run_models,
                 partition=partition,
                 partition_from=partition_from,
@@ -1035,6 +1038,7 @@ class RockyResource(dg.ConfigurableResource):
         filter: str,
         governance_override: dict | None = None,
         *,
+        pipeline: str | None = None,
         run_models: bool = False,
         partition: str | None = None,
         partition_from: str | None = None,
@@ -1101,6 +1105,7 @@ class RockyResource(dg.ConfigurableResource):
         _validate_governance_override(resolved.get("governance_override"))
         build_kwargs: dict[str, Any] = {
             "governance_override": resolved.get("governance_override"),
+            "pipeline": pipeline,
             "run_models": run_models,
             "partition": partition,
             "partition_from": partition_from,

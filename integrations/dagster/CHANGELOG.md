@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`run_streaming()` and `run_pipes()` can select a pipeline.** Both methods now
+  accept the same `pipeline=` keyword as buffered `run()`. Streaming forwards it
+  to `rocky run --pipeline`; Pipes persists it through `rocky plan --pipeline`.
+  This restores both execution modes for projects with multiple pipelines. (#1401)
+
 - **Two DAG nodes resolving to one Dagster asset key are refused, with a message that names them.** The engine deliberately permits the same `catalog.schema.table` on two different adapters — `reject_duplicate_physical_targets` keys on `(adapter, target)` — while the default translator keys a transformation asset on the target triple alone, and neither `DagNodeOutput` nor `TargetConfig` carries the adapter, so the collision cannot be expressed in an asset key at all. Dagster did catch this, but only at repository build and only because the specs differ (`rocky/node_id` is stamped into each), and its `Received conflicting AssetSpecs with the same key` names neither the models, nor their pipelines, nor the adapters that make the project legal upstream. `build_dag_specs` now refuses as soon as the keys are known, listing each colliding key with its node ids and pipelines. The check runs **after** the translator, keyed on what it returned, so a project that already disambiguates with a custom `get_dag_node_asset_key` is unaffected. (#1349)
 
 ### Fixed
