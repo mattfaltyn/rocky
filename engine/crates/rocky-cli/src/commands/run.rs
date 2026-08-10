@@ -4144,50 +4144,41 @@ pub async fn run(
 
     // --- Batch watermark updates (no lock contention — sequential post-run) ---
     //
-    // Under `fail_fast = true` semantics, any table failure should prevent
-    // the surviving tables from advancing their watermarks — otherwise the
-    // next run resumes from a point that implies siblings succeeded. Under
-    // `fail_fast = false` (the default, partial-success semantics), commit
-    // whatever completed cleanly so forward progress isn't lost.
-    let skip_watermarks_due_to_failure = fail_fast && !table_errors.is_empty();
-    if skip_watermarks_due_to_failure {
-        tracing::warn!(
-            deferred = deferred_watermarks.len(),
-            failed_tables = table_errors.len(),
-            "fail_fast + partial failure: skipping {} pending watermark commits so the next run starts from the same baseline",
-            deferred_watermarks.len(),
-        );
-    } else {
-        // §P1.6: single redb transaction for every deferred watermark, run on
-        // the blocking pool so the commit fsync doesn't stall the async task.
-        let store = Arc::clone(&shared_state);
-        let owned: Vec<(String, WatermarkState)> = deferred_watermarks
-            .iter()
-            .map(|wm| {
-                (
-                    wm.state_key.clone(),
-                    WatermarkState {
-                        last_value: wm.timestamp,
-                        updated_at: wm.timestamp,
-                    },
-                )
-            })
-            .collect();
-        let count = owned.len();
-        let res = tokio::task::spawn_blocking(move || {
-            let entries: Vec<(&str, &WatermarkState)> =
-                owned.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            store.batch_set_watermarks(&entries)
+    // Successful table writes have already committed independently in the
+    // warehouse. Always advance their table-specific watermarks, even if a
+    // sibling failed under `fail_fast`; failed tables never enqueue one.
+    // Withholding a survivor's watermark makes recovery append its delta twice.
+    // §P1.6: single redb transaction for every deferred watermark, run on the
+    // blocking pool so the commit fsync doesn't stall the async task.
+    let store = Arc::clone(&shared_state);
+    let owned: Vec<(String, WatermarkState)> = deferred_watermarks
+        .iter()
+        .map(|wm| {
+            (
+                wm.state_key.clone(),
+                WatermarkState {
+                    last_value: wm.timestamp,
+                    updated_at: wm.timestamp,
+                },
+            )
         })
-        .await;
-        match res {
-            // `batch_set_watermarks` returns the count written; ignore it here.
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, count, "failed to persist watermarks for run")
-            }
-            Err(e) => tracing::warn!(error = %e, "watermark flush task panicked"),
+        .collect();
+    let count = owned.len();
+    let res = tokio::task::spawn_blocking(move || {
+        let entries: Vec<(&str, &WatermarkState)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        store.batch_set_watermarks(&entries)
+    })
+    .await;
+    match res {
+        // `batch_set_watermarks` returns the count written; ignore it here.
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, count, "failed to persist watermarks for run")
         }
+        Err(e) => tracing::warn!(error = %e, "watermark flush task panicked"),
     }
 
     // --- Batch table tagging (concurrent, outside the main processing loop) ---
@@ -15042,6 +15033,180 @@ timestamp_column = "ts"
             vec![1, 2, 3],
             "the appended row (id=3) must not be skipped"
         );
+    }
+
+    /// Regression for #1410: a sibling failure under `fail_fast` must not
+    /// withhold the watermark of an incremental table whose warehouse write
+    /// already committed. Otherwise the recovery run appends that delta twice.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn fail_fast_partial_failure_commits_successful_watermark() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::TableRef;
+
+        async fn run_pipeline(
+            config_path: &std::path::Path,
+            state_path: &std::path::Path,
+            run_id: &str,
+        ) -> anyhow::Result<()> {
+            super::run(
+                config_path,
+                Arc::new(rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap()),
+                None,
+                Some("repro"),
+                state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+            )
+            .await
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("repro.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        let state_path = tmp.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.repro]
+strategy = "incremental"
+timestamp_column = "ts"
+
+[pipeline.repro.source.discovery]
+adapter = "default"
+
+[pipeline.repro.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repro.target]
+catalog_template = "repro"
+schema_template = "staging__{{source}}"
+
+[pipeline.repro.target.governance]
+auto_create_schemas = true
+
+[pipeline.repro.checks]
+row_count = false
+column_match = false
+
+[pipeline.repro.execution]
+concurrency = 1
+fail_fast = true
+
+[state]
+backend = "local"
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write rocky.toml");
+
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("seed duckdb");
+            for sql in [
+                "CREATE SCHEMA raw__orders",
+                "CREATE TABLE raw__orders.a_good (id INTEGER, ts TIMESTAMP)",
+                "INSERT INTO raw__orders.a_good VALUES (1, TIMESTAMP '2026-01-01')",
+                "CREATE TABLE raw__orders.z_bad (id INTEGER, ts TIMESTAMP)",
+                "INSERT INTO raw__orders.z_bad VALUES (1, TIMESTAMP '2026-01-01')",
+            ] {
+                db.execute_statement(sql).await.unwrap();
+            }
+        }
+        run_pipeline(&config_path, &state_path, "bootstrap")
+            .await
+            .expect("bootstrap run");
+
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("mutate duckdb");
+            db.execute_statement(
+                "INSERT INTO raw__orders.a_good VALUES (2, TIMESTAMP '2026-01-02')",
+            )
+            .await
+            .unwrap();
+            db.execute_statement("ALTER TABLE raw__orders.z_bad DROP COLUMN ts")
+                .await
+                .unwrap();
+        }
+        let err = run_pipeline(&config_path, &state_path, "partial")
+            .await
+            .expect_err("the sibling table should fail");
+        assert!(
+            err.downcast_ref::<PartialFailure>().is_some(),
+            "one success plus one failure must be partial: {err:#}"
+        );
+
+        let key = TableRef {
+            catalog: "repro".into(),
+            schema: "staging__orders".into(),
+            table: "a_good".into(),
+        }
+        .state_key();
+        let watermark = StateStore::open(&state_path)
+            .expect("open state")
+            .get_watermark(&key)
+            .expect("read watermark")
+            .expect("successful table watermark");
+        assert_eq!(
+            watermark.last_value.to_rfc3339(),
+            "2026-01-02T00:00:00+00:00",
+            "state must match the already-committed successful table write"
+        );
+
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("repair duckdb");
+            db.execute_statement("ALTER TABLE raw__orders.z_bad ADD COLUMN ts TIMESTAMP")
+                .await
+                .unwrap();
+            db.execute_statement("UPDATE raw__orders.z_bad SET ts = TIMESTAMP '2026-01-01'")
+                .await
+                .unwrap();
+            db.execute_statement(
+                "INSERT INTO raw__orders.z_bad VALUES (2, TIMESTAMP '2026-01-02')",
+            )
+            .await
+            .unwrap();
+        }
+        run_pipeline(&config_path, &state_path, "recovery")
+            .await
+            .expect("recovery run");
+
+        let db = DuckDbWarehouseAdapter::open(&db_path).expect("verify duckdb");
+        let counts = db
+            .execute_query(
+                "SELECT COUNT(*), COUNT(DISTINCT id), COUNT(*) FILTER (WHERE id = 2) \
+                 FROM repro.staging__orders.a_good",
+            )
+            .await
+            .unwrap();
+        assert_eq!(counts.rows[0][0], "2", "recovery must not add a third row");
+        assert_eq!(counts.rows[0][1], "2", "both ids must remain distinct");
+        assert_eq!(counts.rows[0][2], "1", "the delta row must appear once");
     }
 
     /// Bad identifier rejected before any warehouse query is issued —
