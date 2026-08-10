@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fail_fast` recovery no longer duplicates a successful incremental table's last delta.** Warehouse writes commit independently per table, but a sibling failure previously suppressed every deferred watermark in the run. Recovery then read the successful table's old watermark and appended its already-committed rows again. Successful table watermarks now advance after the fan-out drains; failed tables retain their prior state. (#1410)
+
 ## [1.70.0] - 2026-08-10
 
 ### Fixed

@@ -168,13 +168,13 @@ Each check runs a `SELECT` against the freshly written target table. Failed chec
 
 ### 6g. Defer watermark write
 
-Rocky does **not** immediately write the watermark to the state store after a model succeeds. Instead, it queues the write. Only when the entire layer completes successfully does Rocky commit all watermarks in that layer in a single transaction.
+Rocky does **not** immediately write the watermark to the state store after a model succeeds. Instead, it queues the write. After the layer drains, Rocky commits the watermarks for every successfully written model in a single transaction; failed models never enqueue one.
 
-If any model in the layer fails, no watermarks are committed for that layer. This means a partial layer failure is fully safe to re-run: every model in the layer will start from its previous watermark.
+Successful model watermarks are committed even when a sibling fails. Warehouse writes commit independently per model, so advancing each survivor's table-specific watermark keeps state aligned with data that is already durable and prevents a retry from appending the same incremental delta again.
 
 ## Step 7: Batch-commit watermarks
 
-After a layer completes (all models succeeded, or the run is in partial mode), Rocky commits the deferred watermarks in one redb transaction. Atomic: all-or-nothing.
+After a layer completes, Rocky commits all successful deferred watermarks in one redb transaction. The state update is atomic across those successful models; failed models retain their prior watermarks.
 
 ## Step 8: Fire post-run hooks
 
