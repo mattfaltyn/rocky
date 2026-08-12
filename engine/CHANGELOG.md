@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky compile --model <name>` now reports exactly that model and rejects unknown names.** The selector previously filtered diagnostics and expanded SQL only: counts, execution layers, model details, text execution order, and `has_errors` still described the whole project. A healthy selected model could therefore exit nonzero with no visible diagnostic because an unrelated model was broken, while a misspelled model name exited 0 and returned the whole project. Rocky still compile-checks the full project internally for dependency and type context, but the returned report and exit status now share one exact-model scope; an unknown selector fails with `model not found`. (#1422)
+
 ## [1.70.1] - 2026-08-11
 
 ### Changed

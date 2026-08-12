@@ -23,7 +23,7 @@ rocky compile [flags]
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
-| `--model <NAME>` | `string` | | Filter compilation to a single model by name. |
+| `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name. The full project is still compile-checked for dependency and type context. |
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
 | `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/concepts/linters/). |
 | `--with-seed` | `bool` | `false` | Execute `data/seed.sql` against an in-memory DuckDB and use its `information_schema` as the source-of-truth for raw source schemas. Turns leaf `.sql` models from `Unknown` columns into concrete types. Requires the `duckdb` feature (enabled by default in the shipped binary). |
@@ -100,6 +100,11 @@ rocky compile --model fct_revenue --contracts contracts/
   "compile_timings": { "load_ms": 5, "resolve_ms": 1, "typecheck_ms": 12 }
 }
 ```
+
+Model selection is exact: an unknown name is an error. Rocky still loads and
+compile-checks the full project internally so the selected model has dependency
+and type context, but the visible counts, layers, model details, diagnostics,
+and failure state describe only the selected model.
 
 Every diagnostic carries a severity (`"error"`, `"warning"`, `"info"`), a code (`E###` errors, `W###` warnings, `P###` portability lints, or `V###` validation), the owning model, and (when the compiler can locate it) a `span` and `suggestion`.
 
