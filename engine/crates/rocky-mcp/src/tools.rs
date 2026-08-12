@@ -48,8 +48,8 @@ pub struct RockyMcpServer {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CompileArgs {
-    /// Optional single-model filter; compile-checks the whole project either
-    /// way but scopes the returned diagnostics to this model when set.
+    /// Optional single-model filter; compile-checks the whole project for type
+    /// context but scopes the returned result to this model when set.
     #[serde(default)]
     pub model: Option<String>,
     /// Optional portability target dialect — one of `"databricks"`,
@@ -539,7 +539,10 @@ impl RockyMcpServer {
             with_seed,
             None,
         )
-        .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
+        .map_err(|e| match e.downcast_ref::<commands::ModelNotFound>() {
+            Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
+            None => ToolError::compile_failed(format!("{e:#}")),
+        })?;
         Ok(Json(project_compile_result(&output)))
     }
 
@@ -4165,6 +4168,39 @@ mod tests {
             "message should name the model: {:?}",
             err.0
         );
+    }
+
+    #[tokio::test]
+    async fn compile_unknown_model_is_model_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )
+        .expect("write config");
+        let models = root.join("models");
+        std::fs::create_dir(&models).expect("create models");
+        std::fs::write(models.join("known.sql"), "SELECT 1 AS id").expect("write sql");
+        std::fs::write(
+            models.join("known.toml"),
+            "name = \"known\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"known\"\n",
+        )
+        .expect("write sidecar");
+
+        let server = RockyMcpServer::new(root.join("rocky.toml"));
+        let err = match server
+            .compile(Parameters(CompileArgs {
+                model: Some("missing".into()),
+                target_dialect: None,
+            }))
+            .await
+        {
+            Ok(_) => panic!("unknown model must error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::ModelNotFound);
+        assert!(err.0.message.contains("missing"));
     }
 
     #[test]
