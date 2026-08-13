@@ -6,7 +6,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
-use rocky_core::models;
 use rocky_core::tests::{TestSeverity, TestType, generate_test_sql_with_dialect};
 use rocky_core::traits::WarehouseAdapter;
 
@@ -177,22 +176,9 @@ pub fn run_test(
 // Declarative test runner (`rocky test --declarative`)
 // ---------------------------------------------------------------------------
 
-/// Load all models from a directory including one level of subdirectories.
-fn load_all_models(models_dir: &Path) -> Result<Vec<models::Model>> {
-    let mut all = models::load_models_from_dir(models_dir).context(format!(
-        "failed to load models from {}",
-        models_dir.display()
-    ))?;
-
-    if let Ok(entries) = std::fs::read_dir(models_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Ok(sub) = models::load_models_from_dir(&entry.path())
-            {
-                all.extend(sub);
-            }
-        }
-    }
+/// Load every `.sql` and `.rocky` model beneath the models directory.
+fn load_all_models(models_dir: &Path) -> Result<Vec<rocky_core::models::Model>> {
+    let mut all = crate::models_loader::load_project_models(models_dir)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
 }
@@ -517,5 +503,34 @@ fn test_type_label(tt: &TestType) -> &'static str {
         TestType::Composite { .. } => "composite",
         TestType::NotInFuture => "not_in_future",
         TestType::OlderThanNDays { .. } => "older_than_n_days",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_all_models;
+
+    #[test]
+    fn declarative_loader_includes_tests_from_rocky_models() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).expect("create models dir");
+        std::fs::write(
+            models.join("orders.rocky"),
+            "from raw_orders\nselect { id }\n",
+        )
+        .expect("write rocky model");
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+        )
+        .expect("write model sidecar");
+
+        let loaded = load_all_models(&models).expect("load models");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].config.name, "orders");
+        assert_eq!(loaded[0].config.tests.len(), 1);
+        assert_eq!(loaded[0].config.tests[0].column.as_deref(), Some("id"));
     }
 }
