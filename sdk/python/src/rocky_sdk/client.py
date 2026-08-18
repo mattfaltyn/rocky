@@ -77,6 +77,7 @@ from rocky_sdk.types import (
     PromotePlan,
     RestoreApplyOutput,
     RetentionStatusOutput,
+    ReviewStatusOutput,
     RunResult,
     StateResult,
     TestResult,
@@ -977,7 +978,7 @@ class RockyClient:
             args.extend(["--env", env])
         return _parse_rocky_json(self.run_cli(args), PlanResult, command="plan")
 
-    def apply(self, plan_id: str) -> ApplyResult:
+    def apply(self, plan_id: str, *, expect_spec_digest: str | None = None) -> ApplyResult:
         """Run ``rocky apply <plan-id>`` and return the parsed result.
 
         Reads ``.rocky/plans/<plan_id>.json`` and dispatches by kind. Each plan
@@ -987,6 +988,23 @@ class RockyClient:
         ``gc`` plans yield :class:`RestoreApplyOutput` and :class:`GcApplyOutput`,
         respectively; compact / archive / promote plans yield their respective
         outputs. See :func:`_parse_apply`.
+
+        Args:
+            plan_id: The 64-char blake3 plan identifier.
+            expect_spec_digest: Passes ``--expect-spec-digest``: the engine
+                refuses unless the plan payload's ``spec_digest`` equals this
+                exact string. The gate is fail-closed both ways — a
+                product-bound plan REQUIRES it (a bare apply is refused), and
+                passing it against a plan with no ``spec_digest`` is refused
+                too. The value MUST come from your own independently approved
+                product-spec source (the approved spec snapshot you intend to
+                fulfil) — NEVER from :meth:`review_status`. The plan carries
+                the digest it was authored against, so feeding
+                ``review_status.spec_digest`` back here compares the plan
+                against itself and always passes; the gate then proves
+                nothing. Use ``review_status.spec_digest`` only to DETECT what
+                the plan pinned, and compare it against your approved
+                snapshot's digest.
 
         Example:
 
@@ -1005,7 +1023,53 @@ class RockyClient:
                     # gc / restore / compact / archive / promote plan kinds.
                     print(type(result).__name__)
         """
-        return _parse_apply(self.run_cli(["apply", plan_id], allow_partial=True))
+        args = ["apply", plan_id]
+        if expect_spec_digest is not None:
+            args.extend(["--expect-spec-digest", expect_spec_digest])
+        return _parse_apply(self.run_cli(args, allow_partial=True))
+
+    def review_status(self, plan_id: str) -> ReviewStatusOutput:
+        """Run ``rocky review <plan-id> --status`` and return the typed state.
+
+        The read-only marker oracle: whether a well-formed sign-off marker
+        naming the plan exists (``reviewed``), who approved it and when, and
+        the plan's product binding (``product_id`` / ``spec_digest``) when it
+        carries one. Poll this instead of probing the marker file — the marker
+        is an engine-internal artifact, and a malformed or mismatched marker
+        is a command ERROR here (raised as :class:`RockyCommandError`), never
+        a silent ``reviewed=False``.
+
+        ``spec_digest`` here is what the PLAN pinned — use it to detect the
+        plan's binding, never as the expectation you pass back to
+        :meth:`apply` (that comparison is the plan against itself, and always
+        passes). The apply-time expectation comes from your own approved
+        product-spec snapshot.
+
+        Example:
+
+            Wait for the human sign-off, verify the plan pinned the spec
+            revision YOU approved, then apply with that independently held
+            digest::
+
+                # The digest of the spec revision you approved, from your own
+                # source of truth — not read back from the plan.
+                approved_digest = my_product_spec.approved_digest
+
+                status = client.review_status(plan_id)
+                if not status.reviewed:
+                    raise RuntimeError("plan not signed off yet")
+                if status.spec_digest != approved_digest:
+                    raise RuntimeError(
+                        f"plan was authored against {status.spec_digest}, "
+                        f"not the approved {approved_digest} — re-propose"
+                    )
+                client.apply(plan_id, expect_spec_digest=approved_digest)
+        """
+        return _parse_rocky_json(
+            self.run_cli(["review", plan_id, "--status"]),
+            ReviewStatusOutput,
+            command="review_status",
+        )
 
     def run(
         self,

@@ -3560,6 +3560,20 @@ pub struct RunPlan {
     /// Informational — re-derived at apply time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execution_layers: Vec<Vec<String>>,
+    /// Product identity this plan fulfils (e.g. `"product:revenue_daily"`).
+    /// Opaque to the engine — never parsed, only carried in the hashed
+    /// payload and compared for equality. Set together with `spec_digest`
+    /// or not at all. When unset the serialized payload is byte-identical
+    /// to the pre-product shape, so every legacy plan_id stays stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Digest of the approved product spec this plan was authored against
+    /// (e.g. `"sha256:<hex>"`). Opaque to the engine; `rocky apply
+    /// --expect-spec-digest` compares it for equality and a plan carrying
+    /// it refuses a bare apply. Set together with `product_id` or not at
+    /// all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
 }
 
 fn default_parallel() -> u32 {
@@ -6998,6 +7012,45 @@ pub struct PromotePlan {
     pub plan_audit: Vec<AuditEvent>,
     /// When this plan was persisted.
     pub created_at: DateTime<Utc>,
+}
+
+/// JSON output for `rocky review <plan-id> --status` — the marker oracle.
+///
+/// A read-only projection of the plan's review state: whether a well-formed
+/// sign-off marker naming the plan exists, who approved it and when, and the
+/// plan's product binding when it carries one. The fulfillment runner polls
+/// this instead of probing the marker path (the marker file itself stays an
+/// engine-internal artifact).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReviewStatusOutput {
+    pub version: String,
+    /// Always `"review_status"`.
+    pub command: String,
+    /// The plan whose review state was read (64-char blake3 hex).
+    pub plan_id: String,
+    /// The plan's kind (e.g. `"ai_authored"`, `"run"`, `"backfill"`).
+    pub kind: String,
+    /// Whether a well-formed sign-off marker naming this plan exists. `false`
+    /// means the plan awaits review; a malformed or mismatched marker is an
+    /// ERROR from the command, never reported as a status.
+    pub reviewed: bool,
+    /// When the approval was recorded, from the marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<DateTime<Utc>>,
+    /// Best-effort git identity of the approver, from the marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approver: Option<ApproverIdentity>,
+    /// Count of breaking-severity findings the approver signed off on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breaking_change_count: Option<u64>,
+    /// Product identity from the plan payload, when the plan is
+    /// product-bound (opaque; never parsed by the engine).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Approved-spec digest from the plan payload, when product-bound.
+    /// Applying such a plan requires `rocky apply --expect-spec-digest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
 }
 
 /// JSON output for `rocky review <plan-id>`.
