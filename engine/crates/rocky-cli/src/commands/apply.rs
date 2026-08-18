@@ -790,6 +790,7 @@ async fn execute_run_plan(
         // `--assume-fresh-state` is a `rocky run` runtime flag, never part of
         // a persisted plan — the two-step apply path always runs without it.
         false,
+        None, // #1460: not a replication plan
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
@@ -3016,18 +3017,36 @@ async fn run_apply_ai_authored_plan(
         state_path,
         &marker_freezes,
     );
-    match gate {
-        PolicyGate::NotConfigured => {
-            if !ai_plan_is_reviewed(root, plan_id) {
-                bail!(
-                    "AI-authored plan '{plan_id}' has not been reviewed and approved. \
-                     An AI agent authored this change, so it cannot be applied directly. \
-                     Review the breaking-change report and approve it first with \
-                     `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
-                );
-            }
-        }
-        gate => apply_policy_gate(root, plan_id, gate)?,
+    // #1459: human review is a FLOOR for an AI-authored plan, not a
+    // policy-dependent extra. This used to run only under
+    // `PolicyGate::NotConfigured`; every other gate went straight to
+    // `apply_policy_gate`, which returns `Ok(())` for `Allow` without
+    // consulting the marker. So configuring a `[policy]` block that resolved
+    // to `Allow` waived human review entirely — the protection was strongest
+    // with governance switched OFF, which is the opposite of what an operator
+    // would predict.
+    //
+    // `Allow` answers "may this principal do this?". The review gate answers
+    // "did a human read this machine-written change?". One is not an answer to
+    // the other, and `PolicyGate::RequireReview` already exists for estates
+    // that want policy to drive review.
+    //
+    // Order matters. The policy gate runs FIRST so its own refusals keep their
+    // wording and precedence: `Deny` still denies, and `RequireReview` without a
+    // marker still reports "policy requires human review" — which is what proves
+    // the kind-aware `ai_authored => agent` default is load-bearing.
+    //
+    // The marker check then runs unconditionally, catching the case policy lets
+    // through: `Allow` (and `NotConfigured`) return `Ok(())` without consulting
+    // the marker. Policy can therefore only TIGHTEN this gate, never waive it.
+    apply_policy_gate(root, plan_id, gate)?;
+    if !ai_plan_is_reviewed(root, plan_id) {
+        bail!(
+            "AI-authored plan '{plan_id}' has not been reviewed and approved. \
+             An AI agent authored this change, so it cannot be applied directly. \
+             Review the breaking-change report and approve it first with \
+             `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
+        );
     }
 
     // Resolve the post-apply verification checks before the run plan is moved.
@@ -3507,6 +3526,97 @@ async fn run_apply_replication_plan(
             .with_context(|| format!("failed to load config from {}", config_path.display()))?,
     );
     let rocky_cfg = &loaded.config;
+
+    // #1460: the plan's config snapshot had no reader. It was written at plan
+    // time and never compared, so changing the adapter, database path, schema
+    // template or strategy between plan and apply re-routed an approved plan to
+    // unreviewed SQL or a different destination, with the source-state check
+    // still passing because discovery was unchanged.
+    //
+    // Compared whole, deliberately. The field's own doc rejects extracting a
+    // "replication-relevant subset" as a footgun: a runtime dependency on a
+    // field outside the subset would silently break replay. So any config
+    // change invalidates the plan and you re-plan.
+    //
+    // TWO LIMITS worth knowing, because this comparison looks stronger than it
+    // is:
+    //
+    // 1. Secrets serialize as `"***"` by construction (`rocky_core::redacted`),
+    //    so this compares routing and shape, NOT credentials. Swapping the
+    //    password behind the same host is invisible.
+    // 2. It does not bind the STATE authority. `StateConfig.valkey_url` is
+    //    redacted whole, and the plan stores neither the resolved
+    //    `--state-path` nor the CLI state namespace — both come from the
+    //    caller at apply time. So a plan can compare equal here and still run
+    //    against a different watermark/freeze/budget ledger, which can mean an
+    //    unexpected full refresh or a freeze the reviewed authority recorded
+    //    going unseen.
+    //
+    // Closing (2) needs a credential-free state-authority identity persisted in
+    // the plan (backend, host/port/database, key prefix, resolved namespace).
+    // That is a payload change, tracked separately rather than bolted on here.
+    let live_config_snapshot = serde_json::to_value(rocky_cfg)
+        .context("failed to serialize the live config for the plan comparison")?;
+    if live_config_snapshot != replication_plan.config_snapshot {
+        let changed =
+            changed_config_sections(&replication_plan.config_snapshot, &live_config_snapshot);
+        bail!(
+            "config has changed since plan '{plan_id}' was created{}.\n\
+             The plan is the reviewed artifact, so applying it against a \
+             different config would run SQL nobody approved — a changed \
+             adapter, path, schema template or strategy redirects the write \
+             while the source state still matches.\n\
+             Nothing was written. Re-plan with `rocky plan` and apply the new \
+             plan_id.\n\
+             Note: credentials are redacted in the snapshot, so a changed \
+             secret is not detected here.",
+            if changed.is_empty() {
+                String::new()
+            } else {
+                format!(" (differing sections: {})", changed.join(", "))
+            }
+        );
+    }
+
+    // #1460: the config comparison above cannot see the state authority —
+    // `valkey_url` is redacted whole and the resolved `--state-path` is a
+    // caller argument, absent from the config. Compare the recorded identity so
+    // a plan cannot pass the config check and still apply against a different
+    // watermark/freeze/budget ledger.
+    //
+    // Absent means the plan predates this field; skip rather than refuse every
+    // older plan. New plans always record it.
+    //
+    // Warn rather than skip silently. A gate that disappears without a word is
+    // how an unbound plan reaches a different ledger unnoticed, and the absence
+    // is not self-announcing anywhere else. Whether an unbound plan should be
+    // refused outright is a policy question, not one to settle by default.
+    if replication_plan.state_authority.is_none() {
+        warn!(
+            target = "rocky::replication::state_authority",
+            plan_id = plan_id,
+            "plan records no state authority (written before that field existed); \
+             applying WITHOUT verifying the state store matches the reviewed one"
+        );
+    }
+    if let Some(reviewed_authority) = replication_plan.state_authority.as_deref() {
+        let live_authority =
+            crate::commands::plan::state_authority_identity(&rocky_cfg.state, state_path);
+        if live_authority != reviewed_authority {
+            bail!(
+                "state authority has changed since plan '{plan_id}' was created.\n\
+                 reviewed: {reviewed_authority}\n\
+                 now:      {live_authority}\n\
+                 Watermarks, freezes, budgets and idempotency keys live in the \
+                 state store, so applying against a different one can redo work \
+                 the reviewed ledger recorded as done, or miss a freeze it \
+                 recorded.\n\
+                 Nothing was written. Re-plan against the intended state store, \
+                 or re-run with the state path the plan was created with."
+            );
+        }
+    }
+
     let (_pipeline_name, pipeline) = crate::registry::resolve_replication_pipeline(
         rocky_cfg,
         replication_plan.pipeline.as_deref(),
@@ -3648,6 +3758,7 @@ async fn run_apply_replication_plan(
         // `--assume-fresh-state` is a `rocky run` runtime flag, never part of
         // a persisted plan — the replication apply path always runs without it.
         false,
+        Some((plan_id, replication_plan.source_state_snapshot.as_slice())), // #1460
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -3677,7 +3788,7 @@ async fn run_apply_replication_plan(
 /// under steady-state source-system churn. Unfiltered applies keep the
 /// strict semantics because any drift is structurally undefined.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DriftScope {
+pub(crate) enum DriftScope {
     /// Snapshots match — proceed normally.
     None,
     /// Drift exists but the active filter excludes every drifted connector
@@ -3732,7 +3843,7 @@ enum DriftScope {
 /// matches today (live) and every connector that matched at plan time
 /// (persisted) — that way a removed in-scope connector is correctly
 /// surfaced as in-scope drift even though `live` no longer carries it.
-fn decide_drift_scope(
+pub(crate) fn decide_drift_scope(
     persisted: &[ReplicationConnectorSnapshot],
     live: &[ReplicationConnectorSnapshot],
     filter: Option<&str>,
@@ -3842,7 +3953,22 @@ fn connector_matches_filter(
 /// source-state snapshot and the live one. Surfaced inside the
 /// stale-source bail message so operators see what changed without
 /// having to inspect the plan file by hand.
-fn summarize_source_state_drift(
+/// Top-level config sections that differ between two snapshots, so a refusal can
+/// say *what* changed instead of only that something did. Names only — values may
+/// contain redacted secrets and site-specific paths.
+fn changed_config_sections(persisted: &serde_json::Value, live: &serde_json::Value) -> Vec<String> {
+    let (Some(p), Some(l)) = (persisted.as_object(), live.as_object()) else {
+        return Vec::new();
+    };
+    let mut keys: std::collections::BTreeSet<&String> = p.keys().collect();
+    keys.extend(l.keys());
+    keys.into_iter()
+        .filter(|k| p.get(*k) != l.get(*k))
+        .map(ToString::to_string)
+        .collect()
+}
+
+pub(crate) fn summarize_source_state_drift(
     persisted: &[ReplicationConnectorSnapshot],
     live: &[ReplicationConnectorSnapshot],
 ) -> String {
@@ -4087,6 +4213,7 @@ pub async fn run_apply_inline_for_run(
         // `--assume-fresh-state` threads through from the CLI (main.rs
         // validated it against the configured `[state]` backend).
         assume_fresh_state,
+        None, // #1460: inline `rocky run`, not a persisted plan
     )
     .await
 }
@@ -4748,6 +4875,31 @@ auto_create_schemas = true
 version = 1
 "#;
 
+    /// #1459: a configured `[policy]` that resolves to `allow` for the agent
+    /// principal. This is the shape that used to waive human review entirely.
+    const ALLOW_POLICY_TOML: &str = r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "allow"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#;
+
     /// Config with an adapter + pipeline and NO `[policy]` block.
     const NO_POLICY_TOML: &str = r#"
 [adapter]
@@ -4833,6 +4985,48 @@ auto_create_schemas = true
         assert!(
             msg.contains("policy requires human review"),
             "must be refused by the policy plane (not just the marker gate), got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// #1459: a configured policy resolving to `allow` must NOT waive human
+    /// review for a machine-authored plan.
+    ///
+    /// The marker check used to run only under `PolicyGate::NotConfigured`.
+    /// Every other gate went to `apply_policy_gate`, which returns `Ok(())` for
+    /// `Allow` without consulting the marker — so configuring a `[policy]` block
+    /// switched the review gate OFF. The protection was strongest with
+    /// governance absent, which is backwards.
+    ///
+    /// `Allow` answers "may this principal do this?". Review answers "did a
+    /// human read this machine-written change?". Policy may tighten the gate
+    /// (`Deny`, `RequireReview`) but never waive it.
+    #[tokio::test]
+    async fn configured_allow_policy_does_not_waive_ai_review() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("rocky.toml"), ALLOW_POLICY_TOML)?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.models = vec!["orders".to_string()];
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+
+        let state = dir.path().join("state.redb");
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            PolicyPrincipal::Agent,
+            true,
+        )
+        .await
+        .expect_err("an allow policy must not let an unreviewed AI plan apply");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has not been reviewed and approved"),
+            "must be refused by the review gate even though policy allowed it, got: {msg}"
         );
         Ok(())
     }
@@ -7538,6 +7732,7 @@ schema_template = "s__{source}"
             branch: None,
             governance_override: None,
             config_snapshot: serde_json::json!({"adapter": {"default": {"type": "duckdb"}}}),
+            state_authority: None,
             source_state_snapshot: vec![ReplicationConnectorSnapshot {
                 id: "raw__orders".to_string(),
                 schema: "raw__orders".to_string(),
@@ -7548,6 +7743,196 @@ schema_template = "s__{source}"
                 }],
             }],
         }
+    }
+
+    /// #1460: a plan must not apply against a different state store.
+    ///
+    /// The config comparison cannot catch this. `valkey_url` is redacted whole,
+    /// so a Valkey A-to-B swap compares equal, and the resolved `--state-path`
+    /// is a caller argument that never appears in the config at all. Yet
+    /// watermarks, freezes, budgets and idempotency keys all live there — so a
+    /// plan reviewed against one ledger and applied against another can redo
+    /// work the first recorded as done, or miss a freeze it recorded.
+    #[tokio::test]
+    async fn replication_apply_refuses_a_changed_state_authority() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let reviewed_state = dir.path().join("reviewed.redb");
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        rp.state_authority = Some(crate::commands::plan::state_authority_identity(
+            &planned.state,
+            &reviewed_state,
+        ));
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        // Same config, DIFFERENT state store — the case config equality misses.
+        let other_state = dir.path().join("other.redb");
+        let err = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &other_state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("a different state store must not apply a plan reviewed against another");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("state authority has changed"),
+            "must refuse on the state-authority comparison, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// A plan written before the field existed must still apply. Absent means
+    /// "not recorded", not "mismatch" — otherwise this change would refuse
+    /// every plan already on disk.
+    #[tokio::test]
+    async fn replication_apply_tolerates_a_plan_without_a_state_authority() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        rp.state_authority = None; // pre-field plan
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        let res = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &dir.path().join("anywhere.redb"),
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await;
+
+        // Assert it got PAST the authority gate, not merely that it failed
+        // somewhere. Accepting any error would let this pass for an unrelated
+        // reason and prove nothing about legacy compatibility.
+        match res {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    !msg.contains("state authority has changed"),
+                    "an unrecorded authority must not refuse, got: {msg}"
+                );
+                // It must fail LATER than the gate — the gate sits before
+                // pipeline resolution, so a failure here means execution was
+                // reached. A failure naming the plan payload or the gate would
+                // mean the test never exercised the path.
+                assert!(
+                    !msg.contains("failed to read replication plan")
+                        && !msg.contains("is a ")
+                        && !msg.contains("config has changed"),
+                    "must fail after the plan/config/authority gates, not at one \
+                     of them — got: {msg}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// #1460: the plan's `config_snapshot` had no reader, so a config change
+    /// between plan and apply went undetected. Discovery was unchanged, so the
+    /// source-state check still passed, and the approved plan ran against a
+    /// different adapter, path, schema template or strategy.
+    ///
+    /// Uses a snapshot taken from the real config, then changes the config —
+    /// so this fails for the intended reason, not because the stub snapshot in
+    /// `minimal_replication_plan` never matches anything.
+    #[tokio::test]
+    async fn replication_apply_refuses_a_changed_config() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        // Snapshot the config exactly as plan time does.
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        // Redirect the write: same discovery, different destination catalog.
+        std::fs::write(
+            &cfg_path,
+            REPLICATION_TOML.replace(r#"catalog_template = "c""#, r#"catalog_template = "other""#),
+        )?;
+
+        let state = dir.path().join("state.redb");
+        let err = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("a changed config must not apply a plan reviewed against the old one");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config has changed since plan"),
+            "must refuse on the config comparison, got: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing was written"),
+            "the refusal must state nothing was written, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// The comparison must not fire when the config is untouched, or every
+    /// replication apply would refuse. Proves the refusal above is caused by
+    /// the change, not by the comparison always failing.
+    #[tokio::test]
+    async fn replication_apply_passes_the_config_check_when_unchanged() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        let state = dir.path().join("state.redb");
+        let res = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await;
+
+        // It may still fail further on (no live warehouse here). It must not
+        // fail on the config comparison.
+        if let Err(e) = res {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("config has changed since plan"),
+                "an unchanged config must pass the comparison, got: {msg}"
+            );
+        }
+        Ok(())
     }
 
     /// Round-trip: `ReplicationPlan` written to disk parses back into an

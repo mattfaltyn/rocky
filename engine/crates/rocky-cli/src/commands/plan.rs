@@ -517,6 +517,7 @@ pub async fn plan(
             pipeline_name,
             env,
             run_options,
+            state_path,
         ) {
             Ok((_replication_plan, plan_id, persisted_at)) => {
                 output.plan_id = Some(plan_id);
@@ -1319,6 +1320,86 @@ fn shadow_descriptor(run_options: &PlanRunOptions, value: Option<&String>) -> Op
     }
 }
 
+/// A credential-free identity for the state authority a plan was reviewed
+/// against: which ledger holds its watermarks, freezes, budgets and
+/// idempotency keys.
+///
+/// Needed because the plan's `config_snapshot` cannot answer this. `valkey_url`
+/// is a `RedactedString` and serializes whole as `"***"`, so a Valkey A-to-B
+/// swap compares equal; and the resolved `--state-path` never appears in the
+/// config at all, because it comes from the caller. A plan could therefore pass
+/// the config comparison and still apply against a different ledger — meaning an
+/// unexpected full refresh, or a freeze recorded in the reviewed authority going
+/// unseen.
+///
+/// Credential-free on purpose. For Valkey this keeps scheme, host, port and
+/// database and drops any `user:password@`, so the identity is comparable
+/// without the plan payload carrying a secret. `expose()` is the audited
+/// accessor; the exposed value is parsed and discarded, never stored.
+pub(crate) fn state_authority_identity(
+    state: &rocky_core::config::StateConfig,
+    state_path: &std::path::Path,
+) -> String {
+    use rocky_core::config::StateBackend;
+    // The remote ledger key embeds the state schema version
+    // (`state_sync.rs`: `format!("v{}", current_schema_version())`), so two
+    // versions are two different objects. Without this, a plan made before a
+    // schema upgrade compares equal afterwards while the new binary reads a
+    // different ledger — losing the reviewed watermarks, budgets and freezes.
+    let mut parts = vec![
+        format!("backend={:?}", state.backend),
+        format!("schema=v{}", rocky_core::state::current_schema_version()),
+    ];
+    match state.backend {
+        StateBackend::S3 => {
+            parts.push(format!(
+                "bucket={}",
+                state.s3_bucket.as_deref().unwrap_or("")
+            ));
+            parts.push(format!(
+                "prefix={}",
+                state.s3_prefix.as_deref().unwrap_or("")
+            ));
+        }
+        StateBackend::Gcs => {
+            parts.push(format!(
+                "bucket={}",
+                state.gcs_bucket.as_deref().unwrap_or("")
+            ));
+            parts.push(format!(
+                "prefix={}",
+                state.gcs_prefix.as_deref().unwrap_or("")
+            ));
+        }
+        _ => {}
+    }
+    if let Some(url) = state.valkey_url.as_ref() {
+        // Keep only where it points. Two secret carriers to remove, not one:
+        //
+        //   redis://user:pass@host:6379/0   -> userinfo before the LAST '@'
+        //                                      (last, because a password may
+        //                                       itself contain '@')
+        //   redis://host:6379?password=xyz  -> query string
+        //
+        // Stripping only the userinfo would write the second form's secret into
+        // a plan file on disk.
+        let raw = url.expose();
+        let (scheme, rest) = raw.split_once("://").unwrap_or(("", raw));
+        let no_userinfo = rest.rsplit_once('@').map_or(rest, |(_creds, host)| host);
+        let no_query = no_userinfo
+            .split_once('?')
+            .map_or(no_userinfo, |(host, _query)| host);
+        let no_fragment = no_query
+            .split_once('#')
+            .map_or(no_query, |(host, _frag)| host);
+        parts.push(format!("valkey={scheme}://{no_fragment}"));
+    }
+    // The local ledger is identified by its resolved path, which the config
+    // never carries.
+    parts.push(format!("path={}", state_path.display()));
+    parts.join(" ")
+}
+
 fn build_and_persist_replication_plan(
     rocky_cfg: &rocky_core::config::RockyConfig,
     connectors: &[DiscoveredConnector],
@@ -1326,9 +1407,11 @@ fn build_and_persist_replication_plan(
     pipeline: Option<&str>,
     env: Option<&str>,
     run_options: &PlanRunOptions,
+    state_path: &std::path::Path,
 ) -> Result<(ReplicationPlan, String, chrono::DateTime<Utc>)> {
     let config_snapshot = serde_json::to_value(rocky_cfg)
         .context("failed to serialize RockyConfig for replication plan")?;
+    let state_authority = state_authority_identity(&rocky_cfg.state, state_path);
     let source_state_snapshot = build_source_state_snapshot(connectors);
 
     let replication_plan = ReplicationPlan {
@@ -1359,6 +1442,7 @@ fn build_and_persist_replication_plan(
         branch: run_options.branch.clone(),
         governance_override: run_options.governance_override.clone(),
         config_snapshot,
+        state_authority: Some(state_authority),
         source_state_snapshot,
     };
 
@@ -2235,6 +2319,63 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    /// The identity must change across a state-schema version bump, because the
+    /// remote ledger key embeds it. Without this a plan made under one version
+    /// compares equal under the next while reading a different object.
+    #[test]
+    fn state_authority_identity_includes_the_state_schema_version() {
+        use rocky_core::config::StateConfig;
+        let st = StateConfig::default();
+        let got = super::state_authority_identity(&st, std::path::Path::new("/s.redb"));
+        assert!(
+            got.contains(&format!(
+                "schema=v{}",
+                rocky_core::state::current_schema_version()
+            )),
+            "identity must record the state schema version, got: {got}"
+        );
+    }
+
+    /// The state-authority identity is persisted to a plan file on disk, so it
+    /// must carry no secret in ANY valkey URL form. Stripping only the
+    /// `user:pass@` userinfo leaves a `?password=` query intact.
+    #[test]
+    fn state_authority_identity_strips_every_credential_form() {
+        use rocky_core::config::{StateBackend, StateConfig};
+        let ident = |url: &str| {
+            let st = StateConfig {
+                backend: StateBackend::Valkey,
+                valkey_url: Some(rocky_core::redacted::RedactedString::new(url.to_string())),
+                ..Default::default()
+            };
+            super::state_authority_identity(&st, std::path::Path::new("/s.redb"))
+        };
+
+        for (url, secret) in [
+            ("redis://user:hunter2@h:6379/0", "hunter2"),
+            ("redis://:hunter2@h:6379", "hunter2"),
+            ("redis://user:p@ss@h:6379", "p@ss"),
+            ("redis://h:6379?password=hunter2", "hunter2"),
+            ("redis://h:6379/0#hunter2", "hunter2"),
+        ] {
+            let got = ident(url);
+            assert!(
+                !got.contains(secret),
+                "identity for {url} leaked the secret: {got}"
+            );
+            assert!(
+                got.contains("h:6379"),
+                "identity for {url} lost the host it exists to compare: {got}"
+            );
+        }
+
+        assert_ne!(
+            ident("redis://a:6379/0"),
+            ident("redis://b:6379/0"),
+            "different hosts must produce different identities"
+        );
+    }
     use std::sync::Arc;
 
     use super::*;
