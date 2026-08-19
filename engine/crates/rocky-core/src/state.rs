@@ -818,7 +818,7 @@ impl StateStore {
     /// binary (stored > current) an error is returned immediately so that the
     /// caller can surface a clear message rather than silently misreading data.
     pub fn open(path: &Path) -> Result<Self, StateError> {
-        Self::open_inner(path, OpenMode::ReadWrite, SchemaMismatchPolicy::Fail)
+        Self::open_inner(path, OpenMode::ReadWrite, SchemaMismatchPolicy::Fail, None)
     }
 
     /// Opens or creates a state store for **writing** with an explicit
@@ -837,7 +837,7 @@ impl StateStore {
     /// `[state] on_schema_mismatch`); every other caller uses the hard-fail
     /// default via [`open`][Self::open].
     pub fn open_with_policy(path: &Path, policy: SchemaMismatchPolicy) -> Result<Self, StateError> {
-        Self::open_inner(path, OpenMode::ReadWrite, policy)
+        Self::open_inner(path, OpenMode::ReadWrite, policy, None)
     }
 
     /// Opens an existing state store for **read-only** access.
@@ -857,7 +857,52 @@ impl StateStore {
     /// millisecond-scale collisions the LSP creates on every debounced
     /// keystroke.
     pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
-        Self::open_inner(path, OpenMode::ReadOnly, SchemaMismatchPolicy::Fail)
+        Self::open_inner(path, OpenMode::ReadOnly, SchemaMismatchPolicy::Fail, None)
+    }
+
+    /// [`StateStore::open_read_only`] with an explicit redb cache budget, for
+    /// **request-local** opens: open, read once, drop.
+    ///
+    /// redb's default cache capacity (~1 GiB) is sized for a long-lived
+    /// handle that re-reads pages. A request-local store can never reuse its
+    /// cache — it is dropped one response later — yet a full-table read
+    /// (`list_runs` pass 1 visits every `RUN_HISTORY` row) fills the cache
+    /// with pages the process immediately frees. Freeing them does not return
+    /// the RSS on Linux/glibc — measured, not a proven allocator mechanism —
+    /// so a polled `GET /api/v1/runs` ratchets serve's RSS with history size:
+    /// one request retained +8.6 MB at 1,435 rows and +211 MB at 50,000 rows
+    /// under the default budget, vs +1.0 MB and +4.0 MB under a 1 MiB budget,
+    /// and no latency cost: at 50,000 rows the budgeted arm measured p99
+    /// 187ms against 205ms unbudgeted, so the cap is not a trade — #1399.
+    /// Callers holding a store open to serve repeated reads should
+    /// keep using [`open_read_only`][Self::open_read_only] — a real cache
+    /// helps there.
+    pub fn open_read_only_with_cache(path: &Path, cache_bytes: usize) -> Result<Self, StateError> {
+        Self::open_inner(
+            path,
+            OpenMode::ReadOnly,
+            SchemaMismatchPolicy::Fail,
+            Some(cache_bytes),
+        )
+    }
+
+    /// redb's count of pages evicted from its read cache since this handle
+    /// was opened.
+    ///
+    /// Exists so a test can prove the cache budget passed to
+    /// [`open_read_only_with_cache`][Self::open_read_only_with_cache] is
+    /// actually in force. A parity test (same rows in, same rows out)
+    /// cannot: it passes unchanged when the budget is dropped, because a
+    /// bigger cache reads the same data. Evictions only happen when a cache
+    /// is small enough to fill, so a non-zero count is direct evidence the
+    /// cap bound.
+    ///
+    /// redb gates this counter behind its `cache_metrics` feature, which
+    /// this crate enables for test builds only (see `[dev-dependencies]`).
+    /// Without it the counter is hard-zero and proves nothing.
+    #[cfg(test)]
+    fn cache_evictions(&self) -> u64 {
+        self.db.cache_stats().evictions()
     }
 
     /// Reads the schema version stamped in an on-disk state file **without**
@@ -881,7 +926,7 @@ impl StateStore {
         if !path.exists() {
             return Ok(None);
         }
-        let db = open_redb_with_retry(path)?;
+        let db = open_redb_with_retry(path, None)?;
         let txn = db.begin_read()?;
         let metadata = match txn.open_table(METADATA) {
             Ok(table) => table,
@@ -956,6 +1001,7 @@ impl StateStore {
         path: &Path,
         mode: OpenMode,
         policy: SchemaMismatchPolicy,
+        cache_budget: Option<usize>,
     ) -> Result<Self, StateError> {
         // Acquire the advisory lock BEFORE opening the database — otherwise two
         // concurrent writers could both pass `Database::create` before either
@@ -967,7 +1013,7 @@ impl StateStore {
             None
         };
 
-        let db = open_redb_with_retry(path)?;
+        let db = open_redb_with_retry(path, cache_budget)?;
 
         match Self::init_db(&db, path, mode, policy)? {
             InitOutcome::Ready => Ok(StateStore {
@@ -1011,7 +1057,7 @@ impl StateStore {
                         path: path.display().to_string(),
                     });
                 }
-                let db = open_redb_with_retry(path)?;
+                let db = open_redb_with_retry(path, cache_budget)?;
                 match Self::init_db(&db, path, mode, policy)? {
                     InitOutcome::Ready => Ok(StateStore {
                         db,
@@ -1536,9 +1582,16 @@ thread_local! {
 /// This does NOT fix the writer-vs-CLI race during a long `rocky run`
 /// (the writer holds the lock for seconds-to-minutes); inspection commands
 /// will still hit `Busy` in that scenario, but with a clear next step.
-fn open_redb_with_retry(path: &Path) -> Result<Database, StateError> {
+fn open_redb_with_retry(path: &Path, cache_budget: Option<usize>) -> Result<Database, StateError> {
+    // `None` preserves redb's default cache capacity (~1 GiB). A budget is
+    // only threaded through for request-local opens that read once and drop
+    // the handle — see [`StateStore::open_read_only_with_cache`] for why.
+    let create = |path: &Path| match cache_budget {
+        Some(bytes) => Database::builder().set_cache_size(bytes).create(path),
+        None => Database::create(path),
+    };
     for attempt in 0..REDB_OPEN_RETRY_ATTEMPTS {
-        match Database::create(path) {
+        match create(path) {
             Ok(db) => return Ok(db),
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
                 #[cfg(test)]
@@ -6551,6 +6604,99 @@ mod tests {
         assert!(
             runs.windows(2).all(|w| w[0].started_at >= w[1].started_at),
             "the page must be ordered newest first"
+        );
+    }
+
+    /// The cache-budgeted read-only open must be a pure resource-limit
+    /// variant: same rows, same order, same page as the default open. A
+    /// budget that leaked into read semantics (truncated pages, reordered
+    /// rows, schema-init drift) would corrupt `/runs` under #1399's fix.
+    #[test]
+    fn open_read_only_with_cache_reads_identically() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            let base = Utc::now();
+            for i in 0..60u32 {
+                store
+                    .record_run(&run_at(
+                        &format!("run-{i:03}"),
+                        base + chrono::Duration::minutes(i64::from(i)),
+                    ))
+                    .unwrap();
+            }
+        }
+        let default_page = StateStore::open_read_only(&path)
+            .unwrap()
+            .list_runs(50)
+            .unwrap();
+        let budgeted_page = StateStore::open_read_only_with_cache(&path, 1 << 20)
+            .unwrap()
+            .list_runs(50)
+            .unwrap();
+        assert_eq!(default_page.len(), 50);
+        let ids = |page: &[RunRecord]| {
+            page.iter()
+                .map(|r| (r.run_id.clone(), r.started_at))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&default_page),
+            ids(&budgeted_page),
+            "a cache budget must not change what a read-only open reads"
+        );
+    }
+
+    /// The cap must actually BIND, not merely be passed.
+    ///
+    /// The parity test above is not evidence of that: it reads the same
+    /// rows whether or not a budget is set, so it passes with the
+    /// `set_cache_size` call deleted. This one fails when the cap is
+    /// dropped, because redb only evicts pages when its cache is small
+    /// enough to fill — with the default (~1 GiB) against this fixture,
+    /// evictions stay at zero.
+    #[test]
+    fn a_cache_budget_actually_constrains_redb() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            let base = Utc::now();
+            // Enough rows that a 64 KiB cache cannot hold the pages a full
+            // history scan touches.
+            for i in 0..4_000u32 {
+                store
+                    .record_run(&run_at(
+                        &format!("run-{i:05}"),
+                        base + chrono::Duration::seconds(i64::from(i)),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        // Scoped: redb refuses a second handle to an open file (`Busy`), so
+        // each open must be dropped before the next.
+        let budgeted_evictions = {
+            let budgeted = StateStore::open_read_only_with_cache(&path, 64 * 1024).unwrap();
+            let _ = budgeted.list_runs(4_000).unwrap();
+            budgeted.cache_evictions()
+        };
+        let default_evictions = {
+            let default = StateStore::open_read_only(&path).unwrap();
+            let _ = default.list_runs(4_000).unwrap();
+            default.cache_evictions()
+        };
+
+        assert_eq!(
+            default_evictions, 0,
+            "the default cache is large enough to hold this fixture; a \
+             non-zero count here means the fixture no longer discriminates"
+        );
+        assert!(
+            budgeted_evictions > 0,
+            "a 64 KiB budget must force evictions during a 4000-run scan — \
+             got {budgeted_evictions}, which means the cap is not in force"
         );
     }
 
