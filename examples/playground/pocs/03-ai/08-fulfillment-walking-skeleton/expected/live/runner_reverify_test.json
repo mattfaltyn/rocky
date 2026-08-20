@@ -1,0 +1,34 @@
+{
+  "version": "1.71.0",
+  "command": "test",
+  "total": 0,
+  "passed": 0,
+  "failed": 0,
+  "failures": [],
+  "model_results": [],
+  "declarative": {
+    "total": 2,
+    "passed": 2,
+    "failed": 0,
+    "warned": 0,
+    "errored": 0,
+    "results": [
+      {
+        "model": "revenue_daily",
+        "table": "wh.out.revenue_daily",
+        "test_type": "composite",
+        "status": "pass",
+        "severity": "error",
+        "sql": "SELECT client_id, day, COUNT(*) FROM wh.out.revenue_daily GROUP BY client_id, day HAVING COUNT(*) > 1"
+      },
+      {
+        "model": "revenue_daily",
+        "table": "wh.out.revenue_daily",
+        "test_type": "expression",
+        "status": "pass",
+        "severity": "error",
+        "sql": "SELECT COUNT(*) FROM wh.out.revenue_daily WHERE NOT (revenue_eur >= 0)"
+      }
+    ]
+  }
+}

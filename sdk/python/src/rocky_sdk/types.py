@@ -1274,6 +1274,7 @@ from .types_generated import (  # noqa: E402, F401
     ExecutedRunOutput,
     FailedSourceOutput,
     FreshnessConfigOutput,
+    FulfillOutput,
     GcApplyOutput,
     HistoryOutput,
     JobStatus,
@@ -1476,6 +1477,7 @@ RockyOutput = (
     | ProductCompileOutput
     | ProductStatusOutput
     | ProductVerifyOutput
+    | FulfillOutput
     | ReviewStatusOutput
 )
 
@@ -1520,6 +1522,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "product_compile": ProductCompileOutput,
     "product_approve": ProductApproveOutput,
     "product_status": ProductStatusOutput,
+    "fulfill": FulfillOutput,
 }
 
 
