@@ -1,0 +1,10 @@
+{
+  "version": "1.71.0",
+  "command": "fulfill",
+  "product": "revenue_daily",
+  "product_id": "product:revenue_daily",
+  "state": "observing",
+  "message": "product revenue_daily is applied; MAX(loaded_at) = 2026-08-20 12:12:05 UTC, lag 0s, budget 86400s",
+  "spec_digest": "sha256:978af3b411e92dd0ec76b587d5c855f685420554c912ecd2482fa2d6f1e7de2d",
+  "plan_id": "c9dda25def1260199b5fd17f4c7884da32a83c35d28fb28414afb14768abb9f8"
+}
