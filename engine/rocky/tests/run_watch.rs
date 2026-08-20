@@ -481,3 +481,115 @@ fn touch(p: &Path) {
     let bytes = fs::read(p).expect("read for touch");
     fs::write(p, bytes).expect("write for touch");
 }
+
+/// SIGTERM must stop the watcher.
+///
+/// Before #1405 the steady-state `select!` had no SIGTERM arm at all, so once
+/// the first run had replaced the default disposition the watcher could not be
+/// killed by `timeout`, a CI job cancellation, or a container eviction — only
+/// by SIGKILL. That is deterministic, unlike the SIGINT race in the test
+/// above, which is why this is the test that pins the fix.
+#[test]
+fn run_watch_exits_on_sigterm() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    let db_path = dir.join("fixture.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db_path).expect("open duckdb");
+        conn.execute_batch(SEED_SQL).expect("seed sql");
+    }
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write rocky.toml");
+
+    // Clock starts BEFORE the spawn: everything up to the first completion
+    // line is part of one run's cost, and on a loaded machine the gap is most
+    // of it (#1315). The shutdown deadline is then expressed in run-times, not
+    // seconds — a flat wall-clock deadline asserts a property of the machine,
+    // which is exactly how the first version of this test failed on CI while
+    // passing locally.
+    let calibration_start = Instant::now();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("-c")
+        .arg(dir.join("rocky.toml"))
+        .arg("run")
+        .arg("--watch")
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rocky");
+
+    let pid = child.id();
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_rx = spawn_line_reader(stderr);
+
+    // Wait for the FIRST RUN TO FINISH, not merely for the watcher to start.
+    //
+    // This distinction is the whole test. Before the first run, SIGTERM still
+    // has its default disposition and kills the process no matter what the
+    // watch loop does — so signalling early passes with or without the fix
+    // and proves nothing. The inner run installs a SIGTERM handler of its
+    // own; when the run ends that handler is dropped, but tokio does NOT
+    // restore the default disposition. Only from that moment does a missing
+    // arm in the watch loop mean SIGTERM is swallowed.
+    let mut seen = String::new();
+    let mut ready = false;
+    let bootstrap_deadline = Instant::now() + BOOTSTRAP_BUDGET;
+    while Instant::now() < bootstrap_deadline {
+        match stderr_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) => {
+                seen.push_str(&line);
+                seen.push('\n');
+                if line.contains("[watch] run completed") || line.contains("[watch] run failed") {
+                    ready = true;
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        ready,
+        "watcher never completed a first run; stderr so far:\n{seen}"
+    );
+    let one_run = calibration_start.elapsed();
+
+    sigterm(pid);
+
+    // Poll for exit rather than blocking: a hung watcher must fail the test,
+    // not hang the suite.
+    let budget = scaled_budget(one_run, SHUTDOWN_BUDGET_RUNS);
+    let deadline = Instant::now() + budget;
+    let mut exited = None;
+    while Instant::now() < deadline {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                exited = Some(status);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+
+    // Reap on every path: `try_wait` only reaps when it returns `Some`, so a
+    // watcher that ignored the signal must be killed AND waited on, or the
+    // test leaves a zombie behind (clippy::zombie_processes).
+    if exited.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    assert!(
+        exited.is_some(),
+        "rocky run --watch ignored SIGTERM for {budget:?} (one run measured \
+         {one_run:?}) — before #1405 the watch select had no SIGTERM arm, so \
+         only SIGKILL could stop it. If one_run is far above a few seconds \
+         this machine is loaded rather than rocky being stuck."
+    );
+}
