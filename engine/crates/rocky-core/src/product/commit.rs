@@ -472,10 +472,12 @@ fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions
 /// nothing has no deletion window at all. Between a stale backup and
 /// deleting a bystander's file, the stale backup is the recoverable one.
 ///
-/// The orphan is therefore handled where it is consumed: restore must
-/// consult the journal's `has_prev` instead of trusting a backup it finds
-/// on disk. Tracked separately — this function's job is to not make it
-/// worse.
+/// The orphan is therefore handled where it is consumed, and that half has
+/// landed: [`recover_generation`] restores only what the journal's
+/// `has_prev` records, and refuses a backup it does not know about
+/// (`commit-unexpected-backup`, #1502). So a partial `.ff-prev` left here
+/// is inert rather than dangerous — this function's job is only to not
+/// make it worse.
 fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
     let (bytes, permissions) = read_no_follow(src)?;
     let backup = create_new_no_follow(dst, Some(0o600))?;
