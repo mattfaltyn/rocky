@@ -42,6 +42,11 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::apply_plan",
     "rocky_cli::commands::fulfill_api::compile_output",
     "rocky_cli::commands::fulfill_api::compute_review_status",
+    // Asks the DECLARATIVE runner's own loader how many checks it would
+    // execute, so the deferred count the verify bundle reports is the
+    // executed set by construction (it includes `[[use_test]]`
+    // expansion, which reading the sidecar's raw array misses).
+    "rocky_cli::commands::fulfill_api::declarative_test_count",
     "rocky_cli::commands::fulfill_api::lookup_apply_receipt",
     "rocky_cli::commands::fulfill_api::observe_max_time_column",
     "rocky_cli::commands::fulfill_api::print_json",
