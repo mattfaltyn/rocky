@@ -53,7 +53,7 @@ does. The tools are named so the loop reads in sequence.
                 ▼
         ┌────────────────┐   rocky review <plan_id> --approve
         │ 6. a human     │   rocky apply  <plan_id>
-        │    approves    │   The agent never approves for you.
+        │    approves    │   No MCP tool writes that approval.
         └────────────────┘
 ```
 
@@ -93,7 +93,9 @@ See [MCP Authoring](/concepts/mcp-authoring/) for every tool in both families.
 ## The three gates
 
 Nothing an agent produces reaches your warehouse without clearing three
-independent checks.
+independent checks. The engine performs all three in code.
+[What the three gates do not defend against](#what-the-three-gates-do-not-defend-against)
+states what each check actually verifies, and where that stops.
 
 ```
    the agent's draft
@@ -113,10 +115,11 @@ independent checks.
           │ allowed
           ▼
    ┌──────────────┐   rocky review <plan_id> --approve
-   │ gate 3       │   The engine refuses to apply an
-   │ a human      │   AI-authored plan without it.
+   │ gate 3       │   writes an approval marker. Apply
+   │ the approval │   refuses an AI-authored plan unless
+   │ marker       │   a marker names that exact plan.
    └──────┬───────┘
-          │ approved
+          │ marker matches
           ▼
    rocky apply <plan_id>  ──►  your warehouse
 ```
@@ -128,16 +131,92 @@ write, not on a second round-trip.
 **Gate 2, your policy rules.** A `[policy]` block in `rocky.toml` states who may
 change what. Rocky evaluates every `draft_*` and `propose` call against it before
 anything persists. A `deny` removes a new file, or restores the prior content of
-a file the agent re-drafted, so a denial leaves nothing behind. Every decision,
-including each denial, is written to the audit ledger. This is the same evaluator
-that gates `apply` and `promote`, so an agent learns the verdict with the write
-rather than three steps later. See
+a file the agent re-drafted, so a denial leaves nothing behind. This is the same
+evaluator that gates `apply` and `promote`, so an agent learns the verdict with
+the write rather than three steps later. See
 [Cross-team contracts](/concepts/cross-team-contracts/) for how the rules are
 written.
 
-**Gate 3, a human.** `propose` writes a plan marked as AI-authored. `rocky apply`
-refuses to run one until a person approves it. The engine enforces this, not a
-convention the prompts ask the agent to follow.
+Rocky records policy decisions in an audit ledger, and `rocky audit` lists them.
+Read that ledger as a best-effort record, not as proof. The write is best-effort
+wherever it happens, on `apply` and on the `draft_*` and `propose` tools alike: a
+failed write warns and lets the operation continue. Some refusals never reach the
+ledger at all, because a request refused before the rules are evaluated returns
+its verdict without writing a row. If you need a decision to be provably
+recorded, the ledger does not give you that today.
+
+**Gate 3, the approval marker.** `propose` writes a plan marked as AI-authored.
+`rocky apply` refuses to run one unless an approval marker is present that parses
+and names that exact plan. `rocky review <plan-id> --approve` is the command that
+writes that marker, and no MCP tool writes it.
+
+Be exact about what this check verifies. It reads a file, parses it, and compares
+the plan id. It does not authenticate who approved, or that a person approved at
+all. That check is a floor: it runs on every AI-authored apply whatever your
+`[policy]` rules say, so an `allow` rule cannot waive it, and a policy rule can
+only add restrictions on top. What the marker cannot tell you is covered below.
+
+## What the three gates do not defend against
+
+The gates are checks in the engine, and they hold against the case they are
+built for. They still have a boundary. This section states where it sits, so you
+can decide what else you need.
+
+The gates defend against mistakes, against drift steered by content the agent
+read, and against tool misuse. They are not a sandbox. The agent, the plan
+store, and the approval markers all sit on one machine, under one user account.
+
+```
+   ┌─ your machine, your user account ─────────────────────────┐
+   │                                                           │
+   │   agent ──► gate 1 ──► gate 2 ──► gate 3 ──► apply         │
+   │             compiler   policy     marker                  │
+   │                                     ▲                     │
+   │                                     │ an unsigned file    │
+   │                                     │ that any process    │
+   │                                     │ of yours can write  │
+   └───────────────────────────────────────────────────────────┘
+     the gates sit inside this box. They do not draw the box.
+```
+
+**The approval marker is not signed.** `rocky review <plan-id> --approve` writes
+a JSON file next to the plan. Rocky checks that the file parses and that it names
+the exact plan being applied. A malformed or mispasted marker is refused with its
+own error, and never counts as an approval. The file still carries no signature.
+It proves that an approval was recorded on this machine, not who wrote the bytes.
+Signed approvals are planned work, not shipped work.
+
+**The author stamp on a plan is a label, not a boundary.** A plan records the
+principal that authored it, and `rocky audit` reports it. That field sits outside
+the plan's content digest, so nothing stops it being edited. Rocky therefore does
+not enforce against it. It enforces against the plan's kind together with the
+principal at apply time, and uses whichever of the two is more restrictive. An
+AI-authored plan carrying no stamp still counts as agent-authored, which is the
+safe direction.
+
+**A process-group kill does not hold a process that leaves the group.** The
+fulfillment loop runs its drafting agent in a separate process group, and kills
+the whole group when the task ends. A descendant that puts itself in a new
+session with `setsid` leaves that group. The operating system re-parents it, and
+it survives the kill. A test exhibits the escape, so the limit cannot quietly
+turn into a false guarantee. Sandboxing at the operating-system level is the
+planned fix. Tracked in
+[#1491](https://github.com/rocky-data/rocky/issues/1491).
+
+**A directory swapped mid-write is still a race.** The fulfillment loop commits
+its files with `O_NOFOLLOW` and creates them with `O_EXCL`, so a symbolic link
+planted at the final path is refused. It does not use directory-relative system
+calls, so a directory component replaced between the check and the open stays a
+window. `O_NOFOLLOW` is a Unix flag. On Windows one backup read follows a link.
+The approval marker is written by a different path. That path writes a temporary
+file and renames it into place, so you never read a half-written marker. The
+rename is the only guarantee it makes. It does not open with `O_NOFOLLOW`, and it
+does not remove a marker that is already there.
+
+None of this changes what the gates do for the case they are built for: an agent
+you chose, running your prompt, making a mistake or being steered by something it
+read. It does mean two things. Point Rocky at an agent binary you trust. Treat
+the machine that runs it as trusted too.
 
 ## Why a warehouse grant is not enough
 
