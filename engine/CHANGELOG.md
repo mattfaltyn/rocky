@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`[rules] no_new_nullable` is now enforced.** The rule parsed since it was introduced and ran nowhere — the product lowering layer knew, and refused to emit the key precisely because "the engine parses that rule and enforces it nowhere, so emitting it would promise a guard that does not run." A nullable output column the contract does not declare in `[[columns]]` is now an error (**E014**). Setting the rule with no `[[columns]]` is also E014: without a declared baseline, "new" has no meaning, and refusing beats the two silent readings (every nullable column is new, or none is). **Enforcement is opt-in** — `no_new_nullable` defaults to false, so this can only fail a project that explicitly asked for the guard. (#1467)
+
 ### Fixed
 
 - **`rocky test-adapter` no longer reports a pass for conformance specs it never ran.** The conformance runner implements exactly one check (`format_table_ref`); every other spec — connect, statement execution, schema and table lifecycle, grants, batch checks, discovery — fell through a `_ => Pass` catch-all. A full-capability adapter therefore printed **26 passing conformance tests having executed one**. Those specs now report `Skipped` with the reason, and `tests_run` counts only real work. Exit status is unchanged (it keys on failures), so no pipeline breaks — but a run that used to print 26 passed now prints 1 accounted-for and 25 skipped, which is the honest number. (#475)
