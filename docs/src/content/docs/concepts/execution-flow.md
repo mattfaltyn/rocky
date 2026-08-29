@@ -247,7 +247,9 @@ Exit code:
 
 ## Checkpoint and resume
 
-A run can be interrupted mid-layer by a killed process or a network failure. Rocky can resume it from the last successful checkpoint, but only when you ask for it. Pass `--resume-latest` or `--resume <run-id>`. Without one of those flags the next run starts fresh and rebuilds every selected table.
+A replication run can be interrupted mid-layer by a killed process or a network failure. Rocky can resume it from the last successful checkpoint, but only when you ask for it. Pass `--resume-latest` or `--resume <run-id>`. Without one of those flags the next run starts fresh and rebuilds every selected table.
+
+Resume flags fail if the checkpoint is missing or unreadable. Other pipeline types and mixed replication/model runs reject them because they do not record compatible per-table resume checkpoints. With a remote state backend, resume also requires an authoritative restore; an absent or unreachable remote state refuses recovery even if a stale local state file exists.
 
 The state store records which tables completed in the `run_progress_entries` table, one entry per `run_id` plus table, with a `run_progress` header row per `run_id`. `rocky run --resume-latest` looks up the most recent `run_id`, reads which tables already completed, and skips them.
 

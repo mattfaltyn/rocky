@@ -321,8 +321,8 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Plan both replication and compiled models. |
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with the defaults. Resolved at plan time and stored in the plan. |
-| `--resume <RUN_ID>` | `string` | | Resume a specific previous run from its last checkpoint. Mints a new `run_id` and records the prior one as `resumed_from`. |
-| `--resume-latest` | `bool` | `false` | Resume the most recent failed run from its last checkpoint. Which run that is gets resolved at apply time, not plan time. |
+| `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint. Mints a new `run_id` and records the prior one as `resumed_from`. |
+| `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint. Which run that is gets resolved at apply time, not plan time. |
 | `--shadow` | `bool` | `false` | Write to shadow targets instead of production. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
 | `--shadow-schema <NAME>` | `string` | | Override the schema for shadow tables. Mutually exclusive with `--shadow-suffix`. |
@@ -549,8 +549,8 @@ rocky run [flags]
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
-| `--resume <RUN_ID>` | `string` | | Resume a specific previous run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. |
-| `--resume-latest` | `bool` | `false` | Resume the most recent failed run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. |
+| `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. |
+| `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. |
 | `--shadow` | `bool` | `false` | Run in shadow mode: write to shadow targets instead of production. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
 | `--shadow-schema <NAME>` | `string` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
@@ -643,7 +643,7 @@ Run both replication and model transformations:
 rocky run --filter client=acme --models models/ --all
 ```
 
-Resume the most recent failed run from its last checkpoint:
+Resume the most recent failed replication run from its last checkpoint:
 
 ```bash
 rocky run --filter client=acme --resume-latest
