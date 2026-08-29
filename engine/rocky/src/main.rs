@@ -787,11 +787,11 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
         all: bool,
-        /// Resume a failed run; mints a new `run_id` and records the prior one as `resumed_from`.
+        /// Resume a failed replication run; mints a new `run_id` and records the prior one as `resumed_from`.
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
         resume: Option<String>,
-        /// Resume the most recent failed run; mints a new `run_id` and records the prior one as `resumed_from`.
+        /// Resume the most recent failed replication run; mints a new `run_id` and records the prior one as `resumed_from`.
         /// Resolved against the state store at apply time.
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
@@ -945,10 +945,10 @@ enum Command {
         /// Execute both replication and compiled models
         #[arg(long)]
         all: bool,
-        /// Resume a failed run; mints a new `run_id` and records the prior one as `resumed_from`
+        /// Resume a failed replication run; mints a new `run_id` and records the prior one as `resumed_from`
         #[arg(long)]
         resume: Option<String>,
-        /// Resume the most recent failed run; mints a new `run_id` and records the prior one as `resumed_from`
+        /// Resume the most recent failed replication run; mints a new `run_id` and records the prior one as `resumed_from`
         #[arg(long)]
         resume_latest: bool,
         /// Run in shadow mode: write to shadow targets instead of production
