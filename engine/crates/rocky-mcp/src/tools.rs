@@ -5521,6 +5521,103 @@ mod tests {
     /// named as NOT available, the hand-off named as the ending) and serves
     /// the skill text below it UNCHANGED; the default profile serves the
     /// skill text verbatim, byte-identical to the compiled file.
+    /// Every `paths:` list in a workflow, as its quoted entries. Enough YAML
+    /// to check a trigger filter without taking a parser dependency: a
+    /// `paths:` line, then the `- '...'` entries indented under it.
+    fn workflow_path_lists(workflow: &str) -> Vec<Vec<String>> {
+        let mut lists = Vec::new();
+        let mut lines = workflow.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim() != "paths:" {
+                continue;
+            }
+            let mut entries = Vec::new();
+            while let Some(next) = lines.peek() {
+                let t = next.trim();
+                if t.starts_with('#') {
+                    lines.next();
+                    continue;
+                }
+                let Some(value) = t.strip_prefix("- ") else {
+                    break;
+                };
+                entries.push(value.trim_matches('\'').trim_matches('"').to_string());
+                lines.next();
+            }
+            lists.push(entries);
+        }
+        lists
+    }
+
+    /// `include_str!` reaches OUT of `engine/` for the AI-workflow skill, so
+    /// that file is part of the engine build: editing it changes what `rocky
+    /// mcp` serves, and renaming or deleting it fails compilation.
+    ///
+    /// `engine-ci.yml` must watch every such path. A check that never runs is
+    /// never satisfied — and because `Test`, `Clippy`, `Format`, `Adapter
+    /// boundary` and the codegen check are REQUIRED contexts, a path the filter
+    /// misses does not merely skip CI, it blocks the merge outright (#1557).
+    #[test]
+    fn every_out_of_tree_include_is_watched_by_engine_ci() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root from the crate manifest");
+        let src = std::fs::read_to_string(manifest.join("src/tools.rs")).expect("read tools.rs");
+        let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/engine-ci.yml"))
+            .expect("read engine-ci.yml");
+
+        // Paths that climb above `engine/` — `src/` is three levels below the
+        // repo root, so four or more `../` escapes the engine tree.
+        let mut checked = 0;
+        for (at, _) in src.match_indices("include_str!(\"") {
+            let rest = &src[at + "include_str!(\"".len()..];
+            let path = &rest[..rest.find('"').expect("unterminated include_str! path")];
+            if !path.starts_with("../../../../") {
+                continue;
+            }
+            let repo_relative = path.trim_start_matches("../");
+            assert!(
+                repo_root.join(repo_relative).exists(),
+                "include_str! names a file that does not exist: {repo_relative}"
+            );
+            // EVERY `paths:` list, not merely one of them. `engine-ci.yml`
+            // carries two — `push` and `pull_request` — and a path present in
+            // only one still misses half the trigger. `contains` over the whole
+            // file would pass on a single occurrence; mutation-checking this
+            // test by deleting one of the two proved exactly that.
+            let lists = workflow_path_lists(&workflow);
+            assert_eq!(
+                lists.len(),
+                2,
+                "expected engine-ci.yml to carry a `paths:` list for both `push` \
+                 and `pull_request`; found {}. If the triggers changed, this \
+                 guard needs to change with them.",
+                lists.len()
+            );
+            for (n, list) in lists.iter().enumerate() {
+                assert!(
+                    list.iter().any(|entry| entry == repo_relative),
+                    "`{repo_relative}` is compiled into the engine but is missing \
+                     from engine-ci.yml `paths:` list {n}. The required checks \
+                     would never run for a change to it, so the change gets no \
+                     engine CI AND cannot merge (#1557). It must be in BOTH the \
+                     push and pull_request lists."
+                );
+            }
+            checked += 1;
+        }
+
+        // A zero here would pass vacuously — the assertion above never runs if
+        // the scan finds nothing, which is exactly how this guard would rot.
+        assert!(
+            checked > 0,
+            "found no out-of-tree include_str! paths to check — the scan broke, \
+             or the coupling moved and this test now proves nothing"
+        );
+    }
+
     #[test]
     fn instructions_carry_the_worker_banner_and_stay_verbatim_by_default() {
         let default_info = server_with(McpProfile::Default).get_info();
