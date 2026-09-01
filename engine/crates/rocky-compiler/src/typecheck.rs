@@ -2192,7 +2192,15 @@ fn merged_join_columns(
                 JoinOperator::Right(_) | JoinOperator::RightOuter(_) => right.nullable,
                 // FULL JOIN can emit unmatched rows from either input. The
                 // coalesced key is non-null only when BOTH input keys are non-null.
-                _ => left.nullable || right.nullable,
+                JoinOperator::FullOuter(_) => left.nullable || right.nullable,
+                // An inner join emits only matched rows, and the merged key's
+                // equality never matches a NULL, so the key is non-null as soon
+                // as either input key is.
+                JoinOperator::Join(_) | JoinOperator::Inner(_) => left.nullable && right.nullable,
+                // The guard above admits only the operators named here. Treat a
+                // variant that ever reaches this arm as nullable, the
+                // conservative answer.
+                _ => true,
             };
             Some((
                 CiKey::owned(left.name.clone()),
@@ -2748,6 +2756,119 @@ mod tests {
                         columns[1].nullable,
                         right_nullable || join != "RIGHT JOIN",
                         "{sql}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An inner join emits only matched rows, and its merged key never matches a
+    /// NULL, so the key stays non-null as soon as either input key is. Sharing
+    /// the FULL rule here widened it and rejected valid contracts with E012.
+    #[test]
+    fn inner_join_using_and_natural_keys_keep_the_merged_key_non_null() {
+        for (left_nullable, right_nullable, merged_nullable) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let sources = HashMap::from([
+                (
+                    "a".to_string(),
+                    source_schema(&[("id", RockyType::Int64, left_nullable)]),
+                ),
+                (
+                    "b".to_string(),
+                    source_schema(&[("id", RockyType::Int64, right_nullable)]),
+                ),
+            ]);
+            let external: HashMap<_, _> = sources
+                .iter()
+                .map(|(name, columns)| {
+                    (
+                        name.clone(),
+                        columns
+                            .iter()
+                            .map(|col| rocky_ir::ColumnInfo {
+                                name: col.name.clone(),
+                                data_type: "BIGINT".to_string(),
+                                nullable: col.nullable,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            // The whole-project path starts from the star's lineage edge, which
+            // resolves to the first relation, and the join overlay only widens.
+            // A nullable left key therefore stays nullable there even though the
+            // merged key itself cannot be null.
+            let project_nullable = merged_nullable || left_nullable;
+            for join in ["JOIN", "INNER JOIN"] {
+                for clause in [
+                    format!("{join} b r USING (id)"),
+                    format!("NATURAL {join} b r"),
+                ] {
+                    for projection in ["id", "*"] {
+                        let sql = format!("SELECT {projection} FROM a l {clause}");
+                        let columns = infer_select_types(&sql, &sources, "joined").unwrap();
+                        assert_eq!(
+                            columns.len(),
+                            1,
+                            "{sql} ({left_nullable}, {right_nullable})"
+                        );
+                        assert_eq!(
+                            columns[0].data_type,
+                            RockyType::Int64,
+                            "{sql} ({left_nullable}, {right_nullable})"
+                        );
+                        assert_eq!(
+                            columns[0].nullable, merged_nullable,
+                            "{sql} ({left_nullable}, {right_nullable})"
+                        );
+                    }
+
+                    let sql = format!("SELECT * FROM a l {clause}");
+                    let project = Project::from_models(vec![make_model("joined", &sql)]).unwrap();
+                    let graph = build_semantic_graph(&project, &external).unwrap();
+                    let result = typecheck_project_with_models(
+                        &graph,
+                        &sources,
+                        None,
+                        &project.models,
+                        None,
+                    );
+                    let columns = &result.typed_models["joined"];
+                    assert_eq!(
+                        columns[0].nullable, project_nullable,
+                        "{sql} ({left_nullable}, {right_nullable})"
+                    );
+                    let contract = CompilerContract {
+                        columns: vec![ContractColumn {
+                            name: "id".to_string(),
+                            type_name: Some("Int64".to_string()),
+                            nullable: Some(false),
+                            description: None,
+                        }],
+                        rules: ContractRules::default(),
+                    };
+                    assert_eq!(
+                        validate_contract("joined", columns, &contract)
+                            .iter()
+                            .any(|d| &*d.code == "E012"),
+                        project_nullable,
+                        "{sql} ({left_nullable}, {right_nullable})"
+                    );
+
+                    let sql = format!("SELECT l.id AS left_id, r.id AS right_id FROM a l {clause}");
+                    let columns = infer_select_types(&sql, &sources, "joined").unwrap();
+                    assert_eq!(
+                        columns[0].nullable, left_nullable,
+                        "{sql} ({left_nullable}, {right_nullable})"
+                    );
+                    assert_eq!(
+                        columns[1].nullable, right_nullable,
+                        "{sql} ({left_nullable}, {right_nullable})"
                     );
                 }
             }
