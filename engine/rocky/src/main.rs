@@ -819,19 +819,25 @@ enum Command {
         /// Applies to the default plan subcommand only.
         #[arg(long, global = false)]
         shadow: bool,
-        /// Suffix appended to table names in shadow mode (default: _rocky_shadow).
+        /// Suffix appended to table names. Requires --shadow; conflicts with --branch.
+        /// --shadow alone uses _rocky_shadow.
         /// Applies to the default plan subcommand only.
-        #[arg(long, default_value = "_rocky_shadow", global = false)]
+        #[arg(
+            long,
+            default_value = "_rocky_shadow",
+            requires = "shadow",
+            global = false
+        )]
         shadow_suffix: String,
-        /// Override schema for shadow tables (mutually exclusive with --shadow-suffix).
+        /// Override schema for shadow tables. Requires --shadow; conflicts with --branch.
         /// Applies to the default plan subcommand only.
-        #[arg(long, global = false)]
+        #[arg(long, requires = "shadow", global = false)]
         shadow_schema: Option<String>,
         /// Execute the run against a named branch created with `rocky branch
         /// create`. Internally equivalent to `--shadow --shadow-schema
         /// <branch.schema_prefix>`; mutually exclusive with the shadow flags.
         /// Applies to the default plan subcommand only.
-        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema"], global = false)]
+        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema", "shadow_suffix"], global = false)]
         branch: Option<String>,
 
         // ----- time_interval partition selection -----
@@ -987,16 +993,17 @@ enum Command {
         /// Run in shadow mode: write to shadow targets instead of production
         #[arg(long)]
         shadow: bool,
-        /// Suffix appended to table names in shadow mode (default: _rocky_shadow)
-        #[arg(long, default_value = "_rocky_shadow")]
+        /// Suffix appended to table names. Requires --shadow; conflicts with --branch.
+        /// --shadow alone uses _rocky_shadow.
+        #[arg(long, default_value = "_rocky_shadow", requires = "shadow")]
         shadow_suffix: String,
-        /// Override schema for shadow tables (mutually exclusive with --shadow-suffix)
-        #[arg(long)]
+        /// Override schema for shadow tables. Requires --shadow; conflicts with --branch.
+        #[arg(long, requires = "shadow")]
         shadow_schema: Option<String>,
         /// Execute the run against a named branch created with `rocky branch
         /// create`. Internally equivalent to `--shadow --shadow-schema
         /// <branch.schema_prefix>`; mutually exclusive with the shadow flags.
-        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema"])]
+        #[arg(long, conflicts_with_all = ["shadow", "shadow_schema", "shadow_suffix"])]
         branch: Option<String>,
 
         // ----- time_interval partition selection -----
@@ -3160,6 +3167,23 @@ fn main() -> Result<()> {
     reset_sigpipe();
 
     let cli = Cli::parse();
+    // A Pipes writer must receive EPIPE as a Rust error. With SIG_DFL,
+    // Dagster closing its stream would kill this process before the run
+    // releases its idempotency claim. Keep the ordinary CLI pipe behavior
+    // above for help/version and commands that never open a Pipes channel.
+    #[cfg(unix)]
+    if std::env::var_os(rocky_cli::pipes::ENV_PIPES_CONTEXT).is_some()
+        && matches!(
+            &cli.command,
+            Command::Run { .. }
+                | Command::Apply { .. }
+                | Command::Snapshot { .. }
+                | Command::Fulfill { .. }
+        )
+    {
+        // SAFETY: this runs before the Tokio runtime and its threads exist.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    }
     // Resolve the effective output format: an explicit `--output` always wins;
     // otherwise TTY-detect (table at a terminal, json when piped). Computed
     // here because `json` feeds both `init_tracing` and the miette hook.
@@ -3352,6 +3376,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     let _remote_parent = rocky_observe::tracing_setup::adopt_remote_parent();
 
     let config_path = cli.config.clone();
+
+    // Apply can write policy state before its run reaches PipesEmitter::detect.
+    // DAG seeds bypass that detector, and watch absorbs iteration errors.
+    // Validate these binary entry points before any of those paths begin.
+    if matches!(
+        &cli.command,
+        Command::Run { .. }
+            | Command::Apply { .. }
+            | Command::Snapshot { .. }
+            | Command::Fulfill { .. }
+    ) {
+        rocky_cli::pipes::PipesEmitter::validate_requested()?;
+    }
 
     // Resolve `--state-path` once so every command below sees the same
     // canonical location. When the caller didn't pass `--state-path`
@@ -3781,8 +3818,25 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             var,
             assume_fresh_state,
         } => {
-            // Resolve branch names before config or warehouse work. This is
-            // also the single name-to-schema funnel used by apply and compare.
+            // Reject an unsupported pipeline using config alone. Resolving a
+            // branch opens the state store, even when it is read-only.
+            if let Some(name) = branch.as_ref() {
+                rocky_cli::commands::validate_branch_name(name)?;
+                let config = rocky_core::config::load_rocky_config(&cli.config)?;
+                let pending_shadow = rocky_core::shadow::ShadowConfig {
+                    suffix: shadow_suffix.clone(),
+                    schema_override: None,
+                    cleanup_after: false,
+                    branch: Some(name.clone()),
+                };
+                rocky_cli::commands::require_shadow_support_for_config(
+                    &config,
+                    pipeline.as_deref(),
+                    model.as_deref(),
+                    &pending_shadow,
+                )?;
+            }
+            // Resolve branch names through the shared name-to-schema funnel.
             let branch_shadow_config = branch
                 .as_ref()
                 .map(|name| {

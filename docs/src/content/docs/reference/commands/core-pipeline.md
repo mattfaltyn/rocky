@@ -265,6 +265,8 @@ Generate the replication SQL Rocky would run, without running it. The command ne
 
 `rocky plan` plus `rocky apply` is the canonical path for production and for gating a pull request. Nothing touches the warehouse between the two steps. For local iteration, [`rocky run`](#rocky-run) does the same work in one command and writes no plan file.
 
+With `--model`, a compile error in that model or one reached through `depends_on` or a bare-name read refuses the plan. Without `--model`, Rocky compiles the whole models directory. An error in a model from another pipeline also refuses the plan. Rocky prints each relevant model and diagnostic code, exits with code `1`, and writes no plan file or `plan_id`. This applies to text and JSON output. Warnings alone do not stop the plan.
+
 ```bash
 rocky plan [flags]
 rocky plan promote <branch> [flags]
@@ -325,9 +327,9 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint. Mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint. Which run that is gets resolved at apply time, not plan time. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--shadow` | `bool` | `false` | Write to shadow targets instead of production. |
-| `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
-| `--shadow-schema <NAME>` | `string` | | Override the schema for shadow tables. Mutually exclusive with `--shadow-suffix`. |
-| `--branch <NAME>` | `string` | | Plan against a branch created with `rocky branch create`. Equivalent to `--shadow --shadow-schema <branch.schema_prefix>`. Mutually exclusive with `--shadow` and `--shadow-schema`. |
+| `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
+| `--shadow-schema <NAME>` | `string` | | Requires `--shadow`. Overrides the schema for shadow tables. Conflicts with `--branch`. |
+| `--branch <NAME>` | `string` | | Plan against a branch created with `rocky branch create`. Equivalent to `--shadow --shadow-schema <branch.schema_prefix>`. Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. |
 | `--partition <KEY>` | `string` | | Plan one partition by its canonical key (`2026-04-07` for daily, `2026-04` for monthly). Errors if the format does not match the model's granularity. Mutually exclusive with `--from`, `--to`, `--latest`, `--missing`. |
 | `--from <KEY>` | `string` | | Lower bound of a closed partition range, inclusive. Requires `--to`. Both bounds must align to the model's grain. |
 | `--to <KEY>` | `string` | | Upper bound of a closed partition range, inclusive. Requires `--from`. |
@@ -402,18 +404,18 @@ rocky plan --filter client=acme
 }
 ```
 
-A model the preview could not render is listed in `skipped`, rather than left out silently:
+A model excluded from the preview or refused by compilation is listed in `skipped`:
 
 ```json
   "skipped": [
     {
       "model": "stg_events",
-      "reason": "invalid SQL generation request: model 'stg_events': `type = \"ephemeral\"` is not supported (E038) — an ephemeral model is not materialized and is not inlined into its consumers; use `type = \"view\"`"
+      "reason": "[E038] model 'stg_events' uses `type = \"ephemeral\"`, which is not supported: an ephemeral model is not materialized and is not inlined into its consumers, so a consumer reads whatever table already carries the name"
     }
   ]
 ```
 
-The `reason` is the generator's own error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool returns the same list. The key is absent when nothing was skipped.
+The `reason` gives the compiler diagnostic or SQL generation error. A refused strategy puts a model there, and so does one that needs a live warehouse, such as a Snowflake dynamic table. The MCP `plan_preview` tool reports preview exclusions. The key is absent when nothing was skipped.
 
 Plan with table output and a custom config:
 
@@ -568,9 +570,9 @@ rocky run [flags]
 | `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--shadow` | `bool` | `false` | Run in shadow mode: write to shadow targets instead of production. |
-| `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
-| `--shadow-schema <NAME>` | `string` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
-| `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Mutually exclusive with `--shadow` / `--shadow-schema`. |
+| `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Requires `--shadow`. Appends a suffix to table names. Conflicts with `--branch`. `--shadow` alone uses `_rocky_shadow`. |
+| `--shadow-schema <NAME>` | `string` | | Requires `--shadow`. Overrides the schema for shadow tables. Conflicts with `--branch`. |
+| `--branch <NAME>` | `string` | | Execute against a named branch previously registered with `rocky branch create`. Applies the branch's `schema_prefix` to every target (internally equivalent to `--shadow --shadow-schema <branch.schema_prefix>`). Conflicts with `--shadow`, `--shadow-schema`, and `--shadow-suffix`. The run records `<NAME>` as `rocky_branch` in [run history](/reference/commands/administration/#rocky-history). |
 | `--watch` | `bool` | `false` | Wrap the run in a filesystem watcher: re-execute the pipeline on every change to `rocky.toml` or any file under `models/`, debounced to 200 ms so editor save bursts coalesce into a single re-run. Failed runs do not exit the loop; Ctrl-C exits cleanly between runs. **v0 limitations:** mutually exclusive with `--dag`, `--resume`, `--resume-latest`, `--idempotency-key`, and `--model` (rejected at parse time). |
 | `--defer` | `bool` | `false` | Build only the `--model`-selected models locally, resolving unbuilt upstream models to an existing (production) schema — the dbt-Core-style defer convenience. Takes effect **only together with `--model`**: a full run builds everything, so the flag is inert. Applies to transformation models; mutually exclusive with `--dag`. See the limitation note below. |
 | `--defer-to <SCHEMA>` | `string` | | Schema the deferred upstream models resolve to. Requires `--defer`. Defaults to each unbuilt upstream's own configured target schema (its production home); pass this to point every deferred reference at a single schema instead (catalog + table are preserved). |
@@ -700,7 +702,7 @@ That last case deserves a word. To such a warehouse the two targets are distinct
 
 This rule is not about whether the dialect quotes identifiers. Rocky renders Trino targets double-quoted, yet treats two Trino targets that differ only by case as one object, so such a run proceeds there.
 
-`--shadow` and `--branch` isolate `rocky run` for transformation pipelines only. `rocky run --dag`, the snapshot pipeline kind, and the load pipeline kind accept both flags but still write production targets.
+`--shadow` and `--branch` isolate `rocky run` for transformation pipelines, and for replication pipelines in either mode. Rocky refuses both flags on `rocky run --dag`, and on quality, snapshot and load pipelines. A refused quality, snapshot or load run stops before it opens a warehouse adapter, writes to the state store, or claims an idempotency key, so it writes nothing. See [Shadow mode](/concepts/shadow-mode/) for the reasons and for how to quality-check a branch.
 
 Or run against a named branch:
 
@@ -789,6 +791,8 @@ acme_warehouse.staging__eu_central__stripe.charges    | 2026-03-29T22:15:00Z    
 ## `rocky branch`
 
 Manage named virtual branches. A branch is the persistent, named form of shadow mode. Creating one records a `schema_prefix` in the state store. Every later run that names the branch applies that prefix to each model target. That holds whether you run `rocky plan --branch <name>` plus `rocky apply <plan-id>` or the one-step `rocky run --branch <name>`. Schema-prefix branches behave the same on every adapter today. Warehouse-native clones (Delta `SHALLOW CLONE`, Snowflake zero-copy `CLONE`) are a follow-up.
+
+`rocky plan` accepts replication pipelines only. A transformation pipeline uses `rocky run --branch <name>`.
 
 ```bash
 rocky branch create <name> [--description <text>]
@@ -908,6 +912,8 @@ rocky branch compare fix_price --pipeline shopify_us   # multi-pipeline project
 ```
 
 Internally this is `rocky compare` pointed at the branch's `schema_prefix` via `ShadowConfig.schema_override`, the same mechanism `rocky run --branch` uses for writes, so compare always hits exactly the tables the branch produced. Accepts the shared [`--filter`](/reference/filters/) flag, and `--pipeline <name>` to select the pipeline in a multi-pipeline project.
+
+When Rocky cannot read a table or its schema on either side, that table reports `verdict: "error"` with the reason in `reasons`. Its unreadable row count is `null`, never `0`. An `error` row counts as failed, so the command exits non-zero. See [`rocky compare`](/reference/cli/#rocky-compare).
 
 ### Related Commands
 

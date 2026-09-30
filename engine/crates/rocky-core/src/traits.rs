@@ -346,8 +346,8 @@ pub enum CaseSignificance {
 /// (or back) hits the warehouse's own "Existing object X is of type Y,
 /// trying to replace with type Z" error with no explanation. That check
 /// compares this value against what the strategy implies and, on a real
-/// mismatch, fails the model with a Rocky diagnostic before the statement
-/// is ever sent.
+/// mismatch, either refuses with a Rocky diagnostic or applies the model's
+/// exact-kind drop permission before the replacement statement.
 ///
 /// Unlike [`CaseSignificance`], this deliberately has a third state.
 /// `CaseSignificance` has no `Unknown` because no state there would
@@ -422,6 +422,25 @@ pub trait WarehouseAdapter: Send + Sync {
         ))
     }
 
+    /// The catalog this connection resolves a catalogless target in, when the
+    /// adapter can name it without a round trip.
+    ///
+    /// A model whose `[target]` sets no `catalog` renders as `schema.table`,
+    /// which the warehouse resolves against the connection's current catalog.
+    /// Rocky needs that name to decide whether a `catalog.schema.table` read
+    /// in another model is that model's table or another catalog's table of
+    /// the same `schema.table` (#1629) — a guess across catalogs can order a
+    /// real dependency backwards.
+    ///
+    /// **`None` means "not established", never "no catalog".** The default is
+    /// `None`, and that is load-bearing: a consumer treats it as unknown and
+    /// derives nothing from it. Only an adapter that can state the answer
+    /// exactly, without connecting, overrides it. DuckDB does: the catalog is
+    /// the database file's name, which its own configuration determines.
+    fn default_catalog(&self) -> Option<String> {
+        None
+    }
+
     /// Execute a SQL statement (DDL/DML) without returning rows.
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()>;
 
@@ -443,6 +462,23 @@ pub trait WarehouseAdapter: Send + Sync {
         self.execute_statement(sql)
             .await
             .map(|()| ExecutionStats::default())
+    }
+
+    /// Execute a kind switch in one transaction when supported. `None` means
+    /// unsupported; the caller must not drop the old object. If CREATE fails,
+    /// the adapter rolls back the DROP before returning an error. A failed
+    /// COMMIT can leave target state uncertain and must say so in its error.
+    async fn atomic_drop_and_create(
+        &self,
+        _drop_sql: &str,
+        _create_sql: &str,
+    ) -> AdapterResult<Option<ExecutionStats>> {
+        Ok(None)
+    }
+
+    /// Whether `object_kind` can distinguish table from view on this adapter.
+    fn supports_object_kind_probe(&self) -> bool {
+        false
     }
 
     /// Classify an error this adapter returned into a run-loop
@@ -503,8 +539,9 @@ pub trait WarehouseAdapter: Send + Sync {
     /// Default: `Ok(ObjectKind::Unknown)`. Every adapter but `rocky-duckdb`
     /// reports this today, which makes the reconciliation check this backs
     /// a no-op for them: their `CREATE OR REPLACE <kind>` runs exactly as
-    /// it always has, and a genuine mismatch still surfaces — just as the
-    /// warehouse's own error, not yet a Rocky diagnostic. Extending this to
+    /// it always has. A failed probe is also Unknown and never authorizes a
+    /// drop; with explicit permission the run reports why it was unused.
+    /// Extending this to
     /// another adapter is a follow-up, not a prerequisite.
     ///
     /// # Errors

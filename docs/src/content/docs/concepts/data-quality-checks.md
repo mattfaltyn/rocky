@@ -322,7 +322,7 @@ The filter is your SQL, and it must be valid in the target dialect. Rocky does n
 - a `unique_expr` `key_expr` and a `cross_source_overlap` `key_expr`;
 - the same `expression` and `filter` again when quarantine lowers that assertion into its own statements. `[checks.quarantine]` itself takes only `enabled`, `mode` and the two suffixes;
 - a `metadata_columns[].value`;
-- a check an agent drafts through the `draft_check` MCP tool, which parses under the generic dialect because it has no target yet.
+- a check an agent drafts through the `draft_check` MCP tool. Rocky validates under the target adapter's SQL dialect before writing. With several pipelines, it infers the dialect when they all agree; otherwise, pass `pipeline` to select one.
 
 One config field is **not** gated: a `[[checks.custom]]` `sql` query. Rocky substitutes `{target}` into it and runs it as written, so treat a custom check as code you are running.
 
@@ -398,8 +398,8 @@ mode = "split"   # or "tag" or "drop"
 | Mode | Behavior |
 |---|---|
 | `split` | Rocky materializes two new tables: `<target>__valid` with the passing rows and `<target>__quarantine` with the failing rows (plus per-assertion `_error_<name>` label columns marking which assertion each row failed). When the run completes, and the two suffixes name two different tables in your warehouse, each row lands in exactly one of them. The original `<target>` is left untouched; point downstream models at `<target>__valid`. Not available on Trino. |
-| `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. |
-| `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. |
+| `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. Not available on Trino. |
+| `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. On Trino, Rocky drops the previous valid table before creating the new one. |
 
 Set-based, table-level, and referential assertions are never quarantinable. They run as after-the-fact checks whatever the mode.
 

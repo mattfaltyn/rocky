@@ -871,6 +871,9 @@ const CURRENT_SCHEMA_VERSION: u32 = 30;
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
 pub enum StateError {
+    #[error("state store not found at {path}")]
+    NotFound { path: String },
+
     #[error("database error: {0}")]
     Database(#[from] redb::DatabaseError),
 
@@ -1150,8 +1153,8 @@ enum InitOutcome {
 /// written by an older binary forward to [`CURRENT_SCHEMA_VERSION`]: stamping
 /// on a read would let a `rocky state show` silently rewrite the very version
 /// it is reporting, and would defeat forward/backward-compat probes that depend
-/// on the on-disk version staying put until a real write occurs. The one write
-/// it still performs is bootstrapping an EMPTY database (#1980).
+/// on the on-disk version staying put until a real write occurs. A missing
+/// file is reported as [`StateError::NotFound`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenMode {
     /// Read-write open: take the advisory lock and stamp/upgrade the version.
@@ -1224,9 +1227,8 @@ impl StateStore {
     /// that lacks a table this binary reads is refused with
     /// [`StateError::ReadOnlyNeedsInit`], which names the tables; the next
     /// read-write open creates them. A store stamped at an older version but
-    /// carrying every table opens normally and keeps its stamp. The one write
-    /// left is bootstrapping an EMPTY database — a path with no state file is
-    /// created and given its tables, unstamped, as before (#1980).
+    /// carrying every table opens normally and keeps its stamp. A missing
+    /// file returns [`StateError::NotFound`] without creating it.
     pub fn open_read_only(path: &Path) -> Result<Self, StateError> {
         Self::open_inner(path, OpenMode::ReadOnly, SchemaMismatchPolicy::Fail, None)
     }
@@ -1255,6 +1257,49 @@ impl StateStore {
             SchemaMismatchPolicy::Fail,
             Some(cache_bytes),
         )
+    }
+
+    /// Open an existing store, or answer reads from an empty in-memory store
+    /// when the project has never written state. The project path is untouched.
+    pub fn open_read_only_or_empty(path: &Path) -> Result<Self, StateError> {
+        Self::open_read_only_or_empty_inner(path, None)
+    }
+
+    /// Cache-budgeted counterpart for request-local history reads.
+    pub fn open_read_only_or_empty_with_cache(
+        path: &Path,
+        cache_bytes: usize,
+    ) -> Result<Self, StateError> {
+        Self::open_read_only_or_empty_inner(path, Some(cache_bytes))
+    }
+
+    fn open_read_only_or_empty_inner(
+        path: &Path,
+        cache_budget: Option<usize>,
+    ) -> Result<Self, StateError> {
+        match Self::open_inner(
+            path,
+            OpenMode::ReadOnly,
+            SchemaMismatchPolicy::Fail,
+            cache_budget,
+        ) {
+            Ok(store) => Ok(store),
+            Err(StateError::NotFound { .. }) => {
+                let mut builder = Database::builder();
+                if let Some(bytes) = cache_budget {
+                    builder.set_cache_size(bytes);
+                }
+                let db = builder.create_with_backend(redb::backends::InMemoryBackend::new())?;
+                Self::init_db(&db, path, OpenMode::ReadWrite, SchemaMismatchPolicy::Fail)?;
+                Ok(Self {
+                    db,
+                    _lock: None,
+                    recreated_for_forward_incompat: false,
+                    write_epoch: AtomicU64::new(0),
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// redb's count of pages evicted from its read cache since this handle
@@ -1292,12 +1337,13 @@ impl StateStore {
     /// shared open path (with the same lock-contention retry) but never Rocky's
     /// advisory write lock.
     pub fn peek_schema_version(path: &Path) -> Result<Option<u32>, StateError> {
-        // Side-effect-free for a missing file: do not let the redb open path
-        // create an empty database as a probe artifact.
-        if !path.exists() {
-            return Ok(None);
-        }
-        let db = open_redb_with_retry(path, None)?;
+        // The same existing-file open as read-only callers closes the race
+        // between an existence probe and opening the database.
+        let db = match open_existing_redb_with_retry(path, None) {
+            Ok(db) => db,
+            Err(StateError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let txn = db.begin_read()?;
         let metadata = match txn.open_table(METADATA) {
             Ok(table) => table,
@@ -1384,7 +1430,11 @@ impl StateStore {
             None
         };
 
-        let db = open_redb_with_retry(path, cache_budget)?;
+        let db = if matches!(mode, OpenMode::ReadOnly) {
+            open_existing_redb_with_retry(path, cache_budget)?
+        } else {
+            open_redb_with_retry(path, cache_budget)?
+        };
 
         match Self::init_db(&db, path, mode, policy)? {
             InitOutcome::Ready => Ok(StateStore {
@@ -1524,15 +1574,9 @@ impl StateStore {
     /// `rocky serve` wrote to the store it was reporting on until a
     /// read-write open re-stamped it (C1-P1b).
     ///
-    /// `Ok(None)` means the database is EMPTY — no table at all. That is a
-    /// file this very open has just created ([`open_redb_with_retry`] uses
-    /// `Database::create`, so a read-only open of a path with no state file
-    /// lands here) or one nothing has initialised, and the caller bootstraps
-    /// it through the write path exactly as before: `rocky doctor`,
-    /// `rocky history` and `GET /api/v1/runs` on a never-run project answer
-    /// "nothing yet", not an error. That is the one write a read-only open
-    /// still performs, on a store that holds nothing; #1980 tracks replacing
-    /// it with a typed absence so a read never creates the file either.
+    /// `Ok(None)` means an existing database is empty — no table at all.
+    /// Its prior bootstrap behavior remains for compatibility. A missing
+    /// path never reaches here: opening it read-only returns typed absence.
     ///
     /// A store that holds something but lacks a table is refused with
     /// [`StateError::ReadOnlyNeedsInit`] naming the missing tables; the next
@@ -1606,9 +1650,9 @@ impl StateStore {
         // polling `/api/v1/runs` contended with the work it was reporting on
         // (#1545). The read-only path answers from a read transaction alone
         // for any store that holds something, and refuses rather than escalate
-        // here when a table is missing. The one case it hands down is an EMPTY
-        // database — the file this open has just created, or one nothing has
-        // initialised — which is bootstrapped below exactly as before (#1980).
+        // here when a table is missing. An existing EMPTY database still
+        // follows the prior bootstrap path. A missing path is refused before
+        // reaching this function.
         if matches!(mode, OpenMode::ReadOnly)
             && let Some(outcome) = Self::init_db_read_only(db, path)?
         {
@@ -2109,16 +2153,47 @@ thread_local! {
 /// (the writer holds the lock for seconds-to-minutes); inspection commands
 /// will still hit `Busy` in that scenario, but with a clear next step.
 fn open_redb_with_retry(path: &Path, cache_budget: Option<usize>) -> Result<Database, StateError> {
+    open_redb_with_retry_mode(path, cache_budget, false)
+}
+
+fn open_existing_redb_with_retry(
+    path: &Path,
+    cache_budget: Option<usize>,
+) -> Result<Database, StateError> {
+    open_redb_with_retry_mode(path, cache_budget, true)
+}
+
+fn open_redb_with_retry_mode(
+    path: &Path,
+    cache_budget: Option<usize>,
+    existing_only: bool,
+) -> Result<Database, StateError> {
     // `None` preserves redb's default cache capacity (~1 GiB). A budget is
     // only threaded through for request-local opens that read once and drop
     // the handle — see [`StateStore::open_read_only_with_cache`] for why.
-    let create = |path: &Path| match cache_budget {
-        Some(bytes) => Database::builder().set_cache_size(bytes).create(path),
-        None => Database::create(path),
+    let open = |path: &Path| match (existing_only, cache_budget) {
+        (true, Some(bytes)) => Database::builder().set_cache_size(bytes).open(path),
+        (true, None) => Database::open(path),
+        (false, Some(bytes)) => Database::builder().set_cache_size(bytes).create(path),
+        (false, None) => Database::create(path),
     };
     for attempt in 0..REDB_OPEN_RETRY_ATTEMPTS {
-        match create(path) {
+        match open(path) {
             Ok(db) => return Ok(db),
+            Err(redb::DatabaseError::Storage(redb::StorageError::Io(ref error)))
+                if existing_only && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return match crate::path_presence::classify_not_found(path) {
+                    crate::path_presence::PathPresence::Absent => Err(StateError::NotFound {
+                        path: path.display().to_string(),
+                    }),
+                    crate::path_presence::PathPresence::Present { .. } => {
+                        Err(StateError::Database(redb::DatabaseError::from(
+                            std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string()),
+                        )))
+                    }
+                };
+            }
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
                 #[cfg(test)]
                 REDB_RETRY_OBSERVER.with(|o| {
@@ -2509,6 +2584,15 @@ pub struct ModelExecution {
     pub attempts: Vec<AttemptRecord>,
 }
 
+/// Where a run wrote its results. Missing on records written before #2172.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunScope {
+    Production,
+    Shadow { schema: Option<String> },
+    Branch { name: String },
+}
+
 /// A complete pipeline run record.
 ///
 /// # Governance audit trail (schema v6)
@@ -2688,6 +2772,10 @@ pub struct RunRecord {
     /// Guarded by `test_pre_rocky_branch_run_record_forward_deserializes_to_none`.
     #[serde(default)]
     pub rocky_branch: Option<String>,
+
+    /// `None` means an older record whose write scope cannot be classified.
+    #[serde(default)]
+    pub run_scope: Option<RunScope>,
 }
 
 /// One executed data-quality check's pass/fail outcome, captured on a
@@ -3245,9 +3333,76 @@ pub struct PersistedJob {
     #[serde(default)]
     pub error: Option<String>,
     /// The canonical `RunOutput` / `PlanOutput` / `ApplyOutput` the underlying
-    /// `rocky <kind>` subprocess emitted, embedded verbatim, once terminal.
+    /// `rocky <kind>` subprocess emitted, once terminal.
+    ///
+    /// Scrubbed of resolved `${VAR}` values before it is written — see
+    /// [`PersistedJob::redaction_version`]. A record whose version is absent
+    /// or below the trusted floor was written before that scrub existed and
+    /// is served without this field.
     #[serde(default)]
     pub result: Option<serde_json::Value>,
+    /// Which redaction rule was applied to `result` and `error` when this
+    /// record was written. Absent on every record written before the rule
+    /// existed, which is exactly the legacy signal — no migration needed,
+    /// because every field on this struct already defaults.
+    ///
+    /// An integer rather than a bool: a bool cannot say "redacted under an
+    /// older, weaker rule", and the rule is expected to tighten when CLI
+    /// output and logs come into scope.
+    ///
+    /// **The compiler catch has a blind spot.** This field is non-optional in
+    /// the struct literal on purpose, so every writer must name it — that
+    /// found six construction sites where one was known, including the
+    /// scheduler's. But a writer spelled
+    /// `PersistedJob { job_id, ..Default::default() }` compiles untouched and
+    /// stamps nothing, and an unstamped record reads as pre-redaction forever.
+    ///
+    /// No production site uses that form today. It is not ENFORCED: a guard
+    /// scanning the source for it was written and removed, because
+    /// distinguishing production from test code here needs real parsing —
+    /// `state.rs` alone has nine separate `#[cfg(test)]` blocks, so any
+    /// first-occurrence or last-occurrence boundary is wrong, and the version
+    /// that looked right silently scanned zero production code. A guard that
+    /// passes while the property is violated is worse than none.
+    ///
+    /// The durable fix is a constructor that stamps, with the literal
+    /// reserved for tests. Until then this is a convention, and a new writer
+    /// using struct-update syntax is the way it breaks.
+    ///
+    /// **Contract, and a future version may only be introduced under it:**
+    /// redaction versions are monotonically non-decreasing in strictness. A
+    /// version may only be introduced for a rule at least as strict as every
+    /// version below it. A future rule that shows MORE needs a different
+    /// mechanism, not a higher number here. Without that rule
+    /// `>= MIN_TRUSTED_REDACTION_VERSION` would be trusting an assumption
+    /// nothing enforces.
+    #[serde(default)]
+    pub redaction_version: Option<u32>,
+}
+
+/// The redaction rule applied to a job record written by this binary.
+pub const CURRENT_REDACTION_VERSION: u32 = 1;
+
+/// The oldest rule whose output is still served.
+///
+/// A record at or above this is trusted, INCLUDING a version this binary does
+/// not recognise: under the monotonic-strictness contract on
+/// [`PersistedJob::redaction_version`] a newer rule redacts at least as hard,
+/// and refusing its records would make a downgrade lose data that is not at
+/// risk.
+pub const MIN_TRUSTED_REDACTION_VERSION: u32 = 1;
+
+impl PersistedJob {
+    /// Whether this record predates the redaction rule, so its `result` and
+    /// `error` must not be served.
+    ///
+    /// Absent OR below the floor — not absent alone. Defining it as a
+    /// comparison from the start means the mechanism already works the first
+    /// time the rule tightens, instead of needing a second marker then.
+    pub fn redaction_is_legacy(&self) -> bool {
+        self.redaction_version
+            .is_none_or(|v| v < MIN_TRUSTED_REDACTION_VERSION)
+    }
 }
 
 impl PersistedJob {
@@ -3274,10 +3429,23 @@ impl PersistedJob {
     /// Whether the job reached a terminal state — `"succeeded"` or `"failed"`.
     ///
     /// Errs toward *unfinished*: an unrecognized `state` reads as **not**
-    /// terminal, so the restart sweep reconciles it rather than leaving an
-    /// embedder polling a record nothing will ever finish. See
-    /// [`is_in_flight`](Self::is_in_flight) for why the two predicates are not
-    /// complements.
+    /// terminal, because this version cannot claim a state it does not know has
+    /// finished. See [`is_in_flight`](Self::is_in_flight) for why the two
+    /// predicates are not complements.
+    ///
+    /// This does **not** mean an unrecognized state strands a poller, and no
+    /// caller should reconcile one on that reasoning. `rocky-cli` renders a
+    /// record through one parse site, `JobState::parse(&state)` with an
+    /// `unwrap_or(JobState::Failed)` fallback, so an unrecognized state already
+    /// reads as terminal at the API boundary. That fallback is a RENDERING
+    /// step, not storage: [`StateStore::get_job`](crate::state::StateStore) and
+    /// `list_jobs` hand back the stored string verbatim, so an in-process
+    /// consumer sees the unrecognized state itself. A caller that instead
+    /// REWRITES
+    /// such a record destroys data: `state` is a plain string precisely so a
+    /// newer sidecar can add a terminal state, and its record carries a real
+    /// result. See `MIN_TRUSTED_REDACTION_VERSION` for the same contract stated
+    /// for the redaction stamp.
     pub fn is_terminal(&self) -> bool {
         matches!(self.state.as_str(), "succeeded" | "failed")
     }
@@ -7318,37 +7486,34 @@ mod tests {
         assert!(after_migration == std::fs::read(&path).expect("read state file"));
     }
 
-    /// A read-only open of a path with NO state file bootstraps an empty store
-    /// — the file, every table, no stamp — exactly as before this change:
-    /// `rocky doctor`, `rocky history` and `GET /api/v1/runs` on a never-run
-    /// project answer "nothing yet", not an error. That is the one write a
-    /// read-only open still performs, on a store that holds nothing (#1980).
-    /// The second read-only open then writes nothing.
+    /// Missing state is a typed absence and never leaves a database behind.
     #[test]
-    fn a_read_only_open_of_a_missing_file_bootstraps_an_empty_store_once() {
+    fn a_read_only_open_of_a_missing_file_returns_not_found_without_creating_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.redb");
         assert!(!path.exists(), "precondition: no state file");
+        assert!(matches!(
+            StateStore::open_read_only(&path),
+            Err(StateError::NotFound { .. })
+        ));
+        assert!(!path.exists(), "read-only open must not create state");
+        let store = StateStore::open_read_only_or_empty(&path).unwrap();
+        assert!(store.list_jobs().unwrap().is_empty());
+        drop(store);
+        assert!(!path.exists(), "empty fallback must not create state");
+    }
 
-        {
-            let store = StateStore::open_read_only(&path).expect("bootstrap from a read-only open");
-            assert!(store.get_watermark("cat.sch.tbl").unwrap().is_none());
-            assert!(store.list_jobs().unwrap().is_empty());
-            assert!(store.list_tombstones().unwrap().is_empty());
-        }
-        assert!(path.exists(), "the bootstrap created the file");
-        assert_eq!(
-            StateStore::peek_schema_version(&path).unwrap(),
-            None,
-            "a read-only bootstrap never stamps the version"
-        );
-
-        let before = std::fs::read(&path).expect("read state file");
-        drop(StateStore::open_read_only(&path).expect("second read-only open"));
-        assert!(
-            before == std::fs::read(&path).expect("read state file"),
-            "the second read-only open of the bootstrapped store wrote"
-        );
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_state_link_is_not_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        std::os::unix::fs::symlink(dir.path().join("gone.redb"), &path).unwrap();
+        assert!(matches!(
+            StateStore::open_read_only_or_empty(&path),
+            Err(StateError::Database(_))
+        ));
+        assert!(std::fs::symlink_metadata(&path).is_ok());
     }
 
     /// An unversioned store (no `schema_version` key) that carries every
@@ -7983,6 +8148,7 @@ mod tests {
             check_gate_failed: false,
             verify_after_failed: false,
             rocky_branch: None,
+            run_scope: Some(RunScope::Production),
         }
     }
 
@@ -8384,6 +8550,25 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&branched).unwrap()).unwrap();
         assert_eq!(round.git_branch.as_deref(), Some("fix-price"));
         assert_eq!(round.rocky_branch.as_deref(), Some("pr-preview-fix-price"));
+    }
+
+    #[test]
+    fn test_pre_run_scope_record_remains_unclassified() {
+        let mut value = serde_json::to_value(minimal_run_record("old", vec![])).unwrap();
+        value.as_object_mut().unwrap().remove("run_scope");
+        let blob = serde_json::to_vec(&value).unwrap();
+        let record: RunRecord = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(record.run_scope, None);
+
+        let (store, _dir) = temp_store();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(RUN_HISTORY).unwrap();
+            table.insert("old", blob.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(store.get_run("old").unwrap().unwrap().run_scope, None);
+        assert_eq!(store.list_runs(1).unwrap()[0].run_scope, None);
     }
 
     #[test]
@@ -14171,6 +14356,7 @@ mod tests {
             principal: Some("ci@example.com".to_string()),
             error: None,
             result: None,
+            redaction_version: Some(CURRENT_REDACTION_VERSION),
         }
     }
 

@@ -48,6 +48,10 @@ pub struct DuckDbWarehouseAdapter {
     /// be exercised against real DuckDB storage in unit tests. Always `false`
     /// in production: the single `Mutex` connection just serializes work.
     concurrent_for_test: bool,
+    /// The catalog DuckDB assigned the primary database, known only when this
+    /// adapter opened the database itself (so it saw the path). Adapters built
+    /// from an existing connector never saw one and report `None`.
+    default_catalog: Option<String>,
 }
 
 impl DuckDbWarehouseAdapter {
@@ -58,6 +62,7 @@ impl DuckDbWarehouseAdapter {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,
             concurrent_for_test: false,
+            default_catalog: Some(crate::dialect::catalog_name_for_path(":memory:")),
         })
     }
 
@@ -68,6 +73,9 @@ impl DuckDbWarehouseAdapter {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,
             concurrent_for_test: false,
+            default_catalog: Some(crate::dialect::catalog_name_for_path(
+                &path.to_string_lossy(),
+            )),
         })
     }
 
@@ -77,6 +85,7 @@ impl DuckDbWarehouseAdapter {
             connector: Arc::new(Mutex::new(connector)),
             dialect: DuckDbSqlDialect,
             concurrent_for_test: false,
+            default_catalog: None,
         }
     }
 
@@ -88,6 +97,7 @@ impl DuckDbWarehouseAdapter {
             connector,
             dialect: DuckDbSqlDialect,
             concurrent_for_test: false,
+            default_catalog: None,
         }
     }
 
@@ -130,6 +140,14 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         Ok(rocky_core::traits::CaseSignificance::Insignificant)
     }
 
+    /// The name DuckDB gives the primary database — the file's base name, or
+    /// `memory` — which is where a catalogless `schema.table` resolves. Known
+    /// from the path the adapter opened, with no round trip; `None` for an
+    /// adapter built from an existing connector, which never saw one.
+    fn default_catalog(&self) -> Option<String> {
+        self.default_catalog.clone()
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         let conn = Arc::clone(&self.connector);
         let sql = sql.to_string();
@@ -138,6 +156,30 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
                 .lock()
                 .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
             conn.execute_statement(&sql).map_err(AdapterError::new)
+        })
+        .await
+        .map_err(|e| join_error(&e))?
+    }
+
+    fn supports_object_kind_probe(&self) -> bool {
+        true
+    }
+
+    async fn atomic_drop_and_create(
+        &self,
+        drop_sql: &str,
+        create_sql: &str,
+    ) -> AdapterResult<Option<rocky_core::traits::ExecutionStats>> {
+        let conn = Arc::clone(&self.connector);
+        let drop_sql = drop_sql.to_string();
+        let create_sql = create_sql.to_string();
+        spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
+            conn.atomic_drop_and_create(&drop_sql, &create_sql)
+                .map_err(AdapterError::new)?;
+            Ok(Some(rocky_core::traits::ExecutionStats::default()))
         })
         .await
         .map_err(|e| join_error(&e))?

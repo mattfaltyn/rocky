@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -137,7 +138,9 @@ pub async fn plan(
     // persists a plan a later `rocky apply` (which re-executes `run()`,
     // where the same collision refuses) would then reject — late, and
     // outside the bounded, watchdog-covered plan step Dagster Pipes relies
-    // on for this check.
+    // on for this check. Plan does not list source tables: it can refuse a
+    // collision for a discovered table that run later skips as missing from
+    // the source, but it cannot miss a collision that run would check.
     let mut collision_check_pairs: Vec<(String, String)> = Vec::new();
 
     // Detect whether this dialect supports catalogs. Dialects without catalog
@@ -249,13 +252,27 @@ pub async fn plan(
                 });
                 continue;
             }
-            collision_check_pairs.push((table.name.clone(), conn.source_type.clone()));
+            let check_table_name = if run_options.shadow
+                && run_options.branch.is_none()
+                && run_options.shadow_schema.is_none()
+            {
+                format!(
+                    "{}{}",
+                    table.name,
+                    run_options
+                        .shadow_suffix
+                        .as_deref()
+                        .unwrap_or("_rocky_shadow")
+                )
+            } else {
+                // A branch or shadow schema override leaves the table name intact.
+                table.name.clone()
+            };
+            collision_check_pairs.push((check_table_name, conn.source_type.clone()));
 
-            // Resolved AFTER the exclusion branches, mirroring `rocky run`,
-            // which preflights the same value only for a table that survives
-            // the filter / missing-from-source / disabled skips. Resolving
-            // earlier would let `plan` refuse a source schema whose tables
-            // `run` never renders.
+            // Resolved AFTER the filter and disabled-override exclusions.
+            // Unlike `run`, plan does not query the warehouse to exclude
+            // tables missing from its current source listing.
             //
             // Same producer `run` uses, so the preview and the run cannot
             // disagree: it substitutes the warehouse-derived schema
@@ -331,13 +348,15 @@ pub async fn plan(
 
     // #1941: refuse before this plan is persisted (`plan_id` below) — see
     // the comment where `collision_check_pairs` is declared above.
-    refuse_check_name_collisions(
-        name,
-        pipeline,
-        collision_check_pairs
-            .iter()
-            .map(|(t, s)| (t.as_str(), s.as_str())),
-    )?;
+    if run_options.model.is_none() {
+        refuse_check_name_collisions(
+            name,
+            pipeline,
+            collision_check_pairs
+                .iter()
+                .map(|(t, s)| (t.as_str(), s.as_str())),
+        )?;
+    }
 
     // --- Governance preview (Wave A + C-1 + C-2) -------------------------
     //
@@ -474,6 +493,8 @@ pub async fn plan(
         output.skipped = preview.skipped;
     }
     let mut run_plan_persisted = false;
+    let mut compile_refused = false;
+    let mut refusal_details = Vec::new();
     if blueprint_models_dir.exists() {
         match build_and_persist_run_plan(
             config_path,
@@ -485,13 +506,32 @@ pub async fn plan(
             base_ref,
             state_path,
         ) {
-            Ok(Some((run_plan, plan_id, persisted_at))) => {
+            Ok(Some(RunPlanBuild::Persisted(run_plan, plan_id, persisted_at))) => {
+                output.models = run_plan.models.clone();
+                output.execution_layers = run_plan.execution_layers.clone();
                 output.plan_id = Some(plan_id);
                 output.plan_kind = Some("run".to_string());
                 output.created_at = Some(persisted_at);
-                output.models = run_plan.models.clone();
-                output.execution_layers = run_plan.execution_layers.clone();
                 run_plan_persisted = true;
+            }
+            Ok(Some(RunPlanBuild::Refused(refused))) => {
+                compile_refused = true;
+                refusal_details = refused
+                    .iter()
+                    .map(|item| {
+                        let code = item.reason.split_whitespace().next().unwrap_or("unknown");
+                        format!("{}: {code}", item.model)
+                    })
+                    .collect();
+                if run_options.model.is_some() {
+                    output.statements.clear();
+                }
+                let refused_names: BTreeSet<&str> =
+                    refused.iter().map(|item| item.model.as_str()).collect();
+                output
+                    .skipped
+                    .retain(|item| !refused_names.contains(item.model.as_str()));
+                output.skipped.extend(refused);
             }
             Ok(None) => {
                 // `models/` exists but compile produced zero models.
@@ -534,7 +574,7 @@ pub async fn plan(
     // any residual path — e.g. a models-directory TOCTOU that flips the
     // `exists()` check between the preview and persistence — so replication is
     // provably unreachable whenever `--model` is set.
-    if run_options.model.is_some() && !run_plan_persisted {
+    if run_options.model.is_some() && !run_plan_persisted && !compile_refused {
         anyhow::bail!(
             "failed to build a model-scoped run plan for --model; \
              refusing to fall back to a replication plan"
@@ -549,7 +589,7 @@ pub async fn plan(
     // is content-addressed by the canonical `RockyConfig` snapshot + the
     // discovered source state (sorted connectors + tables), so identical
     // inputs produce an identical plan_id across machines.
-    if !run_plan_persisted {
+    if !run_plan_persisted && !compile_refused {
         match build_and_persist_replication_plan(
             &rocky_cfg,
             &connectors,
@@ -584,6 +624,9 @@ pub async fn plan(
         render_governance_preview_text(&output);
         render_budget_diagnostics_text(&output);
         render_semantic_verdict_text(&output);
+        for skipped in &output.skipped {
+            eprintln!("Skipped model '{}': {}", skipped.model, skipped.reason);
+        }
         if let Some(ref plan_id) = output.plan_id {
             println!();
             match output.plan_kind.as_deref() {
@@ -606,6 +649,11 @@ pub async fn plan(
             println!("Apply with: rocky apply {plan_id}");
         }
     }
+    anyhow::ensure!(
+        !compile_refused,
+        "compiler refused the following models:\n{}",
+        refusal_details.join("\n")
+    );
     Ok(())
 }
 
@@ -1161,7 +1209,7 @@ pub fn plan_preview_output(
 
 /// Compile the models directory, build a `RunPlan` payload, persist it to
 /// `.rocky/plans/<plan_id>.json`, and return
-/// `Some((payload, plan_id, persisted_at))`.
+/// `Some(RunPlanBuild)`.
 ///
 /// Returns `Ok(None)` when the compile succeeds but produces zero models —
 /// the caller falls through to the replication-plan branch in that case.
@@ -1179,7 +1227,7 @@ fn build_and_persist_run_plan(
     run_options: &PlanRunOptions,
     base_ref: &str,
     state_path: &Path,
-) -> Result<Option<(RunPlan, String, chrono::DateTime<Utc>)>> {
+) -> Result<Option<RunPlanBuild>> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
@@ -1201,6 +1249,39 @@ fn build_and_persist_run_plan(
         // `_defaults.toml` or stub files). Let the caller take the
         // replication-plan path.
         return Ok(None);
+    }
+
+    // `--model` persists only that model. Include its declared prerequisites,
+    // since apply needs them, but ignore errors in unrelated models.
+    let mut needed = BTreeSet::new();
+    if let Some(selected) = run_options.model.as_deref() {
+        needed.insert(selected.to_string());
+        loop {
+            let before = needed.len();
+            for node in &result.project.dag_nodes {
+                if needed.contains(&node.name) {
+                    needed.extend(node.depends_on.iter().cloned());
+                }
+            }
+            if needed.len() == before {
+                break;
+            }
+        }
+    }
+    let refused: Vec<SkippedModel> = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.is_error()
+                && (run_options.model.is_none() || needed.contains(&diagnostic.model))
+        })
+        .map(|diagnostic| SkippedModel {
+            model: diagnostic.model.clone(),
+            reason: format!("[{}] {}", diagnostic.code, diagnostic.message),
+        })
+        .collect();
+    if !refused.is_empty() {
+        return Ok(Some(RunPlanBuild::Refused(refused)));
     }
 
     let (models, execution_layers) = if let Some(model) = run_options.model.as_deref() {
@@ -1253,41 +1334,51 @@ fn build_and_persist_run_plan(
         spec_digest: None,
     };
 
-    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let (plan_id, persisted_at) = (|| -> Result<(String, chrono::DateTime<Utc>)> {
+        let cwd = std::env::current_dir().context("failed to get current working directory")?;
 
-    // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
-    // change-classification into the plan payload, so a later `rocky apply`
-    // evaluates the plan against the identity that authored it and the exact
-    // capabilities that were reviewed.
-    let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
-    // Finding #4: bind the mask iff the apply reaches the mask-reconciling path —
-    // a Replication pipeline whose model leg runs (`--all` / `--models`) on a full
-    // (`--model`-less) run. Resolved with the SAME `resolve_pipeline` `run()` uses,
-    // and the SAME `run_all || models_dir` predicate `run.rs` gates the model leg
-    // with, so it matches the apply-side literal `reconciles_masks`. A resolution
-    // failure ⇒ `false` (fail-safe: apply that doesn't reach the leg never checks
-    // the gate, so a wrong-`true` is harmless; a wrong-`false` would false-refuse).
-    let bind_masks = rocky_core::config::load_rocky_config(config_path)
-        .ok()
-        .map(|cfg| {
-            crate::commands::apply::pipeline_is_replication(&cfg, pipeline)
-                && (run_options.all || run_options.models_dir.is_some())
-                && run_options.model.is_none()
-        })
-        .unwrap_or(false);
-    let capabilities = compute_embedded_capabilities(
-        config_path,
-        models_dir,
-        base_ref,
-        Some(state_path),
-        env,
-        bind_masks,
-    )?;
-    let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
-        .context("failed to write run plan")?;
+        // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
+        // change-classification into the plan payload, so a later `rocky apply`
+        // evaluates the plan against the identity that authored it and the exact
+        // capabilities that were reviewed.
+        let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
+        // Finding #4: bind the mask iff the apply reaches the mask-reconciling path —
+        // a Replication pipeline whose model leg runs (`--all` / `--models`) on a full
+        // (`--model`-less) run. Resolved with the SAME `resolve_pipeline` `run()` uses,
+        // and the SAME `run_all || models_dir` predicate `run.rs` gates the model leg
+        // with, so it matches the apply-side literal `reconciles_masks`. A resolution
+        // failure ⇒ `false` (fail-safe: apply that doesn't reach the leg never checks
+        // the gate, so a wrong-`true` is harmless; a wrong-`false` would false-refuse).
+        let bind_masks = rocky_core::config::load_rocky_config(config_path)
+            .ok()
+            .map(|cfg| {
+                crate::commands::apply::pipeline_is_replication(&cfg, pipeline)
+                    && (run_options.all || run_options.models_dir.is_some())
+                    && run_options.model.is_none()
+            })
+            .unwrap_or(false);
+        let capabilities = compute_embedded_capabilities(
+            config_path,
+            models_dir,
+            base_ref,
+            Some(state_path),
+            env,
+            bind_masks,
+        )?;
+        let plan_id = write_plan_governed(&cwd, PlanKind::Run, &run_plan, principal, capabilities)
+            .context("failed to write run plan")?;
+        Ok((plan_id, Utc::now()))
+    })()?;
+    Ok(Some(RunPlanBuild::Persisted(
+        Box::new(run_plan),
+        plan_id,
+        persisted_at,
+    )))
+}
 
-    let persisted_at = Utc::now();
-    Ok(Some((run_plan, plan_id, persisted_at)))
+enum RunPlanBuild {
+    Refused(Vec<SkippedModel>),
+    Persisted(Box<RunPlan>, String, chrono::DateTime<Utc>),
 }
 
 /// Compute the propose-time change-classification (capability-embed) to embed in a governed
@@ -1570,9 +1661,9 @@ pub(crate) fn build_source_state_snapshot(
 /// this function only canonicalizes the result and persists.
 /// Keep a shadow descriptor only when shadow routing is actually requested.
 ///
-/// `--shadow-suffix` / `--shadow-schema` are accepted without `--shadow`, where
-/// they are inert. Returning `None` there keeps a production plan's payload —
-/// and therefore its `plan_id` — exactly as it was before these fields existed.
+/// A plan without `--shadow` or `--branch` has no shadow override. Returning
+/// `None` there keeps a production plan's payload — and therefore its
+/// `plan_id` — exactly as it was before these fields existed.
 fn shadow_descriptor(run_options: &PlanRunOptions, value: Option<&String>) -> Option<String> {
     if run_options.shadow || run_options.branch.is_some() {
         value.cloned()
@@ -1689,15 +1780,11 @@ fn build_and_persist_replication_plan(
         // Success. That is the #1272 defect shape, one plan kind over.
         shadow: run_options.shadow,
         // Only carry the descriptors when the plan is actually a shadow plan.
-        // `--shadow-schema` and `--shadow-suffix` are accepted WITHOUT
-        // `--shadow` (only `--branch` conflicts with them), and such a run is
-        // still a production run. Persisting an inert flag would add a payload
-        // key — and so a new `plan_id` — to a plan whose behaviour is
-        // unchanged. `main.rs` already applies exactly this normalisation to
-        // `shadow_suffix` before it reaches `PlanRunOptions`, and for the same
-        // stated reason; `shadow_schema` is not normalised there, so it is
-        // handled here rather than widening that path and shifting `RunPlan`
-        // ids too.
+        // Clap now requires `--shadow` with either explicit descriptor, but
+        // `PlanRunOptions` can also be constructed by internal callers. Keep
+        // non-shadow replication plan payloads free of inert descriptors so
+        // their plan IDs remain stable. `main.rs` already normalises the
+        // default suffix before it reaches this point.
         shadow_suffix: shadow_descriptor(run_options, run_options.shadow_suffix.as_ref()),
         shadow_schema: shadow_descriptor(run_options, run_options.shadow_schema.as_ref()),
         branch: run_options.branch.clone(),
@@ -2502,7 +2589,7 @@ pub(crate) async fn build_promote_plan_inner(
 
     // `state_path` is the namespace-aware path threaded from main.rs; the
     // branch record lives in whichever state file this invocation targets.
-    let store = StateStore::open_read_only(state_path).with_context(|| {
+    let store = StateStore::open_read_only_or_empty(state_path).with_context(|| {
         format!(
             "failed to open state store at {} — run `rocky branch create {}` first",
             state_path.display(),
@@ -2607,7 +2694,9 @@ pub(crate) async fn build_promote_plan_inner(
     let (resolved_pipeline_name, planned_targets) =
         discover_branch_targets_for_plan(config_path, &record, filter, pipeline_name).await?;
 
-    let head_ref = std::process::Command::new("git")
+    let mut git = std::process::Command::new("git");
+    rocky_core::process::strip_dagster_pipes_env(&mut git);
+    let head_ref = git
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()
@@ -2765,9 +2854,8 @@ mod tests {
 
     /// #1403: an inert shadow descriptor must not reach the payload.
     ///
-    /// `--shadow-suffix` / `--shadow-schema` are accepted WITHOUT `--shadow`
-    /// (only `--branch` conflicts with them), and such a run is a production
-    /// run. Persisting the flag anyway adds a payload key to a plan whose
+    /// A plan without `--shadow` or `--branch` uses production routing.
+    /// Persisting an override anyway adds a payload key to a plan whose
     /// behaviour is unchanged, and `plan_id` is `blake3({kind, payload})` — so
     /// an existing project's plan id would move for a flag that does nothing.
     ///
@@ -3576,6 +3664,218 @@ threshold = 0
         assert!(
             msg.contains("pipeline \"p\""),
             "the refusal must name the pipeline: {msg}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn plan_collision_fixture(
+        options: PlanRunOptions,
+        separate_source: bool,
+        custom_name: &str,
+    ) -> anyhow::Result<()> {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir()?;
+        let source_path = dir.path().join("source.duckdb");
+        let target_path = if separate_source {
+            dir.path().join("target.duckdb")
+        } else {
+            source_path.clone()
+        };
+        for (index, db_path) in [&source_path, &target_path].into_iter().enumerate() {
+            if index == 1 && !separate_source {
+                continue;
+            }
+            let warehouse = DuckDbWarehouseAdapter::open(db_path)?;
+            for schema in ["raw__acme", "raw__widgets"] {
+                warehouse
+                    .execute_statement(&format!("CREATE SCHEMA {schema}"))
+                    .await?;
+                if !separate_source || schema == "raw__acme" || db_path == &source_path {
+                    warehouse
+                        .execute_statement(&format!(
+                            "CREATE TABLE {schema}.orders AS SELECT 1 AS id"
+                        ))
+                        .await?;
+                }
+            }
+        }
+        if options.model.is_some() {
+            let models = dir.path().join("models");
+            std::fs::create_dir(&models)?;
+            std::fs::write(models.join("m.sql"), "-- model: m\nSELECT 1 AS id")?;
+            std::fs::write(
+                models.join("m.toml"),
+                r#"name = "m"
+[strategy]
+type = "full_refresh"
+[target]
+catalog = ""
+schema = "mart"
+table = "m"
+"#,
+            )?;
+        }
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter.source]
+type = "duckdb"
+path = "{}"
+
+[adapter.target]
+type = "duckdb"
+path = "{}"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "source"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "target"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.checks]
+cross_source_overlap = {{ keys = ["id"] }}
+
+[[pipeline.p.checks.custom]]
+name = "{custom_name}"
+sql = "SELECT 0"
+threshold = 0
+"#,
+                source_path.display(),
+                target_path.display()
+            ),
+        )?;
+        plan(
+            &config_path,
+            None,
+            None,
+            None,
+            &options,
+            false,
+            "HEAD",
+            &dir.path().join("state.redb"),
+            false,
+        )
+        .await
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_model_filter_skips_replication_check_collisions() {
+        plan_collision_fixture(
+            PlanRunOptions {
+                model: Some("m".into()),
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect("a selected model does not run replication checks");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_shadow_suffix_uses_the_written_table_name_for_checks() {
+        plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect("the shadow name does not collide with the production check name");
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_refuses_discovered_collision_without_listing_source_tables() {
+        let error = plan_collision_fixture(
+            PlanRunOptions::default(),
+            true,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect_err("plan checks discovered tables without a warehouse listing");
+        assert!(
+            format!("{error:#}").contains("cross_source_overlap:duckdb.orders"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_shadow_suffix_refuses_a_collision_on_the_written_table() {
+        let error = plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders rocky shadow",
+        )
+        .await
+        .expect_err("the shadow check names collide");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cross_source_overlap:duckdb.orders_rocky_shadow"),
+            "{message}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_shadow_schema_keeps_the_original_table_name_for_checks() {
+        let error = plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                shadow_schema: Some("preview".into()),
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders",
+        )
+        .await
+        .expect_err("a shadow schema does not suffix table names");
+        assert!(
+            format!("{error:#}").contains("cross_source_overlap:duckdb.orders"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn plan_custom_shadow_suffix_uses_the_written_table_name_for_checks() {
+        let error = plan_collision_fixture(
+            PlanRunOptions {
+                shadow: true,
+                shadow_suffix: Some("_preview".into()),
+                ..Default::default()
+            },
+            false,
+            "cross source overlap duckdb orders preview",
+        )
+        .await
+        .expect_err("the custom suffix changes the collision name");
+        assert!(
+            format!("{error:#}").contains("cross_source_overlap:duckdb.orders_preview"),
+            "{error:#}"
         );
     }
 
