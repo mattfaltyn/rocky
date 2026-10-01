@@ -130,9 +130,14 @@ Rocky refuses `--resume` and `--resume-latest` when every planned table copied
 but the terminal run record is missing. Skipping those tables would also skip
 their post-copy checks and could report false success.
 
-Run the pipeline without a resume flag to reconcile watermarks and execute
-checks. If Rocky cannot verify the recovery contract, use the full-refresh route
-above. Incomplete crash checkpoints remain resumable.
+Follow the recovery route in the refusal. A confirmed checkpoint allows a fresh
+run without a resume flag to execute checks. Supported recovery descriptors also
+allow a fresh run to reconcile watermarks before copying.
+
+Older or unsupported checkpoints require full refresh. Keep that strategy until
+the saved incremental cursor matches the replacement target. Switching back to
+incremental with a wall-clock refresh cursor can skip later source arrivals.
+Incomplete crash checkpoints remain resumable.
 
 ## Merge strategy
 

@@ -2305,13 +2305,36 @@ fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> 
                         .collect()
                 })
                 .join(", ");
+            let guidance = if progress.watermarks_confirmed {
+                "Its target watermarks are confirmed. Run the pipeline without a resume \
+                 flag to re-run the post-copy checks."
+            } else if progress
+                .watermark_recovery_tables
+                .as_ref()
+                .is_some_and(|tables| !tables.is_empty())
+                && progress
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.target.as_ref())
+                    .is_some_and(|target| {
+                        matches!(
+                            target.endpoint.adapter_type.to_ascii_lowercase().as_str(),
+                            "duckdb" | "databricks" | "snowflake" | "bigquery"
+                        )
+                    })
+            {
+                "Run the pipeline without a resume flag to reconcile its persisted \
+                 target watermark contracts and re-run the post-copy checks."
+            } else {
+                "Run these tables with the full_refresh strategy without a resume flag \
+                 to replace their data and re-run checks. Keep full_refresh until the \
+                 saved incremental cursor is reconciled to the replacement target; \
+                 do not return to incremental with a wall-clock refresh cursor."
+            };
             anyhow::bail!(
                 "cannot resume run '{}': every planned table copied, but its terminal run \
                  record is missing; resuming would skip the post-copy checks and report a \
-                 false success. Affected tables: {tables}. Run the pipeline without a \
-                 resume flag to recover its target watermarks and re-run checks; if the \
-                 recovery contract cannot be verified, use the full_refresh strategy for \
-                 these tables first",
+                 false success. Affected tables: {tables}. {guidance}",
                 progress.run_id
             );
         }
@@ -14740,6 +14763,12 @@ async fn reconcile_prior_watermarks(
     let mut current_replacements = std::collections::HashSet::new();
     for task in tasks {
         if let Some(table) = watermark_recovery_table(pipeline, task, state)? {
+            // process_table bootstraps by replacing when its incremental
+            // watermark is absent. No original contract is needed to append
+            // because this invocation will overwrite the target instead.
+            if table.prior_watermark.is_none() {
+                current_replacements.insert(table_key(task));
+            }
             current_incremental.insert(table.target.full_name(), table);
         }
         if replaces_target(pipeline, task)? {
@@ -43429,6 +43458,120 @@ timestamp_column = "ts"
 
     #[cfg(feature = "duckdb")]
     #[tokio::test]
+    async fn checkpoint_recovery_legacy_missing_watermark_bootstraps_before_confirmation() {
+        use chrono::TimeZone;
+        for has_mismatched_record in [false, true] {
+            let (_dir, warehouse, state, pipeline, task, scope, descriptor) =
+                checkpoint_recovery_boundary_fixture().await;
+            state
+                .init_run_progress("old", &[table_key(&task)], Some(&scope))
+                .unwrap();
+            if has_mismatched_record {
+                seed_run_record(&state, "old", "PartialFailure");
+            }
+            state
+                .delete_watermark(&descriptor.target.state_key())
+                .unwrap();
+            // An unaccounted target row must be replaced, rather than appended
+            // to, even when the legacy contract cannot be reconstructed.
+            warehouse
+                .execute_statement(
+                    "INSERT INTO tgt.events VALUES (99, TIMESTAMP '2026-03-03 12:00:00')",
+                )
+                .await
+                .unwrap();
+            let replacements = reconcile_prior_watermarks(
+                &warehouse,
+                &state,
+                &pipeline,
+                std::slice::from_ref(&task),
+                &scope,
+                "changed-configuration",
+                has_mismatched_record,
+            )
+            .await
+            .unwrap();
+            assert_eq!(replacements.len(), 1);
+            assert_eq!(
+                replacements[0].required_targets,
+                vec![descriptor.target.state_key()]
+            );
+            assert!(
+                !state
+                    .get_run_progress("old")
+                    .unwrap()
+                    .unwrap()
+                    .watermarks_confirmed
+            );
+            let current = watermark_recovery_table(&pipeline, &task, &state)
+                .unwrap()
+                .unwrap();
+            state
+                .init_run_progress_with_recovery(
+                    "bootstrap",
+                    &[table_key(&task)],
+                    Some(&scope),
+                    std::slice::from_ref(&current),
+                )
+                .unwrap();
+            let TableOutcome::Materialized(result) = process_table_with_replacement_recovery(
+                &warehouse, &state, &pipeline, &task, true, true,
+            )
+            .await
+            .unwrap() else {
+                panic!("missing watermark must bootstrap with full refresh");
+            };
+            assert_eq!(result.materialization.metadata.strategy, "full_refresh");
+            let wm = result.deferred_watermark.unwrap();
+            assert_eq!(
+                wm.timestamp,
+                Utc.with_ymd_and_hms(2026, 3, 2, 12, 0, 0).unwrap()
+            );
+            assert!(
+                !state
+                    .get_run_progress("old")
+                    .unwrap()
+                    .unwrap()
+                    .watermarks_confirmed
+            );
+            assert_eq!(
+                warehouse
+                    .execute_query("SELECT id FROM tgt.events ORDER BY id")
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![vec!["1".to_string()], vec!["2".to_string()]]
+            );
+            let runs = watermark_confirmation_runs(
+                "bootstrap",
+                &[current],
+                &replacements,
+                std::slice::from_ref(&wm),
+            );
+            let durable = WatermarkState {
+                last_value: wm.timestamp,
+                updated_at: wm.timestamp,
+            };
+            state
+                .batch_set_watermarks_and_confirm_runs(
+                    &[(wm.state_key.as_str(), &durable)],
+                    &runs.iter().map(String::as_str).collect::<Vec<_>>(),
+                )
+                .unwrap();
+            for id in ["old", "bootstrap"] {
+                assert!(
+                    state
+                        .get_run_progress(id)
+                        .unwrap()
+                        .unwrap()
+                        .watermarks_confirmed
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
     async fn checkpoint_recovery_legacy_uses_terminal_configuration_evidence() {
         let (_dir, warehouse, state, pipeline, task, scope, descriptor) =
             checkpoint_recovery_boundary_fixture().await;
@@ -43983,6 +44126,131 @@ timestamp_column = "ts"
         )
         .await
         .map(|_| ())
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn checkpoint_recovery_confirmed_recordless_guidance_preserves_incremental_cursor() {
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let rt = remote_state_test_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let config = rt.block_on(write_many_table_project(dir.path(), 1, Some(1)));
+        let raw = std::fs::read_to_string(&config).unwrap().replace(
+            "strategy = \"full_refresh\"",
+            "strategy = \"incremental\"\ntimestamp_column = \"ts\"",
+        );
+        std::fs::write(&config, raw).unwrap();
+        let db = dir.path().join("warehouse.duckdb");
+        let state_path = dir.path().join("state.redb");
+        rt.block_on(async {
+            let warehouse = DuckDbWarehouseAdapter::open(&db).unwrap();
+            warehouse
+                .execute_statement("ALTER TABLE raw__acme.t00 ADD COLUMN ts TIMESTAMP")
+                .await
+                .unwrap();
+            warehouse
+                .execute_statement("UPDATE raw__acme.t00 SET ts = TIMESTAMP '2026-03-01 12:00:00'")
+                .await
+                .unwrap();
+        });
+        let run_id = "confirmed-recordless-guidance";
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = Some(run_id.into());
+        let result = rt.block_on(checkpoint_ordering_run(&config, &state_path, run_id, false));
+        *super::FAIL_RECORD_WRITE_FOR_TEST.lock().unwrap() = None;
+        result.unwrap();
+        {
+            let state = StateStore::open(&state_path).unwrap();
+            let progress = state.get_run_progress(run_id).unwrap().unwrap();
+            assert!(progress.watermarks_confirmed);
+            assert!(state.get_run(run_id).unwrap().is_none());
+            let error = ensure_run_is_resumable(&state, &progress).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("target watermarks are confirmed"),
+                "{message}"
+            );
+            assert!(message.contains("without a resume flag"), "{message}");
+            assert!(!message.contains("full_refresh"), "{message}");
+
+            let mut unconfirmed = progress.clone();
+            unconfirmed.watermarks_confirmed = false;
+            let message = format!(
+                "{:#}",
+                ensure_run_is_resumable(&state, &unconfirmed).unwrap_err()
+            );
+            assert!(
+                message.contains("reconcile its persisted target watermark contracts"),
+                "{message}"
+            );
+            unconfirmed
+                .scope
+                .as_mut()
+                .unwrap()
+                .target
+                .as_mut()
+                .unwrap()
+                .endpoint
+                .adapter_type = "process".into();
+            let message = format!(
+                "{:#}",
+                ensure_run_is_resumable(&state, &unconfirmed).unwrap_err()
+            );
+            assert!(message.contains("Keep full_refresh until"), "{message}");
+            assert!(
+                message.contains("do not return to incremental"),
+                "{message}"
+            );
+            unconfirmed.watermark_recovery_tables = None;
+            let message = format!(
+                "{:#}",
+                ensure_run_is_resumable(&state, &unconfirmed).unwrap_err()
+            );
+            assert!(message.contains("Keep full_refresh until"), "{message}");
+        }
+        let error = rt
+            .block_on(drive_resume_test_run(
+                &config,
+                &state_path,
+                "rep",
+                Some(run_id),
+                false,
+            ))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("target watermarks are confirmed"));
+        for (id, timestamp) in [(1, "2026-03-02 12:00:00"), (2, "2026-03-03 12:00:00")] {
+            rt.block_on(async {
+                let warehouse = DuckDbWarehouseAdapter::open(&db).unwrap();
+                warehouse
+                    .execute_statement(&format!(
+                        "INSERT INTO raw__acme.t00 VALUES ({id}, TIMESTAMP '{timestamp}')"
+                    ))
+                    .await
+                    .unwrap();
+            });
+            rt.block_on(checkpoint_ordering_run(
+                &config,
+                &state_path,
+                &format!("fresh-after-recordless-{id}"),
+                false,
+            ))
+            .unwrap();
+        }
+        rt.block_on(async {
+            let warehouse = DuckDbWarehouseAdapter::open(&db).unwrap();
+            assert_eq!(
+                warehouse
+                    .execute_query("SELECT id FROM staging__acme.t00 ORDER BY id")
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![
+                    vec!["0".to_string()],
+                    vec!["1".to_string()],
+                    vec!["2".to_string()]
+                ]
+            );
+        });
     }
 
     #[cfg(feature = "duckdb")]

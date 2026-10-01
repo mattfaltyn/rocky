@@ -591,10 +591,11 @@ rocky run [flags]
 copied but whose terminal run record is missing. Resuming that checkpoint would
 skip its post-copy checks. Incomplete crash checkpoints remain resumable.
 
-Run without a resume flag to reconcile target watermarks and execute checks.
-If the original recovery contract cannot be verified, first run the affected
-tables with `strategy = "full_refresh"`. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
-for supported adapters and remote durability limits.
+Follow the refusal's recovery route. Confirmed checkpoints and supported recovery
+descriptors allow a fresh run without a resume flag. Older or unsupported
+checkpoints require `strategy = "full_refresh"`. Keep that strategy until the
+saved incremental cursor matches the replacement target. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
+for recovery routes, supported adapters and remote durability limits.
 
 ### Guard one model with a contract
 
