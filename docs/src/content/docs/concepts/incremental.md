@@ -109,8 +109,9 @@ Legacy checkpoints do not preserve their original source and timestamp contracts
 An unchanged configuration hash cannot prove discovery still selects the same
 source table. Include every originally planned target in a full-refresh recovery
 run, even when the configuration did not change. Missing cursors can select
-that full-refresh bootstrap automatically. If the legacy planned set is missing,
-recover its target identities from run logs before retiring the checkpoint.
+that full-refresh bootstrap automatically. A legacy checkpoint missing its planned
+target set remains unresolved after full refresh. Keep full refresh and seek manual
+recovery support before returning to incremental mode.
 
 Keep `timestamp_column` configured for the source you are restoring. Recovery
 replacements establish its target MAX before confirmation, so returning to
