@@ -7473,6 +7473,75 @@ pub struct LoadedConfig {
     /// 16-hex-char fingerprint of the raw file bytes captured at load time —
     /// see [`config_fingerprint_bytes`].
     pub fingerprint: String,
+    /// Pipelines whose legacy replication cursor contract uses literal config
+    /// values. A raw fingerprint alone cannot prove an environment-expanded
+    /// timestamp, strategy, or source mapping stayed unchanged between runs.
+    /// This proof comes from the same owned bytes as `config` and `fingerprint`.
+    pub literal_replication_watermark_contracts: std::collections::BTreeSet<String>,
+}
+
+fn literal_replication_watermark_contracts(
+    raw: &str,
+    config: &RockyConfig,
+) -> std::collections::BTreeSet<String> {
+    fn has_substitution(value: &toml::Value) -> bool {
+        match value {
+            toml::Value::String(value) => ENV_VAR_RE.is_match(value),
+            toml::Value::Array(values) => values.iter().any(has_substitution),
+            toml::Value::Table(values) => values.values().any(has_substitution),
+            _ => false,
+        }
+    }
+
+    let Ok(mut raw) = raw.parse::<toml::Value>() else {
+        // Bare substituted values need expansion before TOML can parse them.
+        // Without a literal proof, legacy recovery must use a replacement.
+        return Default::default();
+    };
+    normalize_toml_shorthands(&mut raw);
+    let adapter = |name: &str| {
+        raw.get("adapter")
+            .or_else(|| raw.get("adapters"))
+            .and_then(|adapters| {
+                adapters.get(name).or_else(|| {
+                    (name == "default" && config.adapters.len() == 1)
+                        .then(|| adapters.as_table()?.values().next())
+                        .flatten()
+                })
+            })
+    };
+    config
+        .pipelines
+        .iter()
+        .filter_map(|(name, pipeline)| {
+            let pipeline = pipeline.as_replication()?;
+            let original = raw
+                .get("pipeline")
+                .or_else(|| raw.get("pipelines"))?
+                .get(name)?;
+            let dynamic_pipeline = [
+                "type",
+                "strategy",
+                "timestamp_column",
+                "source",
+                "table_overrides",
+            ]
+            .iter()
+            .any(|field| original.get(field).is_some_and(has_substitution));
+            let dynamic_adapters = [
+                (&pipeline.source.adapter, true),
+                (&pipeline.target.adapter, false),
+            ]
+            .iter()
+            .any(|(name, source)| {
+                adapter(name).is_none_or(|adapter| {
+                    adapter.get("type").is_some_and(has_substitution)
+                        || (*source && adapter.get("extra").is_some_and(has_substitution))
+                })
+            });
+            (!dynamic_pipeline && !dynamic_adapters).then(|| name.clone())
+        })
+        .collect()
 }
 
 /// Stable 16-char hex fingerprint of a config file's raw bytes.
@@ -7511,9 +7580,12 @@ pub fn load_rocky_config_fingerprinted(path: &Path) -> Result<LoadedConfig, Conf
     let fingerprint = config_fingerprint_bytes(raw.as_bytes());
     let config = parse_rocky_config_str(&raw)?;
     validate_loaded_config(&config)?;
+    let literal_replication_watermark_contracts =
+        literal_replication_watermark_contracts(&raw, &config);
     Ok(LoadedConfig {
         config,
         fingerprint,
+        literal_replication_watermark_contracts,
     })
 }
 
@@ -8380,6 +8452,102 @@ mod tests {
             full.contains("ROCKY_TEST_LEAK_PROBE"),
             "the operator still needs to know which var to look at: {full}"
         );
+    }
+
+    #[test]
+    fn legacy_watermark_proof_rejects_dynamic_contracts_but_allows_credentials() {
+        let raw = r#"
+[adapter.db]
+type = "duckdb"
+path = "wh.duckdb"
+token = "literal-token"
+
+[pipeline.raw]
+type = "replication"
+strategy = "incremental"
+timestamp_column = "synced_at"
+
+[pipeline.raw.source]
+adapter = "db"
+catalog = "src"
+
+[pipeline.raw.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.raw.target]
+adapter = "db"
+catalog_template = "wh"
+schema_template = "raw"
+"#;
+        let config = parse_rocky_config_str(raw).unwrap();
+        assert_eq!(
+            literal_replication_watermark_contracts(raw, &config),
+            std::collections::BTreeSet::from(["raw".into()])
+        );
+        let credential = raw.replace("literal-token", "${ROCKY_TOKEN}");
+        assert!(literal_replication_watermark_contracts(&credential, &config).contains("raw"));
+        for dynamic in [
+            raw.replace("synced_at", "${REPLICATION_TS}"),
+            raw.replace("incremental", "${REPLICATION_STRATEGY}"),
+            raw.replace("catalog = \"src\"", "catalog = \"${SOURCE_CAT}\""),
+            raw.replace("type = \"duckdb\"", "type = \"${ADAPTER_TYPE}\""),
+            format!(
+                "{raw}\n[[pipeline.raw.table_overrides]]\nstrategy = \"incremental\"\n[pipeline.raw.table_overrides.match]\ntable = \"${{OVERRIDE_TABLE}}\"\n"
+            ),
+            format!("{raw}\n[adapter.db.extra]\ntables = [\"${{MANUAL_TABLE}}\"]\n"),
+            format!("{raw}\n[pipeline.raw.execution]\nconcurrency = ${{CONCURRENCY}}\n"),
+        ] {
+            assert!(
+                literal_replication_watermark_contracts(&dynamic, &config).is_empty(),
+                "dynamic or unparseable raw contracts cannot prove a legacy cursor safe"
+            );
+        }
+        let alias = raw.replace("[adapter.db]", "[adapters.db]");
+        assert!(literal_replication_watermark_contracts(&alias, &config).contains("raw"));
+        let alias = raw.replace("[pipeline.raw", "[pipelines.raw");
+        assert!(literal_replication_watermark_contracts(&alias, &config).contains("raw"));
+        let implicit_adapter = raw.replace("adapter = \"db\"\n", "");
+        let implicit_config = parse_rocky_config_str(&implicit_adapter).unwrap();
+        assert!(
+            literal_replication_watermark_contracts(&implicit_adapter, &implicit_config)
+                .contains("raw")
+        );
+    }
+
+    #[test]
+    fn fingerprinted_load_keeps_owned_literal_watermark_proof_after_config_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        let raw = r#"
+[adapter]
+type = "duckdb"
+path = "wh.duckdb"
+[pipeline]
+type = "replication"
+[pipeline.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+[pipeline.target]
+catalog_template = "wh"
+schema_template = "raw"
+"#;
+        std::fs::write(&path, raw).unwrap();
+        let loaded = load_rocky_config_fingerprinted(&path).unwrap();
+        assert!(
+            loaded
+                .literal_replication_watermark_contracts
+                .contains("default")
+        );
+        std::fs::write(&path, "not a configuration").unwrap();
+        assert!(
+            loaded
+                .literal_replication_watermark_contracts
+                .contains("default")
+        );
+        assert_eq!(loaded.fingerprint, config_fingerprint_bytes(raw.as_bytes()));
     }
 
     /// WP-01 PR-B: `load_rocky_config_fingerprinted` is deterministic across

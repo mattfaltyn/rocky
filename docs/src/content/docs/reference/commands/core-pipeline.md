@@ -585,6 +585,17 @@ rocky run [flags]
 `--defer` rewrites each selected model's SQL to qualify deferred upstream references, and the rewrite parses the model with the Databricks dialect. Constructs the parser does not support (`SELECT * EXCEPT (...)`, trailing-comma select lists, and `STRUCT(...)` literals) cannot be rewritten and fail with a clear error. Build those models without `--defer`. With `--defer` off (the default), runs are byte-identical to before the flag existed.
 :::
 
+### Recovering replication checkpoints
+
+`--resume` and `--resume-latest` refuse a checkpoint whose every planned table
+copied but whose terminal run record is missing. Resuming that checkpoint would
+skip its post-copy checks. Incomplete crash checkpoints remain resumable.
+
+Run without a resume flag to reconcile target watermarks and execute checks.
+If the original recovery contract cannot be verified, first run the affected
+tables with `strategy = "full_refresh"`. See [Interrupted replication](/concepts/incremental/#recovering-an-interrupted-replication)
+for supported adapters and remote durability limits.
+
 ### Guard one model with a contract
 
 Use `--contracts` when you build one `full_refresh` transformation model:
