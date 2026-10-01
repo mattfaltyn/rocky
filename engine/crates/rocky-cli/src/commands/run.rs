@@ -5370,10 +5370,7 @@ pub async fn run_with_explicit_contracts(
             &state_store,
             pipeline,
             &tables_to_process,
-            &resume_scope,
-            &config_hash,
-            loaded.literal_replication_watermark_contracts.contains(pipeline_name),
-        )
+            &resume_scope,)
         .await?
     } else {
         Vec::new()
@@ -14743,10 +14740,23 @@ async fn recovered_target_watermark(
     }))
 }
 
+/// A plan-less legacy header identifies every original target only when the
+/// distinct recorded keys account for its original table count.
+fn legacy_recovery_target_set_known(progress: &RunProgress) -> bool {
+    progress.planned_tables.is_some()
+        || progress
+            .tables
+            .iter()
+            .map(|table| table.table_key.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == progress.total_tables
+}
+
 /// Repair every unresolved header, including older runs and other filters.
-/// A legacy header can borrow the current contract only when its terminal
-/// record proves the exact configuration hash. Otherwise a replacement is
-/// required; guessing a timestamp column could silently skip source rows.
+/// A legacy header has no original source/timestamp contract. Discovery can
+/// remap another source to its target even when configuration is unchanged,
+/// so its target must be replaced before another append.
 /// Returns headers that can be retired after this run replaces their targets.
 async fn reconcile_prior_watermarks(
     warehouse: &dyn WarehouseAdapter,
@@ -14754,8 +14764,6 @@ async fn reconcile_prior_watermarks(
     pipeline: &ReplicationPipelineConfig,
     tasks: &[TableTask],
     scope: &ResumeScope,
-    config_hash: &str,
-    legacy_contract_is_literal: bool,
 ) -> Result<Vec<ReplacementRecovery>> {
     let current: HashMap<String, &TableTask> =
         tasks.iter().map(|task| (table_key(task), task)).collect();
@@ -14786,56 +14794,62 @@ async fn reconcile_prior_watermarks(
                 .map(|table| table.table_key.clone())
                 .collect()
         });
-        let (tables, can_confirm) = match progress.watermark_recovery_tables.as_ref() {
-            Some(tables) => (tables.clone(), true),
+        let tables = match progress.watermark_recovery_tables.as_ref() {
+            Some(tables) => tables.clone(),
             None => {
-                let same_config = legacy_contract_is_literal
-                    && state
-                        .get_run(&progress.run_id)?
-                        .is_some_and(|record| record.config_hash == config_hash);
+                if !legacy_recovery_target_set_known(&progress) {
+                    if current_incremental
+                        .values()
+                        .any(|table| !current_replacements.contains(&table.target.full_name()))
+                    {
+                        anyhow::bail!(
+                            "cannot recover legacy run '{}': its original planned target \
+                             set and timestamp/source contracts are unavailable. Use \
+                             full_refresh without a resume flag for the current targets \
+                             and keep that strategy until the original targets and saved \
+                             incremental cursors are reconciled; this run cannot be \
+                             confirmed from a partial checkpoint",
+                            progress.run_id
+                        );
+                    }
+                    // A safe current replacement cannot prove that every
+                    // original target was accounted for. Leave this header pending.
+                    continue;
+                }
                 let relevant: Vec<_> = legacy_keys
                     .iter()
                     .filter_map(|key| current.get(key).map(|task| (key, *task)))
                     .collect();
-                if !same_config {
-                    if relevant.is_empty() {
-                        continue;
-                    }
-                    if relevant
-                        .iter()
-                        .all(|(key, _)| current_replacements.contains(key.as_str()))
-                        && relevant.len() == legacy_keys.len()
-                    {
-                        replaced.push(ReplacementRecovery {
-                            run_id: progress.run_id,
-                            required_targets: relevant
-                                .iter()
-                                .map(|(_, task)| copy_endpoints(task).1.state_key())
-                                .collect(),
-                        });
-                        continue;
-                    }
-                    if relevant
-                        .iter()
-                        .any(|(key, _)| current_incremental.contains_key(key.as_str()))
-                    {
-                        anyhow::bail!(
-                            "cannot recover legacy run '{}': its original timestamp/source \
-                             contract is unavailable. Run full_refresh for its affected \
-                             tables ({}) without a resume flag before appending again",
-                            progress.run_id,
-                            legacy_keys.join(", ")
-                        );
-                    }
+                if relevant.is_empty() {
                     continue;
                 }
-                let mut tables = Vec::new();
-                for (key, _) in &relevant {
-                    if let Some(table) = current_incremental.get(key.as_str()) {
-                        tables.push(table.clone());
-                    }
+                if relevant
+                    .iter()
+                    .all(|(key, _)| current_replacements.contains(key.as_str()))
+                    && relevant.len() == legacy_keys.len()
+                {
+                    replaced.push(ReplacementRecovery {
+                        run_id: progress.run_id,
+                        required_targets: relevant
+                            .iter()
+                            .map(|(_, task)| copy_endpoints(task).1.state_key())
+                            .collect(),
+                    });
+                    continue;
                 }
-                (tables, relevant.len() == legacy_keys.len())
+                if relevant.iter().any(|(key, _)| {
+                    current_incremental.contains_key(key.as_str())
+                        && !current_replacements.contains(key.as_str())
+                }) {
+                    anyhow::bail!(
+                        "cannot recover legacy run '{}': its original timestamp/source \
+                         contract is unavailable. Run full_refresh for all its originally \
+                         planned tables ({}) without a resume flag before appending again",
+                        progress.run_id,
+                        legacy_keys.join(", ")
+                    );
+                }
+                continue;
             }
         };
         let mut waiting_for_replace = Vec::new();
@@ -14883,15 +14897,13 @@ async fn reconcile_prior_watermarks(
                 recovered.insert(key, (table, watermark));
             }
         }
-        if can_confirm {
-            if !waiting_for_replace.is_empty() {
-                replaced.push(ReplacementRecovery {
-                    run_id: progress.run_id,
-                    required_targets: waiting_for_replace,
-                });
-            } else {
-                confirmed.push(progress.run_id);
-            }
+        if !waiting_for_replace.is_empty() {
+            replaced.push(ReplacementRecovery {
+                run_id: progress.run_id,
+                required_targets: waiting_for_replace,
+            });
+        } else {
+            confirmed.push(progress.run_id);
         }
     }
     let entries: Vec<_> = recovered
@@ -20315,16 +20327,17 @@ auto_create_schemas = true
     ///
     /// ```text
     ///   run 1  --branch branch__feature   template staging_p1__{source}
-    ///          checkpoint: warehouse.branch__feature.orders = Success
+    ///          checkpoint: warehouse.branch__feature.orders = Success,
+    ///                      warehouse.branch__feature.items still pending
     ///   edit   template -> edited_p1__{source}
     ///   run 2  --branch branch__feature   --resume-latest
-    ///          scope matches  ->  orders SKIPPED  ->  table never created
+    ///          scope matches  ->  orders SKIPPED, items COPIED in branch
     /// ```
     ///
-    /// The resume is accepted (it refused before this fix), and the only
-    /// source table stays uncopied — which it can only do if the seeded key
-    /// equals the key run 2 would have written. Neither template names a
-    /// schema the run touches.
+    /// The incomplete crash resumes, preserving the earlier orders snapshot
+    /// and copying its pending sibling. Neither template names a schema the
+    /// run touches. A complete record-less checkpoint has its own refusal
+    /// coverage and must not be used as an accepted-resume fixture (#1814).
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn resume_under_a_branch_skips_the_recorded_table_after_a_template_edit() {
@@ -20341,10 +20354,22 @@ auto_create_schemas = true
             write_two_pipeline_project(dir.path(), "staging_p1__{source}", "staging_p2__{source}")
                 .await;
 
+        {
+            let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            for sql in [
+                "CREATE TABLE raw__acme.items AS SELECT 2 AS id",
+                "CREATE SCHEMA branch__feature",
+                "CREATE TABLE branch__feature.orders AS SELECT * FROM raw__acme.orders",
+                "UPDATE raw__acme.orders SET id = 11",
+            ] {
+                warehouse.execute_statement(sql).await.unwrap();
+            }
+        }
+
         // The checkpoint a `--branch branch__feature` run leaves: the scope
-        // built by the run path's own helper, and the one source table
-        // recorded under the key that run writes. No run record — the crash
-        // shape, which stays resumable.
+        // built by the run path's own helper, one completed source table and
+        // one pending sibling. No run record — an incomplete crash, which
+        // stays resumable. This full-refresh plan has no append descriptors.
         {
             let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
             let (name, pipeline_config) =
@@ -20378,10 +20403,14 @@ auto_create_schemas = true
             );
             let store = StateStore::open(&state_path).unwrap();
             store
-                .init_run_progress(
+                .init_run_progress_with_recovery(
                     "run-branch",
-                    &["warehouse.branch__feature.orders".to_string()],
+                    &[
+                        "warehouse.branch__feature.orders".to_string(),
+                        "warehouse.branch__feature.items".to_string(),
+                    ],
                     Some(&scope),
+                    &[],
                 )
                 .unwrap();
             store
@@ -20408,11 +20437,26 @@ auto_create_schemas = true
             .await
             .expect("a template edit the branch bypasses must not refuse the resume");
 
-        assert!(
-            !target_table_exists(&db_path, "branch__feature", "orders").await,
-            "the resumed run must skip the table the checkpoint completed — \
-             the seeded key is the key this run would write"
+        let warehouse = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        assert_eq!(
+            warehouse
+                .execute_query("SELECT id FROM branch__feature.orders")
+                .await
+                .unwrap()
+                .rows,
+            vec![vec!["1".to_string()]],
+            "the resumed run must retain the snapshot its checkpoint already copied"
         );
+        assert_eq!(
+            warehouse
+                .execute_query("SELECT id FROM branch__feature.items")
+                .await
+                .unwrap()
+                .rows,
+            vec![vec!["2".to_string()]],
+            "the pending sibling must copy into the pinned branch schema"
+        );
+        drop(warehouse);
         for schema in ["staging_p1__acme", "edited_p1__acme"] {
             assert!(
                 !target_table_exists(&db_path, schema, "orders").await,
@@ -42929,8 +42973,6 @@ timestamp_column = "ts"
                 &pipeline,
                 std::slice::from_ref(&task),
                 &scope,
-                "unused",
-                true,
             )
             .await
             .unwrap();
@@ -43156,7 +43198,7 @@ timestamp_column = "ts"
         let (_dir, warehouse, state, pipeline, task, mut scope, descriptor) =
             checkpoint_recovery_boundary_fixture().await;
         scope.filter = Some("another_connector".into());
-        reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[], &scope, "ignored", true)
+        reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[], &scope)
             .await
             .unwrap();
         assert!(
@@ -43193,18 +43235,10 @@ timestamp_column = "ts"
             } else {
                 task.effective_override.timestamp_column = Some("different_ts".into());
             }
-            let error = reconcile_prior_watermarks(
-                &warehouse,
-                &state,
-                &pipeline,
-                &[task],
-                &scope,
-                "ignored",
-                true,
-            )
-            .await
-            .err()
-            .unwrap();
+            let error = reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[task], &scope)
+                .await
+                .err()
+                .unwrap();
             assert!(format!("{error:#}").contains("source or watermark column"));
             assert!(
                 !state
@@ -43241,17 +43275,9 @@ timestamp_column = "ts"
             pattern_separator: "__".into(),
             pattern_components: vec![],
         });
-        reconcile_prior_watermarks(
-            &warehouse,
-            &state,
-            &pipeline,
-            &[task],
-            &scope,
-            "ignored",
-            true,
-        )
-        .await
-        .unwrap();
+        reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[task], &scope)
+            .await
+            .unwrap();
         assert!(
             state
                 .get_run_progress("old")
@@ -43275,17 +43301,9 @@ timestamp_column = "ts"
         let (_dir, warehouse, state, mut pipeline, task, scope, descriptor) =
             checkpoint_recovery_boundary_fixture().await;
         pipeline.strategy = "full_refresh".into();
-        let replaced = reconcile_prior_watermarks(
-            &warehouse,
-            &state,
-            &pipeline,
-            &[task],
-            &scope,
-            "ignored",
-            true,
-        )
-        .await
-        .unwrap();
+        let replaced = reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[task], &scope)
+            .await
+            .unwrap();
         assert_eq!(replaced.len(), 1);
         assert_eq!(
             replaced[0].required_targets,
@@ -43325,8 +43343,6 @@ timestamp_column = "ts"
             &pipeline,
             std::slice::from_ref(&task),
             &scope,
-            "ignored",
-            true,
         )
         .await
         .unwrap();
@@ -43426,8 +43442,6 @@ timestamp_column = "ts"
                 &pipeline,
                 std::slice::from_ref(&task),
                 &scope,
-                "ignored",
-                true,
             )
             .await
             .unwrap();
@@ -43486,8 +43500,6 @@ timestamp_column = "ts"
                 &pipeline,
                 std::slice::from_ref(&task),
                 &scope,
-                "changed-configuration",
-                has_mismatched_record,
             )
             .await
             .unwrap();
@@ -43572,49 +43584,330 @@ timestamp_column = "ts"
 
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn checkpoint_recovery_legacy_uses_terminal_configuration_evidence() {
-        let (_dir, warehouse, state, pipeline, task, scope, descriptor) =
+    async fn checkpoint_recovery_legacy_unchanged_config_discovery_remap_requires_replacement() {
+        use async_trait::async_trait;
+        use chrono::TimeZone;
+        use rocky_core::traits::{QueryResult, SqlDialect};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountRecoveryReads<'a> {
+            inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+            max_queries: AtomicUsize,
+            writes: AtomicUsize,
+        }
+        #[async_trait]
+        impl WarehouseAdapter for CountRecoveryReads<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                self.inner.execute_statement(sql).await
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                if sql.starts_with("SELECT MAX(") {
+                    self.max_queries.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.execute_query(sql).await
+            }
+            async fn describe_table(&self, table: &TableRef) -> AdapterResult<Vec<ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+        }
+        let (_dir, warehouse, state, mut pipeline, mut task, scope, descriptor) =
             checkpoint_recovery_boundary_fixture().await;
+        for sql in [
+            "DELETE FROM tgt.events",
+            "INSERT INTO tgt.events VALUES (10, TIMESTAMP '2026-03-10 12:00:00'), (20, TIMESTAMP '2026-03-20 12:00:00')",
+            "DROP TABLE src.events",
+            "CREATE SCHEMA new_src",
+            "CREATE TABLE new_src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO new_src.events VALUES (15, TIMESTAMP '2026-03-15 12:00:00'), (25, TIMESTAMP '2026-03-25 12:00:00')",
+        ] {
+            warehouse.execute_statement(sql).await.unwrap();
+        }
+        let prior = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
         state
-            .init_run_progress("legacy", &[table_key(&task)], Some(&scope))
+            .set_watermark(
+                &descriptor.target.state_key(),
+                &WatermarkState {
+                    last_value: prior,
+                    updated_at: prior,
+                },
+            )
             .unwrap();
+        state
+            .init_run_progress("old", &[table_key(&task)], Some(&scope))
+            .unwrap();
+        // Even identical raw configuration and discovery scope do not record
+        // which physical source produced the old target. Discovery now finds
+        // another source that routes onto that same target.
+        seed_run_record(&state, "old", "PartialFailure");
+        task.source_schema = "new_src".into();
+        let counted = CountRecoveryReads {
+            inner: &warehouse,
+            max_queries: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+        };
         let error = reconcile_prior_watermarks(
-            &warehouse,
+            &counted,
             &state,
             &pipeline,
             std::slice::from_ref(&task),
             &scope,
-            "test",
-            true,
         )
         .await
         .err()
         .unwrap();
         assert!(format!("{error:#}").contains("original timestamp/source contract is unavailable"));
-        assert!(
-            !state
-                .get_run_progress("legacy")
-                .unwrap()
-                .unwrap()
-                .watermarks_confirmed
-        );
-        seed_run_record(&state, "legacy", "PartialFailure");
-        reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[task], &scope, "test", true)
-            .await
-            .unwrap();
-        assert!(
-            state
-                .get_run_progress("legacy")
-                .unwrap()
-                .unwrap()
-                .watermarks_confirmed
-        );
-        assert!(
+        assert_eq!(counted.max_queries.load(Ordering::SeqCst), 0);
+        assert_eq!(counted.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(
             state
                 .get_watermark(&descriptor.target.state_key())
                 .unwrap()
-                .is_some()
+                .unwrap()
+                .last_value,
+            prior
         );
+        assert!(
+            !state
+                .get_run_progress("old")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+        assert_eq!(
+            warehouse
+                .execute_query("SELECT id FROM tgt.events ORDER BY id")
+                .await
+                .unwrap()
+                .rows,
+            vec![vec!["10".to_string()], vec!["20".to_string()]]
+        );
+
+        pipeline.strategy = "full_refresh".into();
+        let replacements = reconcile_prior_watermarks(
+            &counted,
+            &state,
+            &pipeline,
+            std::slice::from_ref(&task),
+            &scope,
+        )
+        .await
+        .unwrap();
+        state
+            .init_run_progress_with_recovery("replacement", &[table_key(&task)], Some(&scope), &[])
+            .unwrap();
+        let TableOutcome::Materialized(result) =
+            process_table_with_replacement_recovery(&counted, &state, &pipeline, &task, true, true)
+                .await
+                .unwrap()
+        else {
+            panic!("legacy recovery must replace the target");
+        };
+        assert_eq!(result.materialization.metadata.strategy, "full_refresh");
+        let wm = result.deferred_watermark.unwrap();
+        assert_eq!(
+            wm.timestamp,
+            Utc.with_ymd_and_hms(2026, 3, 25, 12, 0, 0).unwrap()
+        );
+        assert_eq!(
+            warehouse
+                .execute_query("SELECT id FROM tgt.events ORDER BY id")
+                .await
+                .unwrap()
+                .rows,
+            vec![vec!["15".to_string()], vec!["25".to_string()]]
+        );
+        assert!(
+            !state
+                .get_run_progress("old")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+        assert_eq!(
+            state
+                .get_watermark(&descriptor.target.state_key())
+                .unwrap()
+                .unwrap()
+                .last_value,
+            prior
+        );
+        let runs = watermark_confirmation_runs(
+            "replacement",
+            &[],
+            &replacements,
+            std::slice::from_ref(&wm),
+        );
+        let durable = WatermarkState {
+            last_value: wm.timestamp,
+            updated_at: wm.timestamp,
+        };
+        state
+            .batch_set_watermarks_and_confirm_runs(
+                &[(wm.state_key.as_str(), &durable)],
+                &runs.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        assert!(
+            state
+                .get_run_progress("old")
+                .unwrap()
+                .unwrap()
+                .watermarks_confirmed
+        );
+        assert_eq!(
+            state
+                .get_watermark(&descriptor.target.state_key())
+                .unwrap()
+                .unwrap()
+                .last_value,
+            durable.last_value
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn checkpoint_recovery_legacy_partial_plan_cannot_prove_all_original_targets() {
+        use rocky_core::state::{TableStatus, force_run_progress_header};
+        for recorded_entries in [0, 1, 2] {
+            let (_dir, warehouse, state, mut pipeline, task, scope, descriptor) =
+                checkpoint_recovery_boundary_fixture().await;
+            let progress = RunProgress {
+                run_id: "legacy-planless".into(),
+                started_at: Utc::now(),
+                total_tables: 2,
+                tables: (0..recorded_entries)
+                    .map(|index| table_entry(index, &table_key(&task), TableStatus::Success))
+                    .collect(),
+                scope: Some(scope.clone()),
+                planned_tables: None,
+                watermarks_confirmed: false,
+                watermark_recovery_tables: None,
+            };
+            assert!(
+                !legacy_recovery_target_set_known(&progress),
+                "empty, partial, and duplicate records cannot prove the original set"
+            );
+            force_run_progress_header(&state, &progress).unwrap();
+            let before = state.get_run_progress(&progress.run_id).unwrap().unwrap();
+            let prior = state
+                .get_watermark(&descriptor.target.state_key())
+                .unwrap()
+                .unwrap()
+                .last_value;
+            let error = reconcile_prior_watermarks(
+                &warehouse,
+                &state,
+                &pipeline,
+                std::slice::from_ref(&task),
+                &scope,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(
+                format!("{error:#}").contains(
+                    "original planned target set and timestamp/source contracts are unavailable"
+                ),
+                "{error:#}"
+            );
+            assert_eq!(
+                state
+                    .get_watermark(&descriptor.target.state_key())
+                    .unwrap()
+                    .unwrap()
+                    .last_value,
+                prior
+            );
+            assert_eq!(
+                warehouse
+                    .execute_query("SELECT id FROM tgt.events ORDER BY id")
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![vec!["1".to_string()], vec!["2".to_string()]]
+            );
+            assert_eq!(
+                serde_json::to_value(state.get_run_progress(&progress.run_id).unwrap().unwrap())
+                    .unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+
+            // Replacing the current target is safe, but cannot account for a
+            // second original target whose identity never reached the header.
+            pipeline.strategy = "full_refresh".into();
+            let replacements = reconcile_prior_watermarks(
+                &warehouse,
+                &state,
+                &pipeline,
+                std::slice::from_ref(&task),
+                &scope,
+            )
+            .await
+            .unwrap();
+            assert!(!replacements.iter().any(|run| run.run_id == progress.run_id));
+            warehouse
+                .execute_statement(
+                    "INSERT INTO tgt.events VALUES (99, TIMESTAMP '2026-03-03 12:00:00')",
+                )
+                .await
+                .unwrap();
+            state
+                .init_run_progress_with_recovery(
+                    "replacement",
+                    &[table_key(&task)],
+                    Some(&scope),
+                    &[],
+                )
+                .unwrap();
+            let TableOutcome::Materialized(result) = process_table_with_replacement_recovery(
+                &warehouse, &state, &pipeline, &task, true, true,
+            )
+            .await
+            .unwrap() else {
+                panic!("full refresh must replace the current target");
+            };
+            let wm = result.deferred_watermark.unwrap();
+            let runs = watermark_confirmation_runs(
+                "replacement",
+                &[],
+                &replacements,
+                std::slice::from_ref(&wm),
+            );
+            assert!(!runs.contains(&progress.run_id));
+            let durable = WatermarkState {
+                last_value: wm.timestamp,
+                updated_at: wm.timestamp,
+            };
+            state
+                .batch_set_watermarks_and_confirm_runs(
+                    &[(wm.state_key.as_str(), &durable)],
+                    &runs.iter().map(String::as_str).collect::<Vec<_>>(),
+                )
+                .unwrap();
+            assert!(
+                state
+                    .get_run_progress("replacement")
+                    .unwrap()
+                    .unwrap()
+                    .watermarks_confirmed
+            );
+            assert_eq!(
+                serde_json::to_value(state.get_run_progress(&progress.run_id).unwrap().unwrap())
+                    .unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(
+                warehouse
+                    .execute_query("SELECT id FROM tgt.events ORDER BY id")
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![vec!["1".to_string()], vec!["2".to_string()]]
+            );
+        }
     }
 
     #[cfg(feature = "duckdb")]
@@ -43692,8 +43985,6 @@ timestamp_column = "ts"
             &pipeline,
             std::slice::from_ref(&task),
             &scope,
-            "ignored",
-            true,
         )
         .await
         .unwrap();
@@ -43754,11 +44045,10 @@ timestamp_column = "ts"
                 &[descriptor],
             )
             .unwrap();
-        let error =
-            reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[], &scope, "ignored", true)
-                .await
-                .err()
-                .unwrap();
+        let error = reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[], &scope)
+            .await
+            .err()
+            .unwrap();
         assert!(format!("{error:#}").contains("conflicting recovery source/timestamp contracts"));
         assert_eq!(
             state.get_watermark(&key).unwrap().unwrap().last_value,
@@ -43777,7 +44067,7 @@ timestamp_column = "ts"
 
     #[cfg(feature = "duckdb")]
     #[tokio::test]
-    async fn checkpoint_recovery_legacy_raw_hash_does_not_prove_expanded_contract() {
+    async fn checkpoint_recovery_legacy_scope_cannot_supply_original_contract() {
         let (_dir, warehouse, state, pipeline, task, mut scope, _descriptor) =
             checkpoint_recovery_boundary_fixture().await;
         state
@@ -43790,13 +44080,14 @@ timestamp_column = "ts"
             &pipeline,
             std::slice::from_ref(&task),
             &scope,
-            "test",
-            false,
         )
         .await
         .err()
         .unwrap();
-        assert!(format!("{error:#}").contains("original timestamp/source contract is unavailable"));
+        assert!(
+            format!("{error:#}").contains("original timestamp/source contract is unavailable"),
+            "{error:#}"
+        );
         scope.source = Some(rocky_core::state::ResumeSource {
             discovery_adapter: None,
             endpoint: None,
@@ -43805,19 +44096,14 @@ timestamp_column = "ts"
             pattern_separator: "__".into(),
             pattern_components: vec![],
         });
-        let error = reconcile_prior_watermarks(
-            &warehouse,
-            &state,
-            &pipeline,
-            &[task],
-            &scope,
-            "test",
-            true,
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(format!("{error:#}").contains("source contract differs"));
+        let error = reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[task], &scope)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("cannot recover run 'old': its source contract differs"),
+            "{error:#}"
+        );
         assert!(
             !state
                 .get_run_progress("legacy")
@@ -43884,8 +44170,6 @@ timestamp_column = "ts"
             &pipeline,
             std::slice::from_ref(&task),
             &scope,
-            "ignored",
-            true,
         )
         .await
         .unwrap();
@@ -43947,8 +44231,6 @@ timestamp_column = "ts"
             &pipeline,
             std::slice::from_ref(&task),
             &scope,
-            "ignored",
-            true,
         )
         .await
         .unwrap();
@@ -43992,17 +44274,9 @@ timestamp_column = "ts"
         let (_dir, warehouse, state, pipeline, task, mut scope, descriptor) =
             checkpoint_recovery_boundary_fixture().await;
         scope.target.as_mut().unwrap().adapter = "renamed-target".into();
-        reconcile_prior_watermarks(
-            &warehouse,
-            &state,
-            &pipeline,
-            &[task],
-            &scope,
-            "ignored",
-            true,
-        )
-        .await
-        .unwrap();
+        reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[task], &scope)
+            .await
+            .unwrap();
         assert!(
             state
                 .get_run_progress("old")
@@ -44037,17 +44311,9 @@ timestamp_column = "ts"
         );
         assert_eq!(state.sweep_retention(&policy).unwrap().runs_deleted, 0);
         assert!(state.get_run_progress("old").unwrap().is_some());
-        reconcile_prior_watermarks(
-            &warehouse,
-            &state,
-            &pipeline,
-            &[task],
-            &scope,
-            "ignored",
-            true,
-        )
-        .await
-        .unwrap();
+        reconcile_prior_watermarks(&warehouse, &state, &pipeline, &[task], &scope)
+            .await
+            .unwrap();
         assert_eq!(
             state.sweep_retention_dry_run(&policy).unwrap().runs_deleted,
             1

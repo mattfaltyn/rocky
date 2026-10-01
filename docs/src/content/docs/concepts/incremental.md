@@ -105,9 +105,13 @@ Rocky refuses recovery when it cannot verify an older source or timestamp
 contract. Run the affected tables with `strategy = "full_refresh"` without a
 resume flag, then restore their incremental strategy. Keep the state file;
 deleting it also deletes the evidence Rocky needs to explain the interrupted run.
-For a legacy checkpoint without recovery descriptors, include every originally
-planned target in that replacement run. Environment-expanded contracts cannot
-use an unchanged config-file hash as proof of their original values.
+Legacy checkpoints do not preserve their original source and timestamp contracts.
+An unchanged configuration hash cannot prove discovery still selects the same
+source table. Include every originally planned target in a full-refresh recovery
+run, even when the configuration did not change. Missing cursors can select
+that full-refresh bootstrap automatically. If the legacy planned set is missing,
+recover its target identities from run logs before retiring the checkpoint.
+
 Keep `timestamp_column` configured for the source you are restoring. Recovery
 replacements establish its target MAX before confirmation, so returning to
 incremental mode cannot inherit a cursor ahead of the source.
@@ -121,6 +125,8 @@ durability is required. Governed runs require durable publication too.
 
 Serialize runs that append to the same targets. State compare-and-swap detects
 ledger conflicts; it does not lock warehouse tables against concurrent writers.
+Upgrade every writer before relying on this recovery protocol. Older binaries
+do not reconcile the new recovery descriptors.
 Wait for earlier warehouse statements to finish, or cancel them, before retrying
 after an ambiguous transport failure.
 

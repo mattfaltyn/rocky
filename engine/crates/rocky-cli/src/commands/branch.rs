@@ -2823,7 +2823,6 @@ mod tests {
         let loaded = rocky_core::config::LoadedConfig {
             config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
             fingerprint: "0000000000000000".to_string(),
-            literal_replication_watermark_contracts: Default::default(),
         };
 
         // A plan a pre-fix build would have written: the statement is already
@@ -5663,7 +5662,6 @@ mod duplicate_target_refusal_tests {
         let loaded = rocky_core::config::LoadedConfig {
             config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
             fingerprint: "0000000000000000".to_string(),
-            literal_replication_watermark_contracts: Default::default(),
         };
         let step = |source: &str| crate::output::PromoteTargetPlan {
             target: "wh.main.orders".to_string(),

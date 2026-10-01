@@ -1133,6 +1133,23 @@ pub fn force_schema_version(path: &Path, version: &str) {
     // `store` drops here, releasing the advisory lock.
 }
 
+/// Seed a legacy or invalid progress header for recovery tests.
+/// Existing per-table entries take precedence over its inline `tables`, so
+/// callers should use a fresh run ID. Production initialization is unchanged.
+#[cfg(any(test, feature = "test-support"))]
+pub fn force_run_progress_header(
+    store: &StateStore,
+    progress: &RunProgress,
+) -> Result<(), StateError> {
+    let bytes = serde_json::to_vec(progress)?;
+    let txn = store.db.begin_write()?;
+    {
+        let mut table = txn.open_table(RUN_PROGRESS)?;
+        table.insert(progress.run_id.as_str(), bytes.as_slice())?;
+    }
+    store.commit_write(txn)
+}
+
 /// Outcome of [`StateStore::init_db`].
 enum InitOutcome {
     /// The version was stamped/upgraded and tables were created; the store is
