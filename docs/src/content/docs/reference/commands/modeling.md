@@ -1457,6 +1457,8 @@ rocky publish-ir --with-seed --out project-ir.json
 
 Pass `--with-seed` for a self-contained DuckDB producer. Without concrete types, the snapshot gives the consumer's contract nothing to check against.
 
+Rocky reads `rocky.toml` (`--config`) to find the warehouse each model runs on, as `rocky compile` and `rocky run` do. A cast whose type differs between warehouses, such as `CAST(x AS FLOAT)`, gets that warehouse's type. The snapshot's recipe hash for a model then equals the one `rocky run` records. A missing `rocky.toml` leaves such casts `Unknown`. An unreadable one stops the command.
+
 ### Related Commands
 
 - [`rocky imports`](#rocky-imports) -- the consumer side: advance the vendored baseline
