@@ -10291,6 +10291,13 @@ pub struct BriefActiveFreeze {
     pub frozen_at: String,
     /// The freeze decision's `plan_id`.
     pub plan_id: String,
+    /// `true` when this row stands for a durable freeze marker whose body
+    /// could not be read. Such a marker is in force for both principals on
+    /// scope `any`, and is listed once per principal. `rocky policy unfreeze`
+    /// lifts it only with no `--principal` and scope `any`. Omitted when
+    /// `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreadable_marker: bool,
 }
 
 /// Agent-activity section — the policy-decision ledger rolled up by principal.
@@ -12630,6 +12637,15 @@ pub enum JobKind {
     /// `rocky ci` — compile + test without warehouse credentials. Non-mutating;
     /// no permit.
     Ci,
+    /// `rocky policy freeze` — the kill switch: records a freeze decision in the
+    /// policy-decision ledger (and a durable marker on a remote `[state]`).
+    /// Takes the mutation permit: even on a remote `[state]` backend it opens
+    /// the local store, which a run holds for its whole run. A browser freeze
+    /// is refused (`409 mutation_in_progress`) while a run, apply or approve
+    /// is in progress; retry once it finishes, or cancel that job.
+    Freeze,
+    /// `rocky policy unfreeze` — lifts a freeze. Takes the mutation permit.
+    Unfreeze,
 }
 
 impl JobKind {
@@ -12644,11 +12660,14 @@ impl JobKind {
             JobKind::Approve => "approve",
             JobKind::Test => "test",
             JobKind::Ci => "ci",
+            JobKind::Freeze => "freeze",
+            JobKind::Unfreeze => "unfreeze",
         }
     }
 
     /// The `rocky` subcommand this kind spawns. `Approve` runs `review` with
-    /// `--approve`; there is no `rocky approve` verb.
+    /// `--approve`; there is no `rocky approve` verb. `Freeze` and `Unfreeze`
+    /// run `policy`; the argv builder adds the verb after it.
     pub fn subcommand(self) -> &'static str {
         match self {
             JobKind::Run => "run",
@@ -12657,15 +12676,21 @@ impl JobKind {
             JobKind::Approve => "review",
             JobKind::Test => "test",
             JobKind::Ci => "ci",
+            JobKind::Freeze | JobKind::Unfreeze => "policy",
         }
     }
 
     /// Whether this kind takes the single mutation permit. `run` and `apply`
-    /// change warehouse state; `approve` changes what `apply` may do. `plan`,
+    /// change warehouse state; `approve` changes what `apply` may do; `freeze`
+    /// and `unfreeze` write the policy ledger in the state store. `plan`,
     /// `test` and `ci` only preview or check.
     pub fn mutates(self) -> bool {
         match self {
-            JobKind::Run | JobKind::Apply | JobKind::Approve => true,
+            JobKind::Run
+            | JobKind::Apply
+            | JobKind::Approve
+            | JobKind::Freeze
+            | JobKind::Unfreeze => true,
             JobKind::Plan | JobKind::Test | JobKind::Ci => false,
         }
     }
@@ -12679,6 +12704,8 @@ impl JobKind {
             "approve" => Some(JobKind::Approve),
             "test" => Some(JobKind::Test),
             "ci" => Some(JobKind::Ci),
+            "freeze" => Some(JobKind::Freeze),
+            "unfreeze" => Some(JobKind::Unfreeze),
             _ => None,
         }
     }

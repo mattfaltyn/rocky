@@ -172,7 +172,17 @@ A route with no page is not the same as nothing at all. The two API routes named
 
 ## Operator mode
 
-Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+Operator mode lets the page make changes: run, plan, test, run CI, approve and apply, freeze and unfreeze policy, and cancel a running job. They run as the OS user who started the server, like the VS Code extension. It is on when the token has full scope. The page then shows **Operator mode — changes run as this server's user** at all times. With a read-only token, the page shows the write controls disabled. The label at the top gives the reason once, and each button's tooltip repeats it. While a job runs, its button is disabled and says `running…`. A failed job shows its errors, or the final `Error:` lines, never the server's log lines.
+
+### Freeze and unfreeze
+
+The **Needs you** screen has a **Freeze** form below the autonomy section. Pick a principal (`agent`, `human` or both) and a scope (`any`, `layer=<n>`, `model=<glob>`, `classification=<v>` or `tag=<key>[=<value>]`), and add a reason if you want one. The page asks you to confirm before it freezes. Each freeze in force has an **Unfreeze** button that asks the same way and lifts that freeze's principal and scope. One kind of row is the exception. A durable freeze marker whose body cannot be read is in force for both principals on every model. It is listed once, as **unreadable marker**, and its Unfreeze sends no principal and scope `any`, the only form `rocky policy unfreeze` accepts for it. It lifts every unreadable marker and every freeze on scope `any`, for both agent and human. The confirm text says so.
+
+The buttons run `rocky policy freeze` and `rocky policy unfreeze` on the server. A result can succeed and still need your attention, so the page shows the result's notes under the button. A freeze with no `[policy]` block in `rocky.toml` is recorded but enforced nowhere, and the page shows it as a warning, not as done.
+
+Freeze and unfreeze take the same single write slot as a run. Both open the local state store, even on a remote `[state]` backend, and a run holds that store for its whole run. So a browser freeze is refused while a run, apply or approve is in progress: it answers `409 mutation_in_progress` until that job finishes, and you retry then. To stop a running run, use **Cancel** on that job. A run this server did not start, such as one from a terminal or an orchestrator, also holds the local store but not the server's slot. A freeze then fails on the store lock; on a remote `[state]` backend with durable markers, its marker is already written and the run stops at its next fence, but a retry writes a second marker. Retry after that run ends.
+
+The ledger row names the server's principal id, not the person at the page. The server reads it from `ROCKY_PRINCIPAL_ID` in its own environment, else `unnamed`. A `--principal-id` flag on `rocky serve` does not reach these jobs. The row does not record that the freeze came from the browser.
 
 ### Cancel a running job
 

@@ -57,6 +57,22 @@ class JobKind6(StrEnum):
     ci = "ci"
 
 
+class JobKind7(StrEnum):
+    """
+    `rocky policy freeze` — the kill switch: records a freeze decision in the policy-decision ledger (and a durable marker on a remote `[state]`). Takes the mutation permit: even on a remote `[state]` backend it opens the local store, which a run holds for its whole run. A browser freeze is refused (`409 mutation_in_progress`) while a run, apply or approve is in progress; retry once it finishes, or cancel that job.
+    """
+
+    freeze = "freeze"
+
+
+class JobKind8(StrEnum):
+    """
+    `rocky policy unfreeze` — lifts a freeze. Takes the mutation permit.
+    """
+
+    unfreeze = "unfreeze"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -116,7 +132,16 @@ class JobStatus(BaseModel):
     """
     Opaque job identifier (as returned by `POST /api/v1/jobs/{kind}`).
     """
-    kind: JobKind1 | JobKind2 | JobKind3 | JobKind4 | JobKind5 | JobKind6
+    kind: (
+        JobKind1
+        | JobKind2
+        | JobKind3
+        | JobKind4
+        | JobKind5
+        | JobKind6
+        | JobKind7
+        | JobKind8
+    )
     """
     Which operation the job wraps.
     """
