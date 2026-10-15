@@ -78,6 +78,11 @@ const PRODUCT: ProductStatusOutput = {
   name: "revenue_daily",
   spec_present: true,
   spec_digest: "sha256:1111",
+  approval: {
+    approver: "dev@example.com",
+    snapshot_path: ".rocky/approvals/revenue_daily.json",
+    spec_digest: "sha256:1111",
+  },
   output_model: "revenue_daily",
 } as unknown as ProductStatusOutput;
 
@@ -347,7 +352,7 @@ describe("PlanDetail", () => {
 
     await screen.findByText("no single model to sample");
     // The product read did happen (the spec-drift card needs it)…
-    await screen.findByText("unchanged");
+    await screen.findByText("matches the approval");
     // …and still no offer.
     expect(screen.queryByRole("button", { name: /Show \d+ rows/ })).toBeNull();
     expect(screen.getByText(/The samples route would read none of the models this plan names/))
@@ -621,8 +626,60 @@ describe("PlanDetail", () => {
         })}
       />,
     );
-    await screen.findByText("unchanged");
+    await screen.findByText("matches the approval");
     expect(screen.queryByText("the spec moved")).toBeNull();
+  });
+
+  describe("the spec card compares the plan with the approved digest", () => {
+    const planWith = (digest: string, product: ProductStatusOutput) =>
+      render(
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({
+            status: vi.fn(async () => ({
+              ...STATUS,
+              product_id: "product:revenue_daily",
+              spec_digest: digest,
+            })),
+            product: vi.fn(async () => product),
+          })}
+        />,
+      );
+
+    it("names the approved digest when the plan differs from the approval", async () => {
+      planWith("sha256:0000", PRODUCT);
+      await screen.findByText("the spec moved");
+      expect(screen.getByText(/the approved spec is/)).toBeTruthy();
+    });
+
+    it("says no approval is recorded, and does not compare with the working spec", async () => {
+      // The working spec equals the plan; with no approval that must not read as a match.
+      planWith("sha256:1111", { ...PRODUCT, approval: null } as ProductStatusOutput);
+      await screen.findByText("no approval recorded");
+      expect(screen.queryByText("matches the approval")).toBeNull();
+      expect(screen.queryByText("the spec moved")).toBeNull();
+    });
+
+    it("does not report drift when only the working spec was edited, but says the edits are not approved", async () => {
+      planWith("sha256:1111", {
+        ...PRODUCT,
+        spec_digest: "sha256:edited-after-approval",
+        spec_matches_approval: false,
+      } as ProductStatusOutput);
+      await screen.findByText("matches the approval");
+      expect(screen.queryByText("the spec moved")).toBeNull();
+      expect(
+        await screen.findByText(/The working spec has been edited since the approval; those edits are not approved\./),
+      ).toBeInTheDocument();
+    });
+
+    it("reports drift when the working spec matches the plan but the approval does not", async () => {
+      planWith("sha256:1111", {
+        ...PRODUCT,
+        approval: { ...PRODUCT.approval, spec_digest: "sha256:approved-other" },
+      } as ProductStatusOutput);
+      await screen.findByText("the spec moved");
+    });
   });
 
   it("reads no product at all when the plan is not product-bound", async () => {

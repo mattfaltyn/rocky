@@ -10,6 +10,7 @@ import { type Resource, useResource } from "../estate/useResource";
 import { formatInstant } from "../format";
 import { CustodyLink } from "../governor/links";
 import {
+  ConfirmedWrite,
   JobLine,
   WriteButton,
   defaultJobClient,
@@ -17,6 +18,7 @@ import {
   useJob,
   useWriteAccess,
   type JobClient,
+  type JobView,
 } from "../operator";
 import { navigateTo } from "../router";
 import { reviewPath } from "./paths";
@@ -218,24 +220,38 @@ function SpecDrift({
   product: ProductStatusOutput;
 }) {
   const planned = status.spec_digest ?? null;
-  const current = product.spec_digest ?? product.committed_spec_digest ?? null;
-  if (planned === null || current === null) {
+  // The plan is checked against the APPROVED digest. The working spec
+  // (`product.spec_digest`) may be edited after approval without moving it.
+  const approved = product.approval?.spec_digest ?? null;
+  if (approved === null) {
+    return (
+      <StatusCard
+        label="the spec it was planned against"
+        value="no approval recorded"
+        sub="The product has no approval record, so the screen has no approved digest to compare this plan with."
+      />
+    );
+  }
+  if (planned === null) {
     return (
       <StatusCard
         label="the spec it was planned against"
         value="not recorded"
-        sub="One of the two digests is missing, so the screen cannot say whether the spec moved."
+        sub="The plan carries no spec digest, so the screen cannot say whether it matches the approval."
       />
     );
   }
-  if (planned === current) {
+  if (planned === approved) {
     return (
       <StatusCard
         label="the spec it was planned against"
-        value="unchanged"
+        value="matches the approval"
         sub={
           <>
             Still <Clip value={planned} />.
+            {product.spec_matches_approval === false
+              ? " The working spec has been edited since the approval; those edits are not approved."
+              : null}
           </>
         }
       />
@@ -248,10 +264,10 @@ function SpecDrift({
       tone="risk"
       sub={
         <>
-          Planned against <Clip value={planned} />; the product is now <Clip value={current} />.
+          Planned against <Clip value={planned} />; the approved spec is <Clip value={approved} />.
           Apply compares the digest you pass with the one this plan carries, not with the spec
-          on disk. Passing the current digest refuses this plan; passing the digest it was
-          planned against applies it, stale. Re-propose against the current spec.
+          on disk. Passing the approved digest refuses this plan; passing the digest it was
+          planned against applies it, stale. Re-propose against the approved spec.
         </>
       }
     />
@@ -363,9 +379,10 @@ function productApplyCommand(planId: string): string {
  * In operator mode the buttons submit `POST /api/v1/jobs/approve` and
  * `/jobs/apply` and follow the job. The terminal command stays visible as a
  * secondary hint. A read-only page draws the buttons disabled with the
- * reason. A plan bound to a data product has no Apply button at all: its
- * apply needs the spec digest the reader approved, and the page must never
- * read that digest back from the plan it is checking.
+ * reason. A plan bound to a data product asks the reader to TYPE the spec
+ * digest they approved (`ProductApply`). The page never reads that digest
+ * from the plan it is checking, nor from the product status, nor from any
+ * response: the input starts empty, always.
  */
 function Approval({
   status,
@@ -382,7 +399,11 @@ function Approval({
   const approve = useJob("approve", jobs, onChanged);
   const apply = useJob("apply", jobs, onChanged);
   const planId = status.plan_id;
-  const productBound = status.product_id !== null && status.product_id !== undefined;
+  // Either key marks the plan as bound. The engine refuses a lone key, and
+  // the page treats it as bound too, so it never offers a bare Apply.
+  const productBound =
+    (status.product_id !== null && status.product_id !== undefined) ||
+    (status.spec_digest !== null && status.spec_digest !== undefined);
   // Every row of one plan carries the same command: approval is per plan.
   const command = entries[0]?.approve_command ?? `rocky review ${planId} --approve`;
 
@@ -407,12 +428,8 @@ function Approval({
             // After approval it is unknown, not "next": a plan applied in a
             // terminal, or before a reload, looks exactly the same here.
             state: applied ? "done" : status.reviewed ? "unknown" : "later",
-            // A product-bound plan is applied in a terminal, never here.
-            note: productBound
-              ? "Apply this plan in a terminal."
-              : applied || !status.reviewed
-                ? undefined
-                : "The plan status does not record apply.",
+            note:
+              applied || !status.reviewed ? undefined : "The plan status does not record apply.",
           },
         ]}
       />
@@ -448,17 +465,7 @@ function Approval({
       )}
 
       {productBound ? (
-        <StatusCard
-          label="apply"
-          value="apply in a terminal"
-          sub={
-            <>
-              This plan is bound to a data product. Its apply must carry the spec digest you
-              approved, and that digest must come from you, not from the plan. Run{" "}
-              <code className="break-all">{productApplyCommand(planId)}</code>.
-            </>
-          }
-        />
+        <ProductApply planId={planId} reviewed={status.reviewed} apply={apply.view} cancel={apply.cancel} start={apply.start} />
       ) : (
         <div className="space-y-2">
           <WriteButton
@@ -486,6 +493,82 @@ function Approval({
         </div>
       )}
     </section>
+  );
+}
+
+/**
+ * Apply for a plan bound to a data product. The engine refuses the apply
+ * unless the caller states the spec digest it expects, and the digest must
+ * come from the person: a digest read from the plan would only prove the plan
+ * equals itself. So the input starts empty, takes only what is typed, and
+ * nothing on this page writes to it. What is typed goes out as
+ * `expect_spec_digest`, trimmed of the spaces a paste adds. A wrong digest is
+ * refused by the engine, and the job line shows the cleaned failure.
+ */
+function ProductApply({
+  planId,
+  reviewed,
+  apply,
+  cancel,
+  start,
+}: {
+  planId: string;
+  reviewed: boolean;
+  apply: JobView;
+  cancel: ReturnType<typeof useJob>["cancel"];
+  start: (body?: Record<string, unknown>) => void;
+}) {
+  const [typed, setTyped] = useState("");
+  const digest = typed.trim();
+  const busy = jobBusy(apply);
+  const inputId = "product-apply-digest";
+  const blocked = !reviewed ? "Approve the plan first." : digest === "" ? "Type the spec digest you approved." : null;
+  return (
+    <div className="space-y-2">
+      <p className="text-xs text-zinc-600 dark:text-zinc-300">
+        This plan is bound to a data product. To apply it, type the spec digest you approved.
+        It must come from you, not from the plan.
+      </p>
+      <label htmlFor={inputId} className="block text-xs font-medium text-zinc-700 dark:text-zinc-200">
+        Spec digest you approved
+      </label>
+      <input
+        id={inputId}
+        type="text"
+        value={typed}
+        onChange={(event) => setTyped(event.target.value)}
+        placeholder="sha256:…"
+        autoComplete="off"
+        spellCheck={false}
+        disabled={busy}
+        className="block w-full rounded-md border border-zinc-300 bg-white px-2 py-1.5 font-mono text-xs text-zinc-900 focus-visible:outline-2 focus-visible:outline-orange-500 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100"
+      />
+      {blocked === null ? (
+        <ConfirmedWrite
+          label="Apply"
+          question={`Apply this plan to the warehouse, stating that you approved spec digest ${digest}?`}
+          confirmLabel="Yes, apply"
+          busy={busy}
+          onConfirm={() => start({ plan_id: planId, expect_spec_digest: digest })}
+        />
+      ) : (
+        <WriteButton label="Apply" busy={busy} disabledReason={blocked} onClick={() => undefined} />
+      )}
+      <p className="text-xs text-zinc-600 dark:text-zinc-300">
+        The approved digest is on the <code className="font-mono">approval:</code> line of{" "}
+        <code className="font-mono">rocky product status &lt;name&gt;</code> (
+        <code className="font-mono">approval.spec_digest</code> with{" "}
+        <code className="font-mono">--output json</code>), or in your approval record. Do not copy
+        the plan&apos;s own digest from the spec card: the check would then compare the plan with
+        itself.
+      </p>
+      <JobLine label="Apply" view={apply} cancel={cancel} />
+      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+        The engine compares your digest with the one the plan carries and refuses the apply if
+        they differ. Or in a terminal:
+      </p>
+      <CommandLine command={productApplyCommand(planId)} />
+    </div>
   );
 }
 
