@@ -880,11 +880,41 @@ fn shell_command(command: &str) -> tokio::process::Command {
     }
 }
 
+/// Write the hook's JSON context to an anonymous temp file, rewound to the
+/// start, for use as the child's stdin.
+///
+/// A pipe would need Rocky to write after the spawn. The CLI keeps SIGPIPE
+/// at its default disposition, so a write to a hook that already exited
+/// without reading (`touch done`) kills Rocky silently (#2360). A file needs
+/// no write after the spawn. `tempfile()` unlinks the file at once, so the
+/// context never stays on disk under a name.
+fn context_stdin(json: &str) -> std::io::Result<std::fs::File> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut file = tempfile::tempfile()?;
+    file.write_all(json.as_bytes())?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
+}
+
 async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
     use tokio::io::AsyncWriteExt;
 
     let mut cmd = shell_command(&hook.command);
-    cmd.stdin(std::process::Stdio::piped());
+    // A host with no writable temp directory (a read-only container root)
+    // still runs the hook: the context goes through a pipe, as before #2360.
+    // There, a hook that exits before the write can still raise SIGPIPE.
+    let piped_context = match context_stdin(json) {
+        Ok(file) => {
+            cmd.stdin(file);
+            false
+        }
+        Err(e) => {
+            warn!(command = %hook.command, error = %e, "cannot create the hook's stdin file; using a pipe");
+            cmd.stdin(std::process::Stdio::piped());
+            true
+        }
+    };
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     // SIGKILL the child if our `Child` handle is dropped — including when
@@ -901,18 +931,16 @@ async fn execute_hook(hook: &HookConfig, json: &str) -> Result<(), HookError> {
 
     let mut child = cmd.spawn()?;
 
-    // Write JSON context to stdin, then close it.
-    //
-    // Hooks that don't read stdin (e.g. `test "$VAR" = "x"`) may exit before
-    // we finish writing, closing the pipe and producing `EPIPE`. Treat that
-    // as success — the hook simply chose to ignore its stdin, which is fine.
-    if let Some(mut stdin) = child.stdin.take() {
+    if piped_context && let Some(mut stdin) = child.stdin.take() {
+        // A hook that exits without reading closes the pipe. When SIGPIPE
+        // is ignored, that is `BrokenPipe`, and the hook chose to ignore
+        // its stdin, which is fine.
         match stdin.write_all(json.as_bytes()).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
             Err(e) => return Err(HookError::Io(e)),
         }
-        drop(stdin); // close stdin so the child sees EOF
+        drop(stdin);
     }
 
     // Wait with timeout
@@ -1263,6 +1291,24 @@ mod tests {
         let ctx = HookContext::pipeline_start("run-1", "test_pipeline");
         let result = registry.fire(&ctx).await.unwrap();
         assert_eq!(result, HookResult::Continue);
+    }
+
+    /// The stdin file is rewound before the spawn, so the hook reads the
+    /// whole context, byte for byte, and then EOF.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_stdin_is_the_exact_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen.json");
+        let hook = HookConfig {
+            command: format!("cat > '{}'", seen.display()),
+            timeout_ms: 5000,
+            on_failure: FailureAction::Abort,
+            env: HashMap::new(),
+        };
+        let json = r#"{"event":"pipeline_start","run_id":"run-1"}"#;
+        execute_hook(&hook, json).await.expect("hook must succeed");
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), json);
     }
 
     #[tokio::test]

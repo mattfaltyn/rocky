@@ -8498,6 +8498,38 @@ mod tests {
         let debug = format!("{err:?}");
         assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
         assert!(debug.contains("${RV_CFG_DBG}"), "{debug}");
+
+        // The two variants #1934 added interpolate config-derived values.
+        let later = [
+            ConfigError::UnsafeSeparator {
+                pipeline: "raw".into(),
+                field: "schema_separator".into(),
+                separator: format!("x{SECRET}").into(),
+            },
+            ConfigError::MetadataColumnValueRefused {
+                pipeline: "raw".into(),
+                column: format!("col_{SECRET}").into(),
+                reason: format!("holds {SECRET}").into(),
+            },
+        ];
+        for err in later {
+            for shown in [err.to_string(), format!("{err:?}")] {
+                assert!(!shown.contains(SECRET), "leaks: {shown}");
+                assert!(shown.contains("${RV_CFG_DBG}"), "{shown}");
+            }
+        }
+
+        // A wrapped foreign error does not render by itself: the TOML error
+        // quotes the offending line. This case fails under a derived `Debug`.
+        let toml_err = toml::from_str::<toml::Table>(&format!("host = \"{SECRET}\" ]"))
+            .expect_err("malformed TOML");
+        assert!(
+            format!("{toml_err:?}").contains(SECRET),
+            "fixture quotes it"
+        );
+        let debug = format!("{:?}", ConfigError::ParseToml(toml_err));
+        assert!(!debug.contains(SECRET), "Debug leaks: {debug}");
+        assert!(debug.contains("${RV_CFG_DBG}"), "{debug}");
     }
 
     // ---- credential-tolerant loading (#1536) ----

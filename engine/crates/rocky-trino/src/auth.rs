@@ -20,7 +20,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rocky_core::redacted::RedactedString;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum AuthError {
     #[error("Trino auth requires either basic (user + password) or jwt (token); none provided")]
     NoAuth,
@@ -30,6 +30,15 @@ pub enum AuthError {
 
     #[error("Trino jwt auth requires a non-empty token")]
     JwtEmptyToken,
+}
+
+/// `Debug` prints the rendered `Display` text, like the other adapters'
+/// `AuthError`. No variant holds a value today; this keeps a field added
+/// later from printing its plaintext through a derived `Debug` (#1919).
+impl std::fmt::Debug for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        rocky_core::secret_registry::fmt_rendered_debug(f, "AuthError", self)
+    }
 }
 
 /// Trino authentication provider.
@@ -50,9 +59,13 @@ pub enum TrinoAuth {
 impl std::fmt::Debug for TrinoAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // A `${VAR}`-resolved user prints as `${NAME}` (#1919).
             TrinoAuth::Basic { user, .. } => f
                 .debug_struct("TrinoAuth::Basic")
-                .field("user", user)
+                .field(
+                    "user",
+                    &rocky_core::secret_registry::render_placeholders(user),
+                )
                 .field("password", &"***")
                 .finish(),
             TrinoAuth::Jwt(_) => f
@@ -177,6 +190,32 @@ mod tests {
         let debug = format!("{auth:?}");
         assert!(!debug.contains("very_secret_jwt_value"));
         assert!(debug.contains("***"));
+    }
+
+    #[test]
+    fn debug_basic_renders_a_substituted_user() {
+        const USER: &str = "trino-user-1919-b8e4";
+        rocky_core::secret_registry::register_substitution("RV_TRINO_USER_DBG", USER);
+        // Built at runtime: only the user matters here, and a literal
+        // password trips the hard-coded-credential scan.
+        let pass = std::process::id().to_string();
+        let auth = TrinoAuth::basic(USER, pass).unwrap();
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains(USER), "Debug leaks the user: {debug}");
+        assert!(debug.contains("${RV_TRINO_USER_DBG}"), "{debug}");
+    }
+
+    /// No variant holds a value, so this pins the shape only: `Debug` goes
+    /// through `fmt_rendered_debug`, not a derive that names the variant.
+    #[test]
+    fn auth_error_debug_prints_rendered_display_text() {
+        for err in [
+            AuthError::NoAuth,
+            AuthError::BasicMissingField,
+            AuthError::JwtEmptyToken,
+        ] {
+            assert_eq!(format!("{err:?}"), format!("AuthError({err})"));
+        }
     }
 
     #[test]
