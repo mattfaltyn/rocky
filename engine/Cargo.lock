@@ -2103,7 +2103,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3165,7 +3164,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "rand 0.10.3",
- "reqwest 0.13.5",
+ "reqwest",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -3228,7 +3227,7 @@ dependencies = [
  "bytes",
  "http",
  "opentelemetry",
- "reqwest 0.13.5",
+ "reqwest",
 ]
 
 [[package]]
@@ -3244,7 +3243,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest 0.13.5",
+ "reqwest",
  "thiserror",
  "tokio",
  "tonic",
@@ -3978,45 +3977,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.12.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "futures-core",
- "h2",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "quinn",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tokio-rustls",
- "tower 0.5.3",
- "tower-http 0.6.11",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "webpki-roots",
-]
-
-[[package]]
-name = "reqwest"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
@@ -4041,6 +4001,9 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4082,7 +4045,7 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "rmcp-macros",
- "schemars 1.2.3",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",
@@ -4156,7 +4119,7 @@ name = "rocky-ai"
 version = "1.81.1"
 dependencies = [
  "indexmap",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-compiler",
  "rocky-core",
  "rocky-ir",
@@ -4179,7 +4142,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "percent-encoding",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "serde",
  "serde_json",
@@ -4202,7 +4165,7 @@ dependencies = [
  "googleapis-tonic-google-cloud-bigquery-storage-v1",
  "jsonwebtoken",
  "prost",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-core",
  "rocky-ir",
@@ -4269,7 +4232,7 @@ dependencies = [
  "notify",
  "object_store",
  "parquet",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-ai",
  "rocky-airbyte",
@@ -4294,7 +4257,7 @@ dependencies = [
  "rocky-sql",
  "rocky-sqlserver",
  "rocky-trino",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sqlparser",
@@ -4324,7 +4287,7 @@ version = "1.81.1"
 dependencies = [
  "async-trait",
  "chrono",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "rocky-ir",
  "rocky-sql",
@@ -4355,7 +4318,7 @@ dependencies = [
  "rocky-lang",
  "rocky-sql",
  "salsa",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4393,13 +4356,13 @@ dependencies = [
  "redb",
  "redis",
  "regex",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "rocky-duckdb",
  "rocky-ir",
  "rocky-secret-registry",
  "rocky-sql",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -4433,7 +4396,7 @@ dependencies = [
  "chrono",
  "futures",
  "percent-encoding",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-catalog-core",
  "rocky-core",
@@ -4504,10 +4467,10 @@ dependencies = [
  "object_store",
  "percent-encoding",
  "redis",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "rocky-observe",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
@@ -4551,7 +4514,7 @@ dependencies = [
  "object_store",
  "parquet",
  "percent-encoding",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-catalog-core",
  "rocky-core",
  "rocky-databricks",
@@ -4571,7 +4534,7 @@ dependencies = [
  "blake3",
  "chrono",
  "rocky-sql",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror",
@@ -4618,7 +4581,7 @@ dependencies = [
  "rocky-ir",
  "rocky-snowflake",
  "rocky-sql",
- "schemars 1.2.3",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
@@ -4637,7 +4600,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
@@ -4712,7 +4675,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "jsonwebtoken",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-core",
  "rocky-ir",
@@ -4759,7 +4722,7 @@ dependencies = [
  "miette",
  "regex",
  "rocky-secret-registry",
- "schemars 0.8.22",
+ "schemars",
  "serde",
  "serde_json",
  "sqlparser",
@@ -4773,7 +4736,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-core",
  "rocky-ir",
  "rocky-sql",
@@ -4795,7 +4758,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chrono",
- "reqwest 0.12.28",
+ "reqwest",
  "rocky-adapter-sdk",
  "rocky-core",
  "rocky-ir",
@@ -5052,42 +5015,17 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
-dependencies = [
- "chrono",
- "dyn-clone",
- "indexmap",
- "schemars_derive 0.8.22",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "schemars"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
  "chrono",
  "dyn-clone",
+ "indexmap",
  "ref-cast",
- "schemars_derive 1.2.3",
+ "schemars_derive",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals 0.29.1",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -5098,7 +5036,7 @@ checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
 dependencies = [
  "proc-macro2",
  "quote",
- "serde_derive_internals 0.30.0",
+ "serde_derive_internals",
  "syn 3.0.9",
 ]
 
@@ -5180,17 +5118,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "serde_derive_internals"
-version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -5948,6 +5875,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls-native-certs",
  "socket2",
  "sync_wrapper",
  "tokio",
