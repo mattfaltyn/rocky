@@ -138,6 +138,8 @@ pub async fn run_transformation(
     // the project's pipelines (#2333). `None` only with no project context:
     // the compile then types casts for this pipeline's warehouse.
     target_dialects: Option<&rocky_compiler::operand_check::TargetDialects>,
+    // The run's cancellation token (#1606), observed by `execute_models`.
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -217,13 +219,16 @@ pub async fn run_transformation(
                 false,
                 contracts_dir.map(super::run::RunContracts::Directory),
                 rocky_cfg.contracts.strict,
+                cancel,
             )
             .await;
 
             match exec_result {
                 // Finding #1: only when the model phase is CLEAN (no new soft
                 // failures) — a soft failure returns `Ok`.
-                Ok(snapshot) if output.tables_failed == failures_before => {
+                // An interrupted run (#1606) did not build its whole set, so it
+                // must not reconcile governance either.
+                Ok(snapshot) if output.tables_failed == failures_before && !output.interrupted => {
                     // Pre-reconcile freeze fence (fresh LIST): a freeze landing
                     // after the final layer must withhold the governance
                     // reconcile, recorded so the terminal persist below still
@@ -412,6 +417,11 @@ pub async fn run_transformation(
     // Propagate a hard `[budget]` breach (`on_breach = "error"`) now that the
     // JSON payload has been emitted, matching the replication / model-only
     // ordering.
+    // An interrupted run (#1606) exits 130 even when it also breached a
+    // hard `[budget]`: the cancel is what ended it.
+    if output.interrupted {
+        return Err(anyhow::Error::new(super::run::Interrupted));
+    }
     budget_result?;
 
     // Honour the run-status exit-code contract. A model that failed to
@@ -3874,6 +3884,7 @@ auto_create_schemas = true
             None,  // contracts_dir
             None,  // project
             None,  // target_dialects
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("an Absent decision is the silent no-op, even with the dir on disk");

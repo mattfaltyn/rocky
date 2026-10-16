@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { resolveProjectRoot } from "../config";
+import { loadPlanCost, onPlanCostRecorded } from "../planCostStore";
 import { RockyCliError, runRockyJson, runRockyJsonCached } from "../rockyCli";
 import type { CatalogOutput } from "../types/generated/catalog";
 import type { CompileOutput } from "../types/generated/compile";
@@ -18,6 +19,7 @@ import type {
   InspectorTestsData,
   ModelParam,
 } from "../webviews/inspector/contract";
+import type { PlanCostParam } from "../webviews/lineage/contract";
 import type { AiActionParam } from "../webviews/lineage/contract";
 import {
   buildGraph,
@@ -49,12 +51,43 @@ export function registerInspectorView(context: vscode.ExtensionContext): void {
       h.onRequest("openFile", (p) => openModelFile((p as ModelParam).model));
       h.onRequest("ai", (p) => runAiAction(p as AiActionParam));
       h.onRequest("breaking", () => loadBreaking());
+      h.onRequest("planCost", (p) =>
+        loadPlanCost((p as PlanCostParam | undefined)?.projectRoot),
+      );
       h.onRequest("replay", () => loadReplay());
       h.onRequest("governance", () => loadGovernance());
     },
   });
 
   registerActiveEditorFollow(context);
+  registerPlanCostRefresh(context);
+}
+
+/**
+ * Tell the Inspector to re-read the plan cost when a new Plan finishes or a
+ * model, sidecar or `rocky.toml` changes (either can flip the stale flag).
+ * Debounced so a burst of saves is one refresh.
+ */
+function registerPlanCostRefresh(context: vscode.ExtensionContext): void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const notify = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => controller?.push("planCostChanged", {}), 400);
+  };
+  const watcher = vscode.workspace.createFileSystemWatcher(
+    "**/*.{rocky,sql,toml}",
+  );
+  watcher.onDidCreate(notify);
+  watcher.onDidChange(notify);
+  watcher.onDidDelete(notify);
+  context.subscriptions.push(
+    watcher,
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (/\.(rocky|sql|toml)$/i.test(doc.fileName)) notify();
+    }),
+    { dispose: onPlanCostRecorded(notify) },
+    { dispose: () => timer && clearTimeout(timer) },
+  );
 }
 
 /**

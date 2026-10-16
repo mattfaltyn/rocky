@@ -1,14 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   BreakingData,
   GovernanceData,
   GraphData,
+  PlanCostData,
+  PlanCostParam,
   ReplayData,
 } from "../../../src/webviews/lineage/contract";
 import { getRpc } from "../../runtime/rpcClient";
 import { type ColorMode, type OverlayKind } from "./context";
 import { makeBreakingOverlay } from "./overlays/breaking";
-import { costOverlay } from "./overlays/cost";
+import { makeCostOverlay } from "./overlays/cost";
 import { freshnessOverlay } from "./overlays/freshness";
 import { makeGovernanceOverlay } from "./overlays/governance";
 import { makeLastRunOverlay } from "./overlays/lastRun";
@@ -30,6 +32,8 @@ export function useLineageGraph() {
   const [breaking, setBreaking] = useState<BreakingData | null>(null);
   const [replay, setReplay] = useState<ReplayData | null>(null);
   const [governance, setGovernance] = useState<GovernanceData | null>(null);
+  const [planCost, setPlanCost] = useState<PlanCostData | null>(null);
+  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     void getRpc()
@@ -37,6 +41,51 @@ export function useLineageGraph() {
       .then(setGraph)
       .catch((err) => setError(String(err)));
   }, []);
+
+  // The cost overlay reads a stored plan estimate (never runs `rocky plan`).
+  // Fetch only while it is on, refetch when the host reports a new Plan or a
+  // model/sidecar/rocky.toml change, tick `now` so "30 min ago" ages, and
+  // drop the data on toggle-off so a re-enable cannot show a stale snapshot.
+  const costOn = active.has("cost");
+  const costOnRef = useRef(costOn);
+  costOnRef.current = costOn;
+  const graphRoot = graph ? (graph.projectRoot ?? null) : undefined;
+  const loadRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    if (!costOn || graphRoot === undefined) {
+      setPlanCost(null);
+      loadRef.current = () => {};
+      return;
+    }
+    let ignore = false;
+    const load = (): void => {
+      setNow(Date.now());
+      void getRpc()
+        .request<PlanCostData | null>("planCost", {
+          projectRoot: graphRoot,
+        } satisfies PlanCostParam)
+        .then((d) => !ignore && setPlanCost(d))
+        .catch(() => !ignore && setPlanCost(null));
+    };
+    loadRef.current = load;
+    load();
+    const tick = setInterval(() => setNow(Date.now()), 60_000);
+    return () => {
+      ignore = true;
+      loadRef.current = () => {};
+      clearInterval(tick);
+    };
+  }, [costOn, graphRoot]);
+
+  // Subscribe once at mount so pushes sent while the overlay is off are
+  // consumed (and dropped) here instead of piling up in the RPC buffer.
+  useEffect(
+    () =>
+      getRpc().onPush("planCostChanged", () => {
+        if (costOnRef.current) loadRef.current();
+      }),
+    [],
+  );
 
   const toggleOverlay = (kind: OverlayKind): void => {
     setActive((prev) => {
@@ -70,7 +119,7 @@ export function useLineageGraph() {
 
   const overlays = useMemo<LineageOverlay[]>(() => {
     const list: LineageOverlay[] = [];
-    if (active.has("cost")) list.push(costOverlay);
+    if (active.has("cost")) list.push(makeCostOverlay(planCost, now));
     if (active.has("freshness")) list.push(freshnessOverlay);
     if (active.has("breaking") && breaking && graph) {
       list.push(makeBreakingOverlay(breaking, graph));
@@ -80,7 +129,7 @@ export function useLineageGraph() {
       list.push(makeGovernanceOverlay(governance));
     }
     return list;
-  }, [active, breaking, replay, governance, graph]);
+  }, [active, breaking, replay, governance, graph, planCost, now]);
 
   return {
     graph,

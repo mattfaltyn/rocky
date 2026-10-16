@@ -2956,6 +2956,12 @@ enum ProductSubcommand {
     Approve {
         /// Product name (`products/<name>.toml`).
         product: String,
+        /// Refuse unless the working spec's digest is exactly this
+        /// (`sha256:<hex>`, as `rocky product status` prints it). Nothing is
+        /// written on a mismatch. Without it, the spec on disk when the
+        /// command runs is approved.
+        #[arg(long)]
+        expect_digest: Option<String>,
     },
 }
 
@@ -3618,9 +3624,15 @@ fn model_scope(models: Option<&std::path::Path>) -> rocky_cli::commands::ModelSc
 /// rows committed in the warehouse and its watermark commit is then cut, the
 /// next run re-reads from the old watermark and appends the same delta twice.
 /// The unbounded drop this replaces would let that commit finish, at the price
-/// of the hang it also produces. Removing the trade-off needs a cancellation
-/// protocol that separates "stop starting warehouse work" from "settle the
-/// state tail", which a process-wide timer cannot express — tracked in #1606.
+/// of the hang it also produces.
+///
+/// Since #1606 `rocky run` has a cancellation token that separates "stop
+/// starting warehouse work" from "settle the state tail": a signalled run
+/// flushes its watermarks and writes its record before it returns, and
+/// `--watch` drops an iteration only after it failed to settle within its own
+/// grace. This timeout is now the backstop for that dropped case — a statement
+/// still in flight on the blocking pool — not the thing that orders the state
+/// tail.
 ///
 /// # Why five seconds
 ///
@@ -4202,9 +4214,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             ProductSubcommand::Journal { product } => {
                 rocky_cli::commands::run_product_journal(&cli.config, &product, &state_path, json)
             }
-            ProductSubcommand::Approve { product } => {
-                rocky_cli::commands::run_product_approve(&cli.config, &product, &state_path, json)
-            }
+            ProductSubcommand::Approve {
+                product,
+                expect_digest,
+            } => rocky_cli::commands::run_product_approve(
+                &cli.config,
+                &product,
+                &state_path,
+                expect_digest.as_deref(),
+                json,
+            ),
         },
         Command::Policy { subcommand } => match subcommand {
             PolicySubcommand::Check {
@@ -6882,6 +6901,41 @@ mod tests {
                 expect_spec_digest, ..
             } => assert_eq!(expect_spec_digest, None),
             _ => panic!("expected Apply subcommand"),
+        }
+    }
+
+    /// The browser UI and the server shell out with the LITERAL flag
+    /// `--expect-digest`; a field rename would silently rename it. Pin it, and
+    /// pin that it stays optional for a terminal approval.
+    #[test]
+    fn product_approve_expect_digest_flag_parses_by_its_literal_name() {
+        let cli = try_parse_with_big_stack(&[
+            "rocky",
+            "product",
+            "approve",
+            "revenue_daily",
+            "--expect-digest",
+            "sha256:feed",
+        ]);
+        match cli.command {
+            Command::Product {
+                subcommand:
+                    ProductSubcommand::Approve {
+                        product,
+                        expect_digest,
+                    },
+            } => {
+                assert_eq!(product, "revenue_daily");
+                assert_eq!(expect_digest.as_deref(), Some("sha256:feed"));
+            }
+            _ => panic!("expected product approve"),
+        }
+        let cli = try_parse_with_big_stack(&["rocky", "product", "approve", "revenue_daily"]);
+        match cli.command {
+            Command::Product {
+                subcommand: ProductSubcommand::Approve { expect_digest, .. },
+            } => assert_eq!(expect_digest, None),
+            _ => panic!("expected product approve"),
         }
     }
 

@@ -77,6 +77,7 @@ mod reuse_decision;
 pub(crate) mod review;
 mod run;
 mod run_audit;
+mod run_cancel;
 mod run_content_addressed;
 mod run_dag_exec;
 mod run_incremental;
@@ -123,9 +124,9 @@ pub use backfill::run_backfill;
 #[cfg(feature = "duckdb")]
 pub use bench::run_bench;
 pub use branch::{
-    compute_branch_list, compute_branch_show, resolve_branch_shadow_config, run_branch_approve,
-    run_branch_compare, run_branch_create, run_branch_delete, run_branch_list, run_branch_promote,
-    run_branch_promote_from_plan, run_branch_show, validate_branch_name,
+    APPROVAL_SKIP_ENV, compute_branch_list, compute_branch_show, resolve_branch_shadow_config,
+    run_branch_approve, run_branch_compare, run_branch_create, run_branch_delete, run_branch_list,
+    run_branch_promote, run_branch_promote_from_plan, run_branch_show, validate_branch_name,
 };
 pub use brief::{BriefSince, compute_brief, run_brief};
 pub use catalog::{
@@ -321,6 +322,48 @@ pub(crate) fn filter_table_matches(filter: Option<&(String, String)>, table_name
         return true;
     }
     table_name == value
+}
+
+/// How many discovered `(connector, table)` pairs each `[[table_overrides]]`
+/// rule matches, indexed like `rules`.
+///
+/// The ONE count `rocky plan` and `rocky run` both report. It applies only
+/// the skips the two share before any warehouse query: a connector schema
+/// the pattern does not parse, the connector-level `--filter`, and the
+/// table-level `--filter table=`. It counts BEFORE `run` excludes tables
+/// missing from the source (`plan` never asks the warehouse), and it
+/// counts disabled tables too (`enabled = false` is itself a match).
+pub(crate) fn count_override_rule_matches(
+    rules: &[rocky_core::config::TableOverride],
+    connectors: &[rocky_core::source::DiscoveredConnector],
+    pattern: &rocky_core::schema::SchemaPattern,
+    parsed_filter: Option<&(String, String)>,
+) -> Vec<usize> {
+    let mut counts = vec![0usize; rules.len()];
+    if rules.is_empty() {
+        return counts;
+    }
+    for conn in connectors {
+        let Ok(parsed) = pattern.parse(&conn.schema) else {
+            continue;
+        };
+        if let Some((key, value)) = parsed_filter
+            && !matches_filter(conn, &parsed, key, value)
+        {
+            continue;
+        }
+        for table in &conn.tables {
+            if !filter_table_matches(parsed_filter, &table.name) {
+                continue;
+            }
+            for (count, rule) in counts.iter_mut().zip(rules) {
+                if rule.match_.matches(&conn.id, &conn.schema, &table.name) {
+                    *count += 1;
+                }
+            }
+        }
+    }
+    counts
 }
 
 /// The `--filter` keys a transformation pipeline's model enumeration accepts.

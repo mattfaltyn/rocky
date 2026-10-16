@@ -143,6 +143,16 @@ pub async fn plan(
 
     let mut output = PlanOutput::new(filter.unwrap_or("").to_string());
     output.env = env.map(str::to_string);
+    // R8: the same count `rocky run` reports, from the same function.
+    output.override_match_counts = crate::output::OverrideMatchCountOutput::rows(
+        &pipeline.table_overrides,
+        &super::count_override_rule_matches(
+            &pipeline.table_overrides,
+            &connectors,
+            &pattern,
+            parsed_filter.as_ref(),
+        ),
+    );
 
     // #1941: one (target table name, source_type) pair per table that
     // survives this loop's own skip conditions (filter, disabled override),
@@ -3734,6 +3744,21 @@ pub(crate) async fn build_promote_plan_inner(
     plan_output.plan_id = Some(plan_id);
     plan_output.plan_kind = Some("promote".to_string());
     plan_output.created_at = Some(created_at);
+    // One statement per production table the plan would replace, so a reader
+    // of the output (the browser UI's confirm step among them) can name every
+    // table before it applies the plan.
+    plan_output.statements = promote_plan
+        .targets
+        .iter()
+        .map(|step| crate::output::PlannedStatement {
+            purpose: format!(
+                "promote branch '{}' ({})",
+                promote_plan.branch_name, step.strategy
+            ),
+            target: step.target.clone(),
+            sql: step.statement.clone(),
+        })
+        .collect();
 
     Ok(PromotePlanResult {
         plan: promote_plan,

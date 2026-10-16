@@ -428,6 +428,14 @@ pub struct RunOutput {
     /// no overrides.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_warnings: Vec<OverrideWarningOutput>,
+    /// How many discovered tables each `[[table_overrides]]` rule matches,
+    /// one row per rule in declaration order. Counted after `--filter` and
+    /// BEFORE the warehouse check that excludes tables missing from the
+    /// source, by the same function `rocky plan` calls, so the two report
+    /// the same numbers for the same project. Empty (and omitted) when no
+    /// rules are declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_match_counts: Vec<OverrideMatchCountOutput>,
     /// Problems in the project's `consumers/` records (`E060`): a file that
     /// does not load, a duplicate name, a `depends_on` entry that names no
     /// model, or an unreadable directory. A consumer is metadata about readers
@@ -438,9 +446,51 @@ pub struct RunOutput {
     pub consumer_diagnostics: Vec<Diagnostic>,
 }
 
+/// How many discovered tables one `[[table_overrides]]` rule matches. See
+/// [`RunOutput::override_match_counts`] and
+/// [`PlanOutput::override_match_counts`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct OverrideMatchCountOutput {
+    /// Position of the rule in `[[table_overrides]]`, 0-based.
+    pub rule_index: usize,
+    /// Echo of `match.connector` from the rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+    /// Echo of `match.table` from the rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    /// Discovered `(connector, table)` pairs the rule matches, after
+    /// `--filter` and before tables missing from the source are excluded.
+    pub matched_tables: usize,
+}
+
+impl OverrideMatchCountOutput {
+    /// One row per rule, in declaration order, from the counts
+    /// [`crate::commands::count_override_rule_matches`] returns.
+    pub fn rows(
+        rules: &[rocky_core::config::TableOverride],
+        counts: &[usize],
+    ) -> Vec<OverrideMatchCountOutput> {
+        rules
+            .iter()
+            .zip(counts)
+            .enumerate()
+            .map(
+                |(rule_index, (rule, &matched_tables))| OverrideMatchCountOutput {
+                    rule_index,
+                    connector: rule.match_.connector.clone(),
+                    table: rule.match_.table.clone(),
+                    matched_tables,
+                },
+            )
+            .collect()
+    }
+}
+
 /// Soft warning surfaced on
 /// [`RunOutput::override_warnings`] when an override rule matched no
-/// tables this run.
+/// discovered table this run (after `--filter`, before tables missing from
+/// the source are excluded).
 ///
 /// Distinct kinds let orchestrators (Dagster) branch on cause without
 /// parsing free-form messages.
@@ -1918,6 +1968,14 @@ pub struct PlanOutput {
     /// its plan did not record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub first_run_fills: Vec<PlanFirstRunFill>,
+    /// How many discovered tables each `[[table_overrides]]` rule matches,
+    /// for a replication plan. The same function `rocky run` uses counts
+    /// them, so the numbers agree with [`RunOutput::override_match_counts`]
+    /// for the same project and `--filter`. Plan does not ask the warehouse
+    /// which source tables exist, and run counts before it excludes them.
+    /// Empty (and omitted) when no rules are declared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_match_counts: Vec<OverrideMatchCountOutput>,
 }
 
 /// One row of [`PlanOutput::first_run_fills`].
@@ -3849,6 +3907,24 @@ pub struct LineageOutput {
     /// models, so they are not part of `downstream`. Omitted when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumers: Vec<LineageConsumerRecord>,
+    /// Models in this view (the focal model and every model upstream and
+    /// downstream of it) whose lineage is known to be incomplete, sorted by name
+    /// (#2377). Impact through them may be under-reported. `[]` means none.
+    ///
+    /// Always written. A payload with no such field comes from an older
+    /// build: read it as unknown, never as complete.
+    pub incomplete_lineage: Option<Vec<IncompleteLineageRecord>>,
+}
+
+/// A model whose column lineage is known to be incomplete (#2377).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct IncompleteLineageRecord {
+    /// The model.
+    pub model: String,
+    /// The constructs in it that Rocky does not trace, such as
+    /// `natural_join` or `set_operation`. `None` when they were never
+    /// computed (unknown).
+    pub gaps: Option<Vec<rocky_sql::lineage::LineageGap>>,
 }
 
 /// One downstream consumer in a `rocky lineage` view.
@@ -3903,6 +3979,15 @@ pub struct ColumnLineageOutput {
     /// partitions. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub row_selection: Vec<RowSelectionEdgeRecord>,
+    /// Models whose lineage is known to be incomplete, sorted by name
+    /// (#2377): the focal model, every model upstream of it, and every model
+    /// downstream of it (by model dependency, so a reader with no traced
+    /// column edge is included). `trace`, `downstream_consumers` and
+    /// `row_selection` may be under-reported through them. `[]` means none.
+    ///
+    /// Always written. A payload with no such field comes from an older
+    /// build: read it as unknown, never as complete.
+    pub incomplete_lineage: Option<Vec<IncompleteLineageRecord>>,
 }
 
 /// One row-selection lineage edge. See `ColumnLineageOutput::row_selection`.
@@ -6124,6 +6209,7 @@ impl RunOutput {
             cost_summary: None,
             budget_breaches: vec![],
             override_warnings: vec![],
+            override_match_counts: vec![],
             consumer_diagnostics: vec![],
         }
     }
@@ -6632,6 +6718,7 @@ impl PlanOutput {
             intent_check: None,
             cost_preview: None,
             first_run_fills: vec![],
+            override_match_counts: vec![],
         }
     }
 }
@@ -12372,6 +12459,13 @@ pub struct ProjectOutput {
     /// none was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<ProjectRunOutput>,
+    /// Whether `[branch.approval] required = true` in the bound config, read
+    /// per request. The browser UI offers branch promote only when this is
+    /// `true`, and the server refuses a promote job otherwise. Absent when the
+    /// config could not be loaded (see `config_error`) or none is bound: an
+    /// unknown answer is not shown as `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_approval_required: Option<bool>,
 }
 
 /// One pipeline of the bound config.
@@ -12653,6 +12747,27 @@ pub enum JobKind {
     /// does not re-run the changed models (`run_status` is `planned`). `preview
     /// diff` and `preview cost` are not jobs.
     Preview,
+    /// `rocky plan promote <branch>` — runs the branch's approval and
+    /// breaking-change gates and writes a promote plan. It writes no warehouse
+    /// object and no state: the plan file is the only output, and applying it
+    /// (`rocky apply <plan_id>`, kind `apply`) is what replaces production
+    /// tables. Non-mutating; no permit. The server refuses it unless
+    /// `[branch.approval] required = true`.
+    Promote,
+    /// `rocky product approve <name>` — approves the product's current working
+    /// spec: writes an immutable digest-addressed snapshot file and records the
+    /// approval, the loop state and a journal row in one state-store
+    /// transaction. Takes the mutation permit. The record names the server's git
+    /// identity and the channel `http_api`; it does not prove a browser made the
+    /// call.
+    #[serde(rename = "product_approve")]
+    ProductApprove,
+    /// `rocky compact <table>` or `rocky compact --catalog <name>` — writes a
+    /// compaction plan (`OPTIMIZE` and `VACUUM` per table) to `.rocky/plans/`.
+    /// It writes no warehouse object and runs no statement, so it takes no permit. For a replication pipeline, `--catalog` asks the source adapter to discover tables.
+    /// Applying the plan (`apply`, with the returned `plan_id`) is what runs the
+    /// statements.
+    Compact,
 }
 
 impl JobKind {
@@ -12670,13 +12785,19 @@ impl JobKind {
             JobKind::Freeze => "freeze",
             JobKind::Unfreeze => "unfreeze",
             JobKind::Preview => "preview",
+            JobKind::Promote => "promote",
+            JobKind::ProductApprove => "product_approve",
+            JobKind::Compact => "compact",
         }
     }
 
     /// The `rocky` subcommand this kind spawns. `Approve` runs `review` with
     /// `--approve`; there is no `rocky approve` verb. `Freeze` and `Unfreeze`
     /// run `policy` and `Preview` runs `preview`; the argv builder adds the verb
-    /// (`freeze`, `unfreeze`, `create`) after it.
+    /// (`freeze`, `unfreeze`, `create`) after it. `Promote` runs `plan` and the
+    /// builder adds `promote`; `ProductApprove` runs `product` and the builder
+    /// adds `approve`; `Compact` runs `compact` and the builder adds the table
+    /// or `--catalog`.
     pub fn subcommand(self) -> &'static str {
         match self {
             JobKind::Run => "run",
@@ -12687,6 +12808,9 @@ impl JobKind {
             JobKind::Ci => "ci",
             JobKind::Freeze | JobKind::Unfreeze => "policy",
             JobKind::Preview => "preview",
+            JobKind::Promote => "plan",
+            JobKind::ProductApprove => "product",
+            JobKind::Compact => "compact",
         }
     }
 
@@ -12694,7 +12818,8 @@ impl JobKind {
     /// change warehouse state; `approve` changes what `apply` may do; `freeze`
     /// and `unfreeze` write the policy ledger in the state store; `preview`
     /// registers a branch in the state store and writes the branch schema in the
-    /// warehouse. `plan`, `test` and `ci` only preview or check.
+    /// warehouse; `product_approve` writes the approval snapshot and the state
+    /// store. `plan`, `promote`, `test` and `ci` only preview or check.
     pub fn mutates(self) -> bool {
         match self {
             JobKind::Run
@@ -12702,8 +12827,11 @@ impl JobKind {
             | JobKind::Approve
             | JobKind::Freeze
             | JobKind::Unfreeze
-            | JobKind::Preview => true,
-            JobKind::Plan | JobKind::Test | JobKind::Ci => false,
+            | JobKind::Preview
+            | JobKind::ProductApprove => true,
+            JobKind::Plan | JobKind::Test | JobKind::Ci | JobKind::Promote | JobKind::Compact => {
+                false
+            }
         }
     }
 
@@ -12719,6 +12847,9 @@ impl JobKind {
             "freeze" => Some(JobKind::Freeze),
             "unfreeze" => Some(JobKind::Unfreeze),
             "preview" => Some(JobKind::Preview),
+            "promote" => Some(JobKind::Promote),
+            "product_approve" => Some(JobKind::ProductApprove),
+            "compact" => Some(JobKind::Compact),
             _ => None,
         }
     }

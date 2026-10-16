@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { ProductStatusOutput } from "@rocky-types/product_status";
+import type { ProjectOutput } from "@rocky-types/project";
 import type { ReviewOutput } from "@rocky-types/review";
 import type { ReviewQueueOutput } from "@rocky-types/review_queue";
 import type { ReviewStatusOutput } from "@rocky-types/review_status";
@@ -43,6 +44,13 @@ const DIFF: ReviewOutput = {
       severity: "breaking",
     },
   ],
+};
+
+const PROJECT: ProjectOutput = {
+  name: "p",
+  pipelines: [],
+  adapters: [],
+  diagnostics: { total: 0, warnings: 0, has_errors: false },
 };
 
 const QUEUE: ReviewQueueOutput = {
@@ -111,6 +119,7 @@ function loaders(overrides: Partial<PlanLoaders> = {}): PlanLoaders {
     diff: vi.fn(async () => DIFF),
     queue: vi.fn(async () => QUEUE),
     product: vi.fn(async () => PRODUCT),
+    project: vi.fn(async () => ({ ...PROJECT, branch_approval_required: true })),
     ...overrides,
   };
 }
@@ -707,6 +716,88 @@ describe("PlanDetail", () => {
     );
     await waitFor(() => expect(screen.getByText("plan_not_found")).toBeTruthy());
     expect(screen.getByText("refused (404)")).toBeTruthy();
+  });
+
+  /// Archive deletes rows and vacuums with no retention window. The server
+  /// refuses to apply it over the HTTP API, and the page mirrors that: no
+  /// button that would only be refused, and the terminal command instead.
+  it("does not offer to apply an archive plan, and shows the terminal command", async () => {
+    render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({ status: vi.fn(async () => ({ ...STATUS, kind: "archive", reviewed: true })) })}
+          jobs={{ submit: vi.fn(), status: vi.fn(), cancel: vi.fn() }}
+        />
+      </WriteAccessProvider>,
+    );
+    await screen.findByRole("region", { name: "Approval" });
+    const apply = screen.getByRole("button", { name: "Apply" });
+    expect(apply).toBeDisabled();
+    expect(apply).toHaveAttribute("title", "An archive plan is applied in a terminal, not from this page.");
+    expect(screen.getByText(`rocky apply ${PLAN}`)).toBeTruthy();
+    fireEvent.click(apply);
+  });
+
+  /// A promote plan replaces production tables. The server applies one only
+  /// when the config requires a branch approval; the page mirrors that, with
+  /// the server staying the authority.
+  it("disables Apply for a promote plan unless the project requires a branch approval", async () => {
+    const asPromote = { status: vi.fn(async () => ({ ...STATUS, kind: "promote", reviewed: true })) };
+    for (const [label, project] of [
+      ["off", { ...PROJECT, branch_approval_required: false }],
+      ["unknown", PROJECT],
+    ] as const) {
+      const view = render(
+        <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+          <PlanDetail planId={PLAN} loaders={loaders({ ...asPromote, project: vi.fn(async () => project) })} />
+        </WriteAccessProvider>,
+      );
+      await screen.findByRole("region", { name: "Approval" });
+      await waitFor(() => expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled(), { timeout: 3000 });
+      const text = document.body.textContent ?? "";
+      expect(text, label).toContain("[branch.approval] required = true");
+      expect(screen.getByText(`rocky apply ${PLAN}`), label).toBeTruthy();
+      view.unmount();
+    }
+  });
+
+  it("offers Apply for a promote plan when the project requires a branch approval", async () => {
+    render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({ status: vi.fn(async () => ({ ...STATUS, kind: "promote", reviewed: true })) })}
+        />
+      </WriteAccessProvider>,
+    );
+    await screen.findByRole("region", { name: "Approval" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Apply" })).not.toBeDisabled(), { timeout: 3000 });
+  });
+
+  it("does not read the project for a plan that is not a promote plan", async () => {
+    const project = vi.fn(async () => PROJECT);
+    render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail planId={PLAN} loaders={loaders({ project })} />
+      </WriteAccessProvider>,
+    );
+    await screen.findByRole("region", { name: "Approval" });
+    expect(project).not.toHaveBeenCalled();
+  });
+
+  it("keeps Apply for a plan that is not an archive plan", async () => {
+    render(
+      <WriteAccessProvider value={{ kind: "operator", scope: "full" }}>
+        <PlanDetail
+          planId={PLAN}
+          loaders={loaders({ status: vi.fn(async () => ({ ...STATUS, kind: "gc", reviewed: true })) })}
+        />
+      </WriteAccessProvider>,
+    );
+    await screen.findByRole("region", { name: "Approval" });
+    expect(screen.getByRole("button", { name: "Apply" })).not.toBeDisabled();
+    expect(screen.queryByText(`rocky apply ${PLAN}`)).toBeNull();
   });
 
   it("offers no control that can change anything on a read-only page", async () => {

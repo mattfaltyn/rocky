@@ -33,6 +33,8 @@ export interface GraphEdge {
 
 /** The full project graph, returned by the `"graph"` request. */
 export interface GraphData {
+  /** Project root the graph was built from; scopes the plan-cost overlay. */
+  projectRoot?: string | null;
   nodes: GraphNode[];
   edges: GraphEdge[];
 }
@@ -78,6 +80,37 @@ export interface ReplayData {
   models: ReplayModelLite[];
   /** Set when there is no run to replay. */
   unavailable?: string;
+}
+
+/** Params for the `"planCost"` request: the root the graph was built from. */
+export interface PlanCostParam {
+  projectRoot: string | null;
+}
+
+/** One model's plan-time cost estimate, from the last `rocky plan` the extension ran. */
+export interface PlanCostModelLite {
+  model: string;
+  /** Absent when the plan could not price the model (never `0`). */
+  estimatedCostUsd: number | null;
+  estimatedRows: number | null;
+  /** `"heuristic"` or `"adapter"`. */
+  source: string;
+}
+
+/**
+ * Cost-overlay payload: the plan-time estimate from the user's last explicit
+ * Plan, or `null` when no plan has been run. Never produced by running
+ * `rocky plan` on the Inspector's behalf (that persists a plan file per call).
+ */
+export interface PlanCostData {
+  /** ISO time the plan ran. */
+  recordedAt: string;
+  filter: string;
+  /** `"heuristic"`, `"adapter"` or `"mixed"`. */
+  source: string;
+  /** True when a model file changed after the plan ran. */
+  modelsChangedSince: boolean;
+  models: PlanCostModelLite[];
 }
 
 /** One model's governance posture: classified columns and unmasked exceptions. */

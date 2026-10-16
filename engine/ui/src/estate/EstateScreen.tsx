@@ -10,10 +10,12 @@ import { apiGet } from "../api";
 import { ArrowPathIcon } from "@heroicons/react/20/solid";
 import { READ_BUTTON, ScreenHeader, StatusCard } from "../components";
 import type { JobClient } from "../operator";
+import { CompactControls } from "./CompactControls";
 import { DagPanel } from "./DagPanel";
 import { ModelDetail } from "./ModelDetail";
 import { type CompiledModels, anyNotCompiled, compiledModels, isWholeList } from "./nodeRoute";
 import { PreviewControls } from "./PreviewControls";
+import { PromoteControls } from "./PromoteControls";
 import { ProjectActions, planUnavailable } from "./ProjectActions";
 import { ProjectStrip } from "./ProjectStrip";
 import { RunsPanel } from "./RunsPanel";
@@ -176,6 +178,20 @@ export function EstateScreen({
 
       <Panel title="Preview" producer="POST /api/v1/jobs/preview">
         <PreviewControls jobs={jobs} onDone={refreshAll} />
+      </Panel>
+
+      <Panel title="Promote" producer="GET /api/v1/branches + POST /api/v1/jobs/promote">
+        <PromoteControls
+          approvalRequired={
+            project.kind === "loading" ? undefined : project.kind === "ready" ? (project.value.branch_approval_required ?? null) : null
+          }
+          jobs={jobs}
+          onDone={refreshAll}
+        />
+      </Panel>
+
+      <Panel title="Compact" producer="POST /api/v1/jobs/compact">
+        <CompactControls jobs={jobs} onDone={refreshAll} />
       </Panel>
 
       <Panel title="Runs" producer="GET /api/v1/runs">

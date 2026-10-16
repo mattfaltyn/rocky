@@ -81,6 +81,30 @@ class JobKind9(StrEnum):
     preview = "preview"
 
 
+class JobKind10(StrEnum):
+    """
+    `rocky plan promote <branch>` — runs the branch's approval and breaking-change gates and writes a promote plan. It writes no warehouse object and no state: the plan file is the only output, and applying it (`rocky apply <plan_id>`, kind `apply`) is what replaces production tables. Non-mutating; no permit. The server refuses it unless `[branch.approval] required = true`.
+    """
+
+    promote = "promote"
+
+
+class JobKind11(StrEnum):
+    """
+    `rocky product approve <name>` — approves the product's current working spec: writes an immutable digest-addressed snapshot file and records the approval, the loop state and a journal row in one state-store transaction. Takes the mutation permit. The record names the server's git identity and the channel `http_api`; it does not prove a browser made the call.
+    """
+
+    product_approve = "product_approve"
+
+
+class JobKind12(StrEnum):
+    """
+    `rocky compact <table>` or `rocky compact --catalog <name>` — writes a compaction plan (`OPTIMIZE` and `VACUUM` per table) to `.rocky/plans/`. It writes no warehouse object and runs no statement, so it takes no permit. For a replication pipeline, `--catalog` asks the source adapter to discover tables. Applying the plan (`apply`, with the returned `plan_id`) is what runs the statements.
+    """
+
+    compact = "compact"
+
+
 class JobState1(StrEnum):
     """
     Accepted, not yet started.
@@ -150,6 +174,9 @@ class JobStatus(BaseModel):
         | JobKind7
         | JobKind8
         | JobKind9
+        | JobKind10
+        | JobKind11
+        | JobKind12
     )
     """
     Which operation the job wraps.

@@ -87,7 +87,10 @@ Record a human's approval of the current spec revision.
 
 ```bash
 rocky product approve revenue_daily
+rocky product approve revenue_daily --expect-digest sha256:<hex>
 ```
+
+With `--expect-digest`, the command approves the working spec only if its digest is exactly the one given (as `rocky product status` prints it). A different digest refuses with `approval-digest-mismatch` before the store is opened, and nothing is written. Use it to approve exactly the spec you read. Without the flag, the spec on disk when the command runs is approved. The browser UI always passes it.
 
 Approval is one authority transition, in a fixed order:
 
@@ -97,6 +100,8 @@ Approval is one authority transition, in a fixed order:
 A crash between step 1 and step 2 leaves only an orphan snapshot file — harmless; the next approve completes over it. Approving the already-approved digest is a no-op. When two people race, the second approve loses its compare-and-swap cleanly and prints the winning digest.
 
 The approver identity is the same best-effort git identity the review marker records. It is an attribution, not an authentication.
+
+The command reads the channel from `ROCKY_SESSION_SOURCE`, as `rocky review --approve` does. In a terminal, `approver` is the bare email. In a job that `rocky serve` started (the browser UI, or `POST /api/v1/jobs/product_approve`), `ROCKY_SESSION_SOURCE=http_api` is set and `approver` is `<email> (http_api)`. That job refuses with `approver_identity_unresolved`, and writes nothing, when the git identity cannot be read or is literally `unknown`. The label names the channel, not the person.
 
 ### JSON output
 

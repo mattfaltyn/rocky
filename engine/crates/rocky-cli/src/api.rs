@@ -31,6 +31,10 @@
 //! POST /api/v1/jobs/freeze                      → submit a freeze job → 202 {job_id}
 //! POST /api/v1/jobs/unfreeze                    → submit an unfreeze  → 202 {job_id}
 //! POST /api/v1/jobs/preview                     → submit a preview create → 202 {job_id}
+//! POST /api/v1/jobs/promote                     → plan a branch promote (= rocky plan promote) → 202 {job_id}
+//! GET  /api/v1/branches                         → the branch list (= rocky branch list)
+//! POST /api/v1/jobs/product_approve             → approve a product spec (= rocky product approve) → 202 {job_id}
+//! POST /api/v1/jobs/compact                     → plan a compaction (= rocky compact) → 202 {job_id}
 //! GET  /api/v1/jobs/:id                          → job status (+ embedded result when done)
 //! ```
 //!
@@ -109,8 +113,9 @@ use crate::commands::{
     lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
 };
 use crate::output::{
-    AuditForOutput, AuditOutput, AuditScorecardOutput, BriefOutput, PolicyRulesOutput,
-    ProjectOutput, ReviewOutput, ReviewQueueOutput, ReviewStatusOutput, ScorecardDimension,
+    AuditForOutput, AuditOutput, AuditScorecardOutput, BranchListOutput, BriefOutput,
+    PolicyRulesOutput, ProjectOutput, ReviewOutput, ReviewQueueOutput, ReviewStatusOutput,
+    ScorecardDimension,
 };
 use crate::output::{
     ColumnLineageOutput, CompileOutput, DagExecutionOutput, DagLayersOutput, DagNodeResultOutput,
@@ -200,6 +205,10 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/freeze", post(submit_freeze))
         .route("/api/v1/jobs/unfreeze", post(submit_unfreeze))
         .route("/api/v1/jobs/preview", post(submit_preview))
+        .route("/api/v1/jobs/promote", post(submit_promote))
+        .route("/api/v1/jobs/product_approve", post(submit_product_approve))
+        .route("/api/v1/jobs/compact", post(submit_compact))
+        .route("/api/v1/branches", get(list_branches))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/schedule", get(schedule_status))
@@ -628,7 +637,7 @@ impl ApiError {
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
-            "another run, apply, approve, freeze, unfreeze or preview job is already in progress on this project",
+            "another run, apply, approve, freeze, unfreeze, preview or product approval job is already in progress on this project",
             Some("wait for the running job to finish (poll GET /api/v1/jobs/{id}), then resubmit"),
         );
         err.envelope.running_job_id = Some(running_job_id.to_string());
@@ -973,6 +982,10 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/freeze",
         "POST /api/v1/jobs/unfreeze",
         "POST /api/v1/jobs/preview",
+        "POST /api/v1/jobs/promote",
+        "POST /api/v1/jobs/product_approve",
+        "POST /api/v1/jobs/compact",
+        "GET /api/v1/branches",
         "GET /api/v1/jobs/{id}",
         "POST /api/v1/jobs/{id}/cancel",
         "GET /api/v1/schedule",
@@ -1058,6 +1071,7 @@ async fn project(
     State(state): State<Arc<ServerState>>,
 ) -> Result<PrettyJson<ProjectOutput>, ApiError> {
     let read_failure = state.config_read_failure.read().await.clone();
+    let mut branch_approval_required: Option<bool> = None;
     let (name, config_path, pipelines, adapters, config_error) = match state.config_path.as_deref()
     {
         None => ("rocky".to_string(), None, Vec::new(), Vec::new(), None),
@@ -1089,6 +1103,7 @@ async fn project(
                                 adapter_type: cfg.adapter_type.clone(),
                             })
                             .collect();
+                        branch_approval_required = Some(config.branch.approval.required);
                         (name, shown, pipelines, adapters, None)
                     }
                     Err(e) => (name, shown, Vec::new(), Vec::new(), Some(format!("{e:#}"))),
@@ -1181,6 +1196,7 @@ async fn project(
         models_compiled,
         diagnostics,
         last_run,
+        branch_approval_required,
     }))
 }
 
@@ -2787,7 +2803,7 @@ fn too_many_requests_response(retry_after: std::time::Duration) -> Response {
 pub(crate) struct JobRequest {
     /// `--filter <component=value>` for `run`/`plan`.
     filter: Option<String>,
-    /// `--pipeline <name>` for `run`/`plan`.
+    /// `--pipeline <name>` for `run`/`plan`/`promote`.
     pipeline: Option<String>,
     /// `--model <name>` for `run`/`plan` (single-model execution) and `test`.
     model: Option<String>,
@@ -2799,7 +2815,10 @@ pub(crate) struct JobRequest {
     /// fail-closed both ways: a product-bound plan REFUSES an apply without
     /// this, and passing it against an unbound plan refuses too. The value
     /// must come from the caller's independently approved product-spec
-    /// snapshot, never read back from the plan itself.
+    /// snapshot, never read back from the plan itself. For `product_approve`
+    /// it is required: `--expect-digest <digest>`, the digest of the working
+    /// spec the caller confirmed. The command refuses, writing nothing, when
+    /// the spec on disk has a different digest.
     expect_spec_digest: Option<String>,
     /// `--principal <agent|human>` for `freeze` and `unfreeze`. Absent means
     /// both principals. Ignored by every other kind.
@@ -2813,10 +2832,19 @@ pub(crate) struct JobRequest {
     reason: Option<String>,
     /// `--name <branch>` for `preview`: the branch to register, `[A-Za-z0-9_]`,
     /// 1 to 64 characters. Absent means a name derived from the project's git
-    /// branch. Ignored by every other kind.
+    /// branch. For `promote`: the branch to promote (required). For
+    /// `product_approve`: the product to approve (required). Ignored by every
+    /// other kind.
     name: Option<String>,
-    /// `--base <git ref>` for `preview`: the ref the change set is computed
-    /// against. Absent means `main`. Ignored by every other kind.
+    /// `<table>` for `compact`: the table to compact, `catalog.schema.table`.
+    /// Exactly one of `table` and `catalog`. Ignored by every other kind.
+    table: Option<String>,
+    /// `--catalog <name>` for `compact`: compact every Rocky-managed table in
+    /// the catalog. Exactly one of `table` and `catalog`. Ignored by every
+    /// other kind.
+    catalog: Option<String>,
+    /// `--base <git ref>` for `preview` and `promote`: the ref the change set
+    /// is computed against. Absent means `main`. Ignored by every other kind.
     base: Option<String>,
 }
 
@@ -3310,6 +3338,65 @@ async fn submit_preview(
     submit_job(JobKind::Preview, state, &headers, &body).await
 }
 
+/// `POST /api/v1/jobs/promote` — plan a branch promote: `rocky plan promote
+/// <branch>` (non-mutating; no permit). Runs the branch's approval and
+/// breaking-change gates and writes a promote plan; it replaces no production
+/// table. Body `{"name": "<branch>", "base": "<git ref>", "pipeline": "<name>"}`;
+/// `name` is required. Refused `409 branch_approval_not_required` unless
+/// `[branch.approval] required = true`. Applying the plan is a separate
+/// `POST /api/v1/jobs/apply`, behind the same check.
+async fn submit_promote(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Promote, state, &headers, &body).await
+}
+
+/// `POST /api/v1/jobs/product_approve` — approve a product's working spec:
+/// `rocky product approve <name>` (mutating; takes the permit). Body
+/// `{"name": "<product>"}`; `name` is required. The child runs with
+/// `ROCKY_SESSION_SOURCE=http_api`, so the approval records
+/// `"<server git email> (http_api)"` and the child refuses
+/// (`approver_identity_unresolved`) when that identity cannot be read. The
+/// approval covers the spec as it is on disk when the job runs.
+async fn submit_product_approve(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::ProductApprove, state, &headers, &body).await
+}
+
+/// `POST /api/v1/jobs/compact` — plan a compaction: `rocky compact <table>` or
+/// `rocky compact --catalog <name>` (non-mutating; no permit). Writes a plan
+/// and runs no statement. Body `{"table": "<catalog.schema.table>"}` or
+/// `{"catalog": "<name>"}`, exactly one. Applying the plan is a separate
+/// `POST /api/v1/jobs/apply` with the returned `plan_id`.
+async fn submit_compact(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    submit_job(JobKind::Compact, state, &headers, &body).await
+}
+
+/// `GET /api/v1/branches` — canonical [`BranchListOutput`].
+///
+/// The same bytes as `rocky branch list --output json` against the state
+/// store the server resolved. Read-only.
+async fn list_branches(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<BranchListOutput>, ApiError> {
+    let state_path = state_path_for(&state);
+    let output = store_read(&state, move || {
+        crate::commands::compute_branch_list(&state_path)
+    })
+    .await?
+    .map_err(|e| map_state_err(e, state.mutation_permit.running_job()))?;
+    Ok(PrettyJson(output))
+}
+
 /// Shared submission path for all job kinds.
 ///
 /// Returns `202 {job_id}` after (1) taking the mutation permit for `run`/`apply`
@@ -3334,6 +3421,12 @@ async fn submit_job(
     validate_freeze_fields(kind, &request)?;
     validate_preview_fields(kind, &request)?;
     validate_apply_digest(kind, &request)?;
+    validate_promote_fields(kind, &request)?;
+    validate_product_approve_fields(kind, &request)?;
+    validate_compact_fields(kind, &request)?;
+    // Project-state gates that need a read of the config or the plan: they run
+    // before the permit, so a refused job never holds it.
+    gate_job_against_project(kind, &state, &request).await?;
     let principal = principal_from_headers(headers)?;
     let job_id = new_job_id();
 
@@ -3443,7 +3536,10 @@ fn validate_job_plan_id(kind: JobKind, request: &JobRequest) -> Result<(), ApiEr
         | JobKind::Ci
         | JobKind::Freeze
         | JobKind::Unfreeze
-        | JobKind::Preview => Ok(()),
+        | JobKind::Preview
+        | JobKind::Promote
+        | JobKind::ProductApprove
+        | JobKind::Compact => Ok(()),
         JobKind::Apply | JobKind::Approve => match request.plan_id.as_deref() {
             Some(plan_id) if is_plan_id(plan_id) => Ok(()),
             Some(_) | None => Err(ApiError::invalid_plan_id(kind)),
@@ -3548,6 +3644,336 @@ fn validate_preview_fields(kind: JobKind, request: &JobRequest) -> Result<(), Ap
     Ok(())
 }
 
+/// The most characters a compact `table` or `catalog` may carry.
+const COMPACT_TARGET_MAX_CHARS: usize = 300;
+
+/// Refuse a `compact` body the CLI would not plan, before the argv. Exactly
+/// one of `table` and `catalog` is given. A `table` is `catalog.schema.table`:
+/// three parts, each a SQL identifier (`[A-Za-z0-9_]+`, the rule the SQL
+/// generator applies to every part). A `catalog` is one such identifier. Both
+/// become argv entries, so neither can start with `-`; the identifier rule
+/// already rules that out. Other kinds ignore these fields.
+fn validate_compact_fields(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    if kind != JobKind::Compact {
+        return Ok(());
+    }
+    let ident = |part: &str| {
+        !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    match (request.table.as_deref(), request.catalog.as_deref()) {
+        (Some(table), None) => {
+            let parts: Vec<&str> = table.split('.').collect();
+            if table.chars().count() > COMPACT_TARGET_MAX_CHARS
+                || parts.len() != 3
+                || !parts.iter().all(|part| ident(part))
+            {
+                return Err(ApiError::bad_request(
+                    "invalid table: use the full name catalog.schema.table, each part letters, digits or '_'",
+                ));
+            }
+            Ok(())
+        }
+        (None, Some(catalog)) => {
+            if catalog.chars().count() > COMPACT_TARGET_MAX_CHARS || !ident(catalog) {
+                return Err(ApiError::bad_request(
+                    "invalid catalog: use a catalog name of letters, digits or '_'",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(ApiError::bad_request(
+            "a compact job needs exactly one of `table` (catalog.schema.table) or `catalog`",
+        )),
+    }
+}
+
+/// Refuse a `product_approve` body without a product name the CLI would take,
+/// before the permit and the argv. The name must be a bare identifier, the
+/// spec parser's own rule (an ASCII letter or `_`, then letters, digits or
+/// `_`), so it cannot read as a flag or climb out of `products/`. Other kinds
+/// ignore the field.
+fn validate_product_approve_fields(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    if kind != JobKind::ProductApprove {
+        return Ok(());
+    }
+    match request.name.as_deref() {
+        Some(name) if is_bare_product_name(name) => Ok(()),
+        _ => Err(ApiError::bad_request(
+            "invalid name: a product_approve job needs the product name, an ASCII letter or '_' then letters, digits or '_'",
+        )),
+    }
+}
+
+/// The most characters a promote branch `name` or `pipeline` may carry.
+const PROMOTE_NAME_MAX_CHARS: usize = 64;
+
+/// Refuse a `promote` body the CLI would not take, before the permit and the
+/// argv. `name` is required and is a branch name. A branch created before the
+/// strict creation rule may hold `-` or `.`, so the shape here is the wider
+/// `[A-Za-z0-9_.-]`, never starting with `-` (clap would read it as a flag);
+/// the child checks that the branch exists. `base` is a git ref and `pipeline`
+/// a pipeline name, each held to the same one-word shape. Other kinds ignore
+/// these fields.
+fn validate_promote_fields(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
+    if kind != JobKind::Promote {
+        return Ok(());
+    }
+    let word = |value: &str| {
+        !value.is_empty()
+            && value.chars().count() <= PROMOTE_NAME_MAX_CHARS
+            && !value.starts_with('-')
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    };
+    match request.name.as_deref() {
+        Some(name) if word(name) => {}
+        _ => {
+            return Err(ApiError::bad_request(
+                "invalid name: a promote job needs the branch name, 1 to 64 letters, digits, '_', '.' or '-', not starting with '-'",
+            ));
+        }
+    }
+    if let Some(pipeline) = request.pipeline.as_deref()
+        && !word(pipeline)
+    {
+        return Err(ApiError::bad_request(
+            "invalid pipeline: use 1 to 64 letters, digits, '_', '.' or '-', not starting with '-', or omit it",
+        ));
+    }
+    if let Some(base) = request.base.as_deref() {
+        if base.is_empty()
+            || base.starts_with('-')
+            || base.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(ApiError::bad_request(
+                "invalid base: it must be a git ref with no spaces or control characters, and must not start with '-'",
+            ));
+        }
+        if base.chars().count() > PREVIEW_BASE_MAX_CHARS {
+            return Err(ApiError::bad_request(format!(
+                "invalid base: at most {PREVIEW_BASE_MAX_CHARS} characters"
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl ApiError {
+    /// `409` — a branch promote was asked for, but the bound config does not
+    /// require a branch approval. Production tables are replaced only behind a
+    /// signed sign-off, and `[branch.approval] required = true` is what makes
+    /// the engine ask for one.
+    fn branch_approval_not_required() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "branch_approval_not_required",
+            "a branch promote from the HTTP API needs `[branch.approval] required = true` in rocky.toml",
+            Some(
+                "set `required = true` under `[branch.approval]`, approve the branch with \
+                 `rocky branch approve <branch>` in a terminal, or promote in a terminal",
+            ),
+        )
+    }
+
+    /// `409` — the promote plan was not built behind an approval.
+    fn promote_plan_not_approved(reason: &str) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "promote_plan_not_approved",
+            format!("this promote plan was not built behind the branch approval gate: {reason}"),
+            Some(
+                "approve the branch with `rocky branch approve <branch>`, then plan the promote \
+                 again; or apply the plan in a terminal with `rocky apply <plan-id>`",
+            ),
+        )
+    }
+
+    /// `409` — an archive plan was submitted to the HTTP API. Archive runs a
+    /// `DELETE` and then a `VACUUM` with no retention window, which cannot be
+    /// undone, so it is applied in a terminal only.
+    fn archive_apply_terminal_only() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "archive_apply_terminal_only",
+            "an archive plan cannot be applied over the HTTP API: it deletes rows and vacuums with no retention window",
+            Some("apply it in a terminal with `rocky apply <plan-id>`"),
+        )
+    }
+
+    /// `500` — the config or the plan could not be read for a gate.
+    fn project_read_failed(what: &str, error: &str) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "project_read_failed",
+            format!("could not read {what} to check this job: {error}"),
+            Some("fix rocky.toml, then resubmit"),
+        )
+    }
+}
+
+/// What the gate on an `apply` learns from the plan and the config.
+#[derive(Debug, PartialEq, Eq)]
+enum ApplyGateVerdict {
+    Allowed,
+    ArchivePlan,
+    PromoteWithoutApprovalRequired,
+    PromotePlanNotApproved(String),
+}
+
+/// The directory and config a job child runs against, resolved the way
+/// [`job_subprocess_command`] resolves them: the directory of the bound
+/// `rocky.toml`, and with none bound the server's own directory and the CLI's
+/// default `rocky.toml`. A gate that read anywhere else could clear a plan the
+/// child then applies from somewhere it never looked.
+fn job_project_paths(state: &ServerState) -> (std::path::PathBuf, std::path::PathBuf) {
+    match state.config_path.as_deref().map(absolute_path) {
+        Some(config) => {
+            let root = match config.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                _ => std::path::PathBuf::from("."),
+            };
+            (root, config)
+        }
+        None => (
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from("rocky.toml"),
+        ),
+    }
+}
+
+/// Decide an `apply` from the plan it names, as a plain function of the plan
+/// and the config so a test can drive every arm. A plan that cannot be read is
+/// allowed through: the child reads the same plan first and fails on it
+/// before it does anything, so there is nothing to clear.
+fn judge_apply(
+    plan: Option<&crate::plan_store::PersistedPlan>,
+    config: &dyn Fn() -> anyhow::Result<rocky_core::config::RockyConfig>,
+) -> anyhow::Result<ApplyGateVerdict> {
+    use crate::plan_store::PlanKind;
+    let Some(plan) = plan else {
+        return Ok(ApplyGateVerdict::Allowed);
+    };
+    // Rocky-owned enum: every kind is named, so a new kind has to choose.
+    match plan.kind {
+        PlanKind::Archive => Ok(ApplyGateVerdict::ArchivePlan),
+        PlanKind::Promote => {
+            let config = config()?;
+            let approval = &config.branch.approval;
+            if !approval.required {
+                return Ok(ApplyGateVerdict::PromoteWithoutApprovalRequired);
+            }
+            // The approval gate runs when the plan is built, and apply does not
+            // run it again. A plan built while `required` was off, or with the
+            // gate bypassed, holds no approvals; turning `required` on later
+            // must not clear it.
+            let promote: crate::output::PromotePlan =
+                match serde_json::from_value(plan.payload.clone()) {
+                    Ok(promote) => promote,
+                    Err(e) => {
+                        return Ok(ApplyGateVerdict::PromotePlanNotApproved(format!(
+                            "its payload does not read as a promote plan ({e})"
+                        )));
+                    }
+                };
+            if promote
+                .plan_audit
+                .iter()
+                .any(|event| event.kind == crate::output::AuditEventKind::ApprovalSkipped)
+            {
+                return Ok(ApplyGateVerdict::PromotePlanNotApproved(
+                    "the approval gate was skipped when it was built".to_string(),
+                ));
+            }
+            let needed = approval.min_approvers.max(1) as usize;
+            if promote.approvals_used.len() < needed {
+                return Ok(ApplyGateVerdict::PromotePlanNotApproved(format!(
+                    "it records {} valid approval(s) and the config needs {needed}",
+                    promote.approvals_used.len()
+                )));
+            }
+            Ok(ApplyGateVerdict::Allowed)
+        }
+        PlanKind::Compact
+        | PlanKind::Run
+        | PlanKind::Replication
+        | PlanKind::AiAuthored
+        | PlanKind::Backfill
+        | PlanKind::Gc
+        | PlanKind::Restore => Ok(ApplyGateVerdict::Allowed),
+    }
+}
+
+/// Gates a job on the project it would run against. Runs after the request is
+/// validated and before the permit is taken.
+///
+/// * `promote` — `[branch.approval] required = true` in the config, read now.
+/// * `apply` — reads the plan it names (see [`judge_apply`]): an archive plan
+///   is refused, and a promote plan only passes when the config requires a
+///   branch approval and the plan was built behind one.
+///
+/// Every other kind passes. The match names every kind so a new one has to
+/// choose.
+async fn gate_job_against_project(
+    kind: JobKind,
+    state: &ServerState,
+    request: &JobRequest,
+) -> Result<(), ApiError> {
+    let (root, config_path) = job_project_paths(state);
+    match kind {
+        JobKind::Promote => {
+            let required = tokio::task::spawn_blocking(move || {
+                rocky_core::config::load_rocky_config(&config_path)
+                    .map(|config| config.branch.approval.required)
+                    .map_err(|e| format!("{e:#}"))
+            })
+            .await
+            .map_err(|e| map_join_err(&e))?
+            .map_err(|e| ApiError::project_read_failed("rocky.toml", &e))?;
+            if required {
+                Ok(())
+            } else {
+                Err(ApiError::branch_approval_not_required())
+            }
+        }
+        JobKind::Apply => {
+            let Some(plan_id) = request.plan_id.clone() else {
+                return Ok(());
+            };
+            let verdict = tokio::task::spawn_blocking(move || {
+                let plan = crate::plan_store::read_plan(&root, &plan_id).ok();
+                judge_apply(plan.as_ref(), &|| {
+                    rocky_core::config::load_rocky_config(&config_path).map_err(Into::into)
+                })
+                .map_err(|e| format!("{e:#}"))
+            })
+            .await
+            .map_err(|e| map_join_err(&e))?
+            .map_err(|e| ApiError::project_read_failed("rocky.toml", &e))?;
+            match verdict {
+                ApplyGateVerdict::Allowed => Ok(()),
+                ApplyGateVerdict::ArchivePlan => Err(ApiError::archive_apply_terminal_only()),
+                ApplyGateVerdict::PromoteWithoutApprovalRequired => {
+                    Err(ApiError::branch_approval_not_required())
+                }
+                ApplyGateVerdict::PromotePlanNotApproved(reason) => {
+                    Err(ApiError::promote_plan_not_approved(&reason))
+                }
+            }
+        }
+        JobKind::Run
+        | JobKind::Plan
+        | JobKind::Approve
+        | JobKind::Test
+        | JobKind::Ci
+        | JobKind::Freeze
+        | JobKind::Unfreeze
+        | JobKind::Preview
+        | JobKind::ProductApprove
+        | JobKind::Compact => Ok(()),
+    }
+}
+
 /// The most characters an `expect_spec_digest` may carry.
 const SPEC_DIGEST_MAX_CHARS: usize = 200;
 
@@ -3555,13 +3981,23 @@ const SPEC_DIGEST_MAX_CHARS: usize = 200;
 /// before the permit is taken or an argv is built. The digest is opaque to the
 /// engine (it compares equality only), so this checks shape, not content: not
 /// empty, no whitespace or control characters, no leading `-` (clap would read
-/// it as a flag), and a length cap. Other kinds ignore the field.
+/// it as a flag), and a length cap. A `product_approve` job must carry one
+/// (`400` without), because the approval has to cover exactly the spec the
+/// person confirmed. Other kinds ignore the field.
 fn validate_apply_digest(kind: JobKind, request: &JobRequest) -> Result<(), ApiError> {
-    if kind != JobKind::Apply {
+    if !matches!(kind, JobKind::Apply | JobKind::ProductApprove) {
         return Ok(());
     }
     let Some(digest) = request.expect_spec_digest.as_deref() else {
-        return Ok(());
+        // An apply may go without one (the engine decides). A product approval
+        // may not: it must say which spec it covers.
+        return if kind == JobKind::ProductApprove {
+            Err(ApiError::bad_request(
+                "a product_approve job needs `expect_spec_digest`: the digest of the spec you confirmed",
+            ))
+        } else {
+            Ok(())
+        };
     };
     if digest.is_empty()
         || digest.starts_with('-')
@@ -3736,6 +4172,58 @@ fn job_subprocess_args(
             if let Some(models) = &dirs.models {
                 args.push("--models".into());
                 args.push(models.into());
+            }
+        }
+        JobKind::Promote => {
+            // `rocky plan promote <branch>`: the verb and the branch follow
+            // `plan`. Each value is its own entry, so it can never read as a
+            // flag. The child's `--models` default is relative to the project
+            // root it runs in, so the server's own `--models` is passed when
+            // one was given.
+            args.push("promote".into());
+            if let Some(name) = &request.name {
+                args.push(name.into());
+            }
+            if let Some(base) = &request.base {
+                args.push("--base".into());
+                args.push(base.into());
+            }
+            if let Some(pipeline) = &request.pipeline {
+                args.push("--pipeline".into());
+                args.push(pipeline.into());
+            }
+            if let Some(models) = &dirs.models {
+                args.push("--models".into());
+                args.push(models.into());
+            }
+        }
+        JobKind::ProductApprove => {
+            // `rocky product approve <name>`: the verb and the product follow
+            // `product`. The name is its own entry, so it can never read as a
+            // flag. The child reads `products/` under its working directory,
+            // the project root.
+            args.push("approve".into());
+            if let Some(name) = &request.name {
+                args.push(name.into());
+            }
+            // The approval covers exactly the spec the person confirmed; the
+            // command refuses, writing nothing, if the spec on disk differs.
+            if let Some(digest) = &request.expect_spec_digest {
+                args.push("--expect-digest".into());
+                args.push(digest.into());
+            }
+        }
+        JobKind::Compact => {
+            // `rocky compact <table>` or `rocky compact --catalog <name>`. The
+            // plan flags are left out on purpose: the command's `--dry-run`
+            // still writes an applicable plan, and the page offers no size
+            // option. Each value is its own entry, so it can never read as a
+            // flag.
+            if let Some(table) = &request.table {
+                args.push(table.into());
+            } else if let Some(catalog) = &request.catalog {
+                args.push("--catalog".into());
+                args.push(catalog.into());
             }
         }
         JobKind::Test | JobKind::Ci => {
@@ -4376,6 +4864,12 @@ fn job_subprocess_command(
     // --approve` stamps `ApproverSource::HttpApi` and refuses to fall back
     // to an `unknown` approver. It labels the channel, not the person.
     cmd.env(HTTP_API_SESSION_SOURCE_ENV, HTTP_API_SESSION_SOURCE);
+    // The bypass for the branch approval gate is an env var, and a child
+    // inherits the server's. A promote plan built from the HTTP API never
+    // takes it, whatever the server was started with.
+    if kind == JobKind::Promote {
+        cmd.env_remove(crate::commands::APPROVAL_SKIP_ENV);
+    }
     // The child runs in the project root: the directory of the bound
     // `rocky.toml`, the same root the review and product GET routes read
     // (`project_root_for`). `plan`, `review --approve` and `apply` keep their
@@ -10129,6 +10623,9 @@ mod tests {
             JobKind::Freeze,
             JobKind::Unfreeze,
             JobKind::Preview,
+            JobKind::Promote,
+            JobKind::ProductApprove,
+            JobKind::Compact,
         ] {
             assert_eq!(JobKind::parse(kind.verb()), Some(kind));
         }
@@ -13360,6 +13857,915 @@ adapter = "db"
                 GroupSignal::Kill
             ]
         );
+    }
+
+    // ----- Browser branch promote and the apply gate -----
+
+    /// A project dir with a `rocky.toml` whose `[branch.approval]` block is
+    /// `approval` (an empty string leaves the block out), a state path and a
+    /// models dir. The adapter is DuckDB, so no credentials are involved.
+    fn promote_gate_project(dir: &std::path::Path, approval: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = dir.join("promote_project");
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\n\n\
+                 [pipeline.main]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.main.target.governance]\nauto_create_schemas = true\n\n{approval}"
+            ),
+        )
+        .unwrap();
+        let state_path = root.join("models/.rocky-state.redb");
+        (root, config, state_path)
+    }
+
+    const APPROVAL_REQUIRED: &str = "[branch.approval]\nrequired = true\n";
+
+    fn promote_plan_payload(approvals: usize, skipped: bool) -> crate::output::PromotePlan {
+        use crate::output::{
+            ApprovalArtifact, ApprovalSignature, ApproverIdentity, ApproverSource, AuditEvent,
+            AuditEventKind, PromoteTargetPlan, SignatureAlgorithm,
+        };
+        let who = ApproverIdentity {
+            email: "dev@example.com".to_string(),
+            name: None,
+            host: "host".to_string(),
+            source: ApproverSource::Local,
+        };
+        let approval = |n: usize| ApprovalArtifact {
+            approval_id: format!("a{n}"),
+            branch: "fix".to_string(),
+            branch_state_hash: "hash".to_string(),
+            approver: who.clone(),
+            signed_at: chrono::Utc::now(),
+            message: None,
+            signature: ApprovalSignature {
+                algorithm: SignatureAlgorithm::Blake3CanonicalJson,
+                digest: "00".repeat(32),
+            },
+        };
+        crate::output::PromotePlan {
+            branch_name: "fix".to_string(),
+            pipeline: None,
+            base_ref: "main".to_string(),
+            head_ref: "deadbeef".to_string(),
+            branch_state_hash: "hash".to_string(),
+            approvals_used: (0..approvals).map(approval).collect(),
+            approvals_rejected: Vec::new(),
+            breaking_changes: None,
+            allow_breaking: false,
+            targets: vec![PromoteTargetPlan {
+                target: "warehouse.main.orders".to_string(),
+                source: "warehouse.branch__fix.orders".to_string(),
+                target_catalog: "warehouse".to_string(),
+                target_schema: "main".to_string(),
+                target_table: "orders".to_string(),
+                source_catalog: "warehouse".to_string(),
+                source_schema: "branch__fix".to_string(),
+                source_table: "orders".to_string(),
+                strategy: "full_refresh".to_string(),
+                statement: "CREATE OR REPLACE TABLE \"warehouse\".\"main\".\"orders\" AS SELECT 1"
+                    .to_string(),
+                pre_drop_statement: None,
+                production_upstreams: Vec::new(),
+            }],
+            plan_audit: if skipped {
+                vec![AuditEvent {
+                    kind: AuditEventKind::ApprovalSkipped,
+                    at: chrono::Utc::now(),
+                    actor: who,
+                    branch: "fix".to_string(),
+                    branch_state_hash: "hash".to_string(),
+                    reason: Some("ROCKY_BRANCH_APPROVAL_SKIP=1".to_string()),
+                    breaking_changes: None,
+                }]
+            } else {
+                Vec::new()
+            },
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn read_persisted(root: &std::path::Path, plan_id: &str) -> crate::plan_store::PersistedPlan {
+        crate::plan_store::read_plan(root, plan_id).expect("plan reads back")
+    }
+
+    /// `promote` spawns `rocky plan promote <branch>`: the branch is a
+    /// positional entry, each validated flag is its own pair, an absent field
+    /// adds nothing, the server's explicit `--models` rides along, and the same
+    /// request under another kind carries none of it.
+    #[test]
+    fn promote_job_argv() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let full = JobRequest {
+            name: Some("fix_price".to_string()),
+            base: Some("origin/main".to_string()),
+            pipeline: Some("main".to_string()),
+            reason: Some("ignored".to_string()),
+            ..JobRequest::default()
+        };
+        let explicit = JobProjectDirs {
+            models: Some(PathBuf::from("/p/src/models")),
+            contracts: None,
+        };
+        let derived = JobProjectDirs {
+            models: None,
+            contracts: None,
+        };
+        let argv = |kind, dirs: &JobProjectDirs, request: &JobRequest| -> Vec<String> {
+            job_subprocess_args(
+                kind,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                dirs,
+                state,
+                request,
+            )
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        let head = [
+            "--output",
+            "json",
+            "--config",
+            "/p/rocky.toml",
+            "--state-path",
+            "/tmp/state.redb",
+            "plan",
+            "promote",
+        ];
+        let mut expected = head.to_vec();
+        expected.extend([
+            "fix_price",
+            "--base",
+            "origin/main",
+            "--pipeline",
+            "main",
+            "--models",
+            "/p/src/models",
+        ]);
+        assert_eq!(argv(JobKind::Promote, &explicit, &full), expected);
+        let mut bare = head.to_vec();
+        bare.push("fix_price");
+        let only_name = JobRequest {
+            name: Some("fix_price".to_string()),
+            ..JobRequest::default()
+        };
+        assert_eq!(argv(JobKind::Promote, &derived, &only_name), bare);
+        for kind in [
+            JobKind::Preview,
+            JobKind::Freeze,
+            JobKind::Test,
+            JobKind::Ci,
+        ] {
+            let args = argv(kind, &explicit, &full);
+            assert!(
+                !args.iter().any(|a| a == "promote"),
+                "{kind:?} must not carry the promote verb: {args:?}"
+            );
+        }
+        assert!(
+            !JobKind::Promote.mutates(),
+            "writing a plan takes no permit"
+        );
+        assert_eq!(JobKind::Promote.verb(), "promote");
+        assert_eq!(JobKind::Promote.subcommand(), "plan");
+        assert_eq!(JobKind::parse("promote"), Some(JobKind::Promote));
+    }
+
+    /// A promote child never inherits the approval-gate bypass from the
+    /// server's environment, whatever it was started with; other kinds are left
+    /// as they were.
+    #[test]
+    fn promote_child_strips_the_approval_skip_env() {
+        let envs = |kind: JobKind| -> Vec<(String, Option<String>)> {
+            let cmd = job_subprocess_command(
+                PathBuf::from("/bin/true"),
+                kind,
+                None,
+                &JobProjectDirs::default(),
+                std::path::Path::new("/tmp/state.redb"),
+                &JobRequest::default(),
+            );
+            cmd.as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        };
+        assert!(
+            envs(JobKind::Promote)
+                .contains(&(crate::commands::APPROVAL_SKIP_ENV.to_string(), None)),
+            "promote must remove {}",
+            crate::commands::APPROVAL_SKIP_ENV
+        );
+        assert!(
+            envs(JobKind::Plan)
+                .iter()
+                .all(|(k, _)| k != crate::commands::APPROVAL_SKIP_ENV),
+            "other kinds leave the variable alone"
+        );
+    }
+
+    /// The promote fields are checked before the gate and the argv: a missing
+    /// or bad branch name, pipeline or base is a `400` that never spawns a
+    /// child. Other kinds ignore the fields.
+    #[tokio::test]
+    async fn promote_route_validates_its_fields() {
+        let base = spawn_router(test_state()).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/jobs/promote");
+        let bad = [
+            serde_json::json!({}),
+            serde_json::json!({ "name": "" }),
+            serde_json::json!({ "name": "-x" }),
+            serde_json::json!({ "name": "a b" }),
+            serde_json::json!({ "name": "x\n" }),
+            serde_json::json!({ "name": "a/b" }),
+            serde_json::json!({ "name": "n".repeat(65) }),
+            serde_json::json!({ "name": "fix", "pipeline": "-p" }),
+            serde_json::json!({ "name": "fix", "pipeline": "a b" }),
+            serde_json::json!({ "name": "fix", "base": "" }),
+            serde_json::json!({ "name": "fix", "base": "--upload-pack=touch" }),
+            serde_json::json!({ "name": "fix", "base": "main branch" }),
+            serde_json::json!({ "name": "fix", "base": "b".repeat(201) }),
+        ];
+        for body in &bad {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 400, "{body}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "bad_request", "{body}");
+        }
+        // A legacy branch name with `-` and `.` passes the shape check and
+        // reaches the config gate (no config here, so that is what answers).
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({ "name": "pr-1.fix_x", "base": "origin/main" }))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), 400, "a legacy name is not a shape error");
+    }
+
+    /// The server refuses the promote job unless the loaded config says
+    /// `[branch.approval] required = true`. Checked server-side: the request
+    /// is valid and the UI is not involved.
+    #[tokio::test]
+    async fn promote_job_is_refused_unless_branch_approval_is_required() {
+        let dir = tempfile::tempdir().unwrap();
+        for (approval, why) in [
+            ("", "no [branch.approval] block"),
+            ("[branch.approval]\nrequired = false\n", "required = false"),
+        ] {
+            let (root, config, state_path) = promote_gate_project(&dir.path().join(why), approval);
+            let base = spawn_router(pinned_server(
+                root.join("models"),
+                Some(config),
+                &state_path,
+            ))
+            .await;
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/api/v1/jobs/promote"))
+                .json(&serde_json::json!({ "name": "fix" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 409, "{why}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "branch_approval_not_required", "{why}");
+            assert!(
+                envelope
+                    .remediation_hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("[branch.approval]")),
+                "{why}: {envelope:?}"
+            );
+        }
+
+        // With the block on, the same request clears the gate. Driven through
+        // the gate itself, so no child is spawned.
+        let (root, config, state_path) =
+            promote_gate_project(&dir.path().join("on"), APPROVAL_REQUIRED);
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        gate_job_against_project(
+            JobKind::Promote,
+            &state,
+            &JobRequest {
+                name: Some("fix".to_string()),
+                ..JobRequest::default()
+            },
+        )
+        .await
+        .map_err(|e| e.envelope.code)
+        .expect("required = true clears the promote gate");
+
+        // The config is read per request: turning the block off again closes it.
+        let config_path = state.config_path.clone().unwrap();
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            text.replace("required = true", "required = false"),
+        )
+        .unwrap();
+        let refused = gate_job_against_project(
+            JobKind::Promote,
+            &state,
+            &JobRequest {
+                name: Some("fix".to_string()),
+                ..JobRequest::default()
+            },
+        )
+        .await
+        .expect_err("required = false closes it");
+        assert_eq!(refused.envelope.code, "branch_approval_not_required");
+    }
+
+    /// An unreadable config closes the gate with a `500`; it does not read as
+    /// "approval not required" and it does not open it.
+    #[tokio::test]
+    async fn promote_gate_fails_closed_on_an_unreadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), APPROVAL_REQUIRED);
+        std::fs::write(&config, "this is [not toml").unwrap();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let refused = gate_job_against_project(
+            JobKind::Promote,
+            &state,
+            &JobRequest {
+                name: Some("fix".to_string()),
+                ..JobRequest::default()
+            },
+        )
+        .await
+        .expect_err("an unreadable config refuses");
+        assert_eq!(refused.envelope.code, "project_read_failed");
+    }
+
+    /// Every arm of the apply gate. Archive is never applied over the API;
+    /// a promote plan needs the config flag AND approvals recorded in the plan
+    /// (the gate runs when the plan is built, not at apply); every other kind
+    /// passes.
+    #[test]
+    fn judge_apply_names_every_plan_kind() {
+        use crate::plan_store::{PlanKind, write_plan};
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, _) = promote_gate_project(dir.path(), APPROVAL_REQUIRED);
+        let load = |toml_block: &'static str| {
+            let config = config.clone();
+            move || -> anyhow::Result<rocky_core::config::RockyConfig> {
+                let text = std::fs::read_to_string(&config)?;
+                let text = text.replace(APPROVAL_REQUIRED, toml_block);
+                let path = config.with_file_name("variant.toml");
+                std::fs::write(&path, text)?;
+                Ok(rocky_core::config::load_rocky_config(&path)?)
+            }
+        };
+        let judge = |plan: &crate::plan_store::PersistedPlan, block: &'static str| {
+            let load = load(block);
+            judge_apply(Some(plan), &load).expect("judged")
+        };
+        let write = |kind: PlanKind, payload: serde_json::Value| {
+            read_persisted(&root, &write_plan(&root, kind, &payload).unwrap())
+        };
+
+        // A plan that cannot be read is the child's to refuse.
+        assert_eq!(
+            judge_apply(None, &|| unreachable!("no plan, no config read")).unwrap(),
+            ApplyGateVerdict::Allowed
+        );
+
+        let archive = write(
+            PlanKind::Archive,
+            serde_json::json!({ "tables": ["a.b.c"] }),
+        );
+        assert_eq!(
+            judge(&archive, APPROVAL_REQUIRED),
+            ApplyGateVerdict::ArchivePlan
+        );
+        for kind in [
+            PlanKind::Compact,
+            PlanKind::Run,
+            PlanKind::Replication,
+            PlanKind::AiAuthored,
+            PlanKind::Backfill,
+            PlanKind::Gc,
+            PlanKind::Restore,
+        ] {
+            let plan = write(
+                kind.clone(),
+                serde_json::json!({ "tag": format!("{kind:?}") }),
+            );
+            assert_eq!(
+                judge(&plan, ""),
+                ApplyGateVerdict::Allowed,
+                "{kind:?} is not decided by the branch gate"
+            );
+        }
+
+        let promote = |approvals, skipped| {
+            write(
+                PlanKind::Promote,
+                serde_json::to_value(promote_plan_payload(approvals, skipped)).unwrap(),
+            )
+        };
+        let approved = promote(1, false);
+        assert_eq!(
+            judge(&approved, APPROVAL_REQUIRED),
+            ApplyGateVerdict::Allowed
+        );
+        assert_eq!(
+            judge(&approved, ""),
+            ApplyGateVerdict::PromoteWithoutApprovalRequired,
+            "no required = true: refused even with approvals in the plan"
+        );
+        assert_eq!(
+            judge(&approved, "[branch.approval]\nrequired = false\n"),
+            ApplyGateVerdict::PromoteWithoutApprovalRequired
+        );
+        assert!(matches!(
+            judge(&promote(0, false), APPROVAL_REQUIRED),
+            ApplyGateVerdict::PromotePlanNotApproved(reason) if reason.contains("0 valid approval")
+        ));
+        assert!(matches!(
+            judge(&promote(1, true), APPROVAL_REQUIRED),
+            ApplyGateVerdict::PromotePlanNotApproved(reason) if reason.contains("skipped")
+        ));
+        assert!(matches!(
+            judge(&approved, "[branch.approval]\nrequired = true\nmin_approvers = 2\n"),
+            ApplyGateVerdict::PromotePlanNotApproved(reason) if reason.contains("needs 2")
+        ));
+        let malformed = write(PlanKind::Promote, serde_json::json!({ "branch_name": "x" }));
+        assert!(matches!(
+            judge(&malformed, APPROVAL_REQUIRED),
+            ApplyGateVerdict::PromotePlanNotApproved(_)
+        ));
+    }
+
+    /// End to end over HTTP: an archive plan and an unapproved promote plan are
+    /// refused before the permit (held here, so a gate that let them through
+    /// would answer `mutation_in_progress` instead), and a compact plan is not
+    /// decided by the gate.
+    #[tokio::test]
+    async fn apply_route_refuses_archive_and_unapproved_promote_plans() {
+        use crate::plan_store::{PlanKind, write_plan};
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), APPROVAL_REQUIRED);
+        let archive = write_plan(&root, PlanKind::Archive, &serde_json::json!({ "t": 1 })).unwrap();
+        let compact = write_plan(&root, PlanKind::Compact, &serde_json::json!({ "t": 2 })).unwrap();
+        let unapproved = write_plan(
+            &root,
+            PlanKind::Promote,
+            &serde_json::to_value(promote_plan_payload(0, false)).unwrap(),
+        )
+        .unwrap();
+        let approved = write_plan(
+            &root,
+            PlanKind::Promote,
+            &serde_json::to_value(promote_plan_payload(1, false)).unwrap(),
+        )
+        .unwrap();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let apply = |plan_id: String| {
+            let client = client.clone();
+            let url = format!("{base}/api/v1/jobs/apply");
+            async move {
+                let resp = client
+                    .post(url)
+                    .json(&serde_json::json!({ "plan_id": plan_id }))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = resp.status().as_u16();
+                let envelope: ErrorEnvelope = resp.json().await.unwrap();
+                (status, envelope.code)
+            }
+        };
+        assert_eq!(
+            apply(archive).await,
+            (409, "archive_apply_terminal_only".to_string())
+        );
+        assert_eq!(
+            apply(unapproved).await,
+            (409, "promote_plan_not_approved".to_string())
+        );
+        // Past the gate, both reach the held permit.
+        assert_eq!(
+            apply(compact).await,
+            (409, "mutation_in_progress".to_string())
+        );
+        assert_eq!(
+            apply(approved).await,
+            (409, "mutation_in_progress".to_string())
+        );
+        drop(held);
+    }
+
+    /// `promote` creates a plan only, but it sits behind the same write gate as
+    /// every job route.
+    #[tokio::test]
+    async fn promote_route_is_behind_the_write_gate() {
+        assert_routes_behind_the_write_gate(&["promote"]).await;
+    }
+
+    /// `GET /api/v1/branches` answers with `rocky branch list --output json`'s
+    /// bytes.
+    #[tokio::test]
+    async fn branches_route_matches_the_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), APPROVAL_REQUIRED);
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            for name in ["fix_price", "pr-old.1"] {
+                store
+                    .put_branch(&rocky_core::state::BranchRecord {
+                        name: name.to_string(),
+                        schema_prefix: format!("branch__{name}"),
+                        created_by: "dev".to_string(),
+                        created_at: chrono::Utc::now(),
+                        description: Some("a branch".to_string()),
+                    })
+                    .unwrap();
+            }
+        }
+        let base = spawn_router(pinned_server(
+            root.join("models"),
+            Some(config),
+            &state_path,
+        ))
+        .await;
+        let resp = reqwest::get(format!("{base}/api/v1/branches"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        let expected = crate::commands::compute_branch_list(&state_path).unwrap();
+        assert_eq!(text, reference_bytes(&expected));
+        let served: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(served["total"], 2, "{text}");
+    }
+
+    /// `GET /api/v1/project` reports whether the config requires a branch
+    /// approval, read per request. An unreadable config leaves it out: unknown
+    /// is not `false`.
+    #[tokio::test]
+    async fn project_reports_whether_branch_approval_is_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |config: PathBuf, root: PathBuf, state_path: PathBuf| async move {
+            let base = spawn_router(pinned_server(
+                root.join("models"),
+                Some(config),
+                &state_path,
+            ))
+            .await;
+            let project: serde_json::Value = reqwest::get(format!("{base}/api/v1/project"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            project
+        };
+        let (root, config, state_path) =
+            promote_gate_project(&dir.path().join("on"), APPROVAL_REQUIRED);
+        let project = read(config.clone(), root.clone(), state_path.clone()).await;
+        assert_eq!(project["branch_approval_required"], true, "{project}");
+
+        let (root_off, config_off, state_off) = promote_gate_project(&dir.path().join("off"), "");
+        let project = read(config_off, root_off, state_off).await;
+        assert_eq!(project["branch_approval_required"], false, "{project}");
+
+        std::fs::write(&config, "this is [not toml").unwrap();
+        let project = read(config, root, state_path).await;
+        assert!(
+            project.get("branch_approval_required").is_none(),
+            "an unreadable config says nothing: {project}"
+        );
+    }
+
+    // ----- Browser product approve -----
+
+    /// `product_approve` spawns `rocky product approve <name>`: the product is
+    /// a positional entry, nothing else rides along, and no other kind carries
+    /// the verb. It takes the permit (it writes the state store) and its wire
+    /// name is `product_approve`.
+    #[test]
+    fn product_approve_job_argv_and_kind() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let request = JobRequest {
+            name: Some("revenue_daily".to_string()),
+            base: Some("ignored".to_string()),
+            expect_spec_digest: Some("sha256:abc".to_string()),
+            ..JobRequest::default()
+        };
+        let dirs = JobProjectDirs {
+            models: Some(PathBuf::from("/p/models")),
+            contracts: Some(PathBuf::from("/p/contracts")),
+        };
+        let argv = |kind| -> Vec<String> {
+            job_subprocess_args(
+                kind,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                &dirs,
+                state,
+                &request,
+            )
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        assert_eq!(
+            argv(JobKind::ProductApprove),
+            [
+                "--output",
+                "json",
+                "--config",
+                "/p/rocky.toml",
+                "--state-path",
+                "/tmp/state.redb",
+                "product",
+                "approve",
+                "revenue_daily",
+                "--expect-digest",
+                "sha256:abc",
+            ]
+        );
+        for kind in [
+            JobKind::Preview,
+            JobKind::Promote,
+            JobKind::Freeze,
+            JobKind::Test,
+        ] {
+            assert!(
+                !argv(kind).iter().any(|a| a == "product" || a == "approve"),
+                "{kind:?} must not carry the product approve verb"
+            );
+        }
+        assert!(JobKind::ProductApprove.mutates());
+        assert_eq!(JobKind::ProductApprove.verb(), "product_approve");
+        assert_eq!(JobKind::ProductApprove.subcommand(), "product");
+        assert_eq!(
+            JobKind::parse("product_approve"),
+            Some(JobKind::ProductApprove)
+        );
+        assert_eq!(
+            serde_json::to_string(&JobKind::ProductApprove).unwrap(),
+            "\"product_approve\"",
+            "the wire name is the verb, which the UI posts to"
+        );
+    }
+
+    /// The product name is checked before the permit and the argv: a missing
+    /// or non-bare name is a `400` that never spawns a child, and a good name
+    /// takes the permit like a run (`409` while one is held).
+    #[tokio::test]
+    async fn product_approve_route_validates_its_name_and_takes_the_permit() {
+        let state = test_state();
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/jobs/product_approve");
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let named = |name: &str| serde_json::json!({ "name": name, "expect_spec_digest": digest });
+        let bad = [
+            serde_json::json!({}),
+            serde_json::json!({ "expect_spec_digest": digest }),
+            named(""),
+            named("-x"),
+            named("1abc"),
+            named("a-b"),
+            named("a b"),
+            named("../x"),
+            named("a/b"),
+            named("x\n"),
+            named("é"),
+            // The digest is required, and held to the apply digest's shape.
+            serde_json::json!({ "name": "revenue_daily" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "--force" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "a b" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "a\nb" }),
+            serde_json::json!({ "name": "revenue_daily", "expect_spec_digest": "d".repeat(201) }),
+        ];
+        for body in &bad {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 400, "{body}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "bad_request", "{body}");
+        }
+        for name in ["revenue_daily", "_x", "A1"] {
+            let resp = client.post(&url).json(&named(name)).send().await.unwrap();
+            assert_eq!(resp.status(), 409, "{name}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "mutation_in_progress", "{name}");
+            assert_eq!(envelope.running_job_id.as_deref(), Some("job_incumbent"));
+        }
+        // Another kind ignores the field: a bad `name` on `freeze` is not a 400.
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/freeze"))
+            .json(&serde_json::json!({ "name": "a-b" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "freeze ignores name");
+        drop(held);
+    }
+
+    /// Approving a spec writes the state store, so it sits behind the write
+    /// gate like every job route.
+    #[tokio::test]
+    async fn product_approve_route_is_behind_the_write_gate() {
+        assert_routes_behind_the_write_gate(&["product_approve"]).await;
+    }
+
+    // ----- Browser compact -----
+
+    /// `compact` spawns `rocky compact <table>` or `rocky compact --catalog
+    /// <name>` and nothing more: no `--dry-run`, no `--target-size`, because the
+    /// command's dry run still writes an applicable plan and the page offers no
+    /// size. It takes no permit (the command reads the config and writes a plan
+    /// file) and no other kind carries the verb.
+    #[test]
+    fn compact_job_argv_and_kind() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let dirs = JobProjectDirs {
+            models: Some(PathBuf::from("/p/models")),
+            contracts: Some(PathBuf::from("/p/contracts")),
+        };
+        let argv = |kind, request: &JobRequest| -> Vec<String> {
+            job_subprocess_args(
+                kind,
+                Some(std::path::Path::new("/p/rocky.toml")),
+                &dirs,
+                state,
+                request,
+            )
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+        };
+        let head = [
+            "--output",
+            "json",
+            "--config",
+            "/p/rocky.toml",
+            "--state-path",
+            "/tmp/state.redb",
+            "compact",
+        ];
+        let table = JobRequest {
+            table: Some("cat.sch.orders".to_string()),
+            catalog: Some("ignored".to_string()),
+            ..JobRequest::default()
+        };
+        let mut expected = head.to_vec();
+        expected.push("cat.sch.orders");
+        assert_eq!(argv(JobKind::Compact, &table), expected);
+        let catalog = JobRequest {
+            catalog: Some("cat".to_string()),
+            ..JobRequest::default()
+        };
+        let mut expected = head.to_vec();
+        expected.extend(["--catalog", "cat"]);
+        assert_eq!(argv(JobKind::Compact, &catalog), expected);
+        for kind in [
+            JobKind::Plan,
+            JobKind::Preview,
+            JobKind::Promote,
+            JobKind::Apply,
+        ] {
+            let args = argv(kind, &table);
+            assert!(
+                !args.iter().any(|a| a == "compact" || a == "cat.sch.orders"),
+                "{kind:?} must not carry the compact target: {args:?}"
+            );
+        }
+        assert!(!JobKind::Compact.mutates());
+        assert_eq!(JobKind::Compact.verb(), "compact");
+        assert_eq!(JobKind::Compact.subcommand(), "compact");
+        assert_eq!(JobKind::parse("compact"), Some(JobKind::Compact));
+    }
+
+    /// The compact target is checked before the argv: none, both, a short or
+    /// long dotted name, a part that is not an identifier, and a catalog that is
+    /// not a bare name are each a `400` that spawns nothing. Other kinds ignore
+    /// the fields.
+    #[tokio::test]
+    async fn compact_route_validates_its_target() {
+        let base = spawn_router(test_state()).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/v1/jobs/compact");
+        let bad = [
+            serde_json::json!({}),
+            serde_json::json!({ "table": "a.b.c", "catalog": "a" }),
+            serde_json::json!({ "table": "" }),
+            serde_json::json!({ "table": "orders" }),
+            serde_json::json!({ "table": "b.orders" }),
+            serde_json::json!({ "table": "a.b.c.d" }),
+            serde_json::json!({ "table": "a..c" }),
+            serde_json::json!({ "table": ".b.c" }),
+            serde_json::json!({ "table": "-a.b.c" }),
+            serde_json::json!({ "table": "a.b.c --dry-run" }),
+            serde_json::json!({ "table": "a.b.c\n" }),
+            serde_json::json!({ "table": "a.b-x.c" }),
+            serde_json::json!({ "table": "a.`b`.c" }),
+            serde_json::json!({ "table": "é.b.c" }),
+            serde_json::json!({ "table": format!("a.b.{}", "x".repeat(300)) }),
+            serde_json::json!({ "catalog": "" }),
+            serde_json::json!({ "catalog": "-c" }),
+            serde_json::json!({ "catalog": "a.b" }),
+            serde_json::json!({ "catalog": "a b" }),
+            serde_json::json!({ "catalog": "x".repeat(301) }),
+        ];
+        for body in &bad {
+            let resp = client.post(&url).json(body).send().await.unwrap();
+            assert_eq!(resp.status(), 400, "{body}");
+            let envelope: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(envelope.code, "bad_request", "{body}");
+        }
+        // Another kind ignores the fields: a bad `table` on `freeze` is not a 400
+        // (no permit is held here, so it would start; hold one to stop it).
+        let state = test_state();
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let other = spawn_router(state).await;
+        let resp = client
+            .post(format!("{other}/api/v1/jobs/freeze"))
+            .json(&serde_json::json!({ "table": "nope", "catalog": "-x" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "freeze ignores table and catalog");
+        drop(held);
+    }
+
+    /// A compact plan applies through the generic apply, by its id: the gate
+    /// does not stop it (only an archive plan and an unapproved promote plan
+    /// are stopped), so it reaches the held permit.
+    #[tokio::test]
+    async fn a_compact_plan_applies_through_the_generic_apply_gate() {
+        use crate::plan_store::{PlanKind, write_plan};
+        let dir = tempfile::tempdir().unwrap();
+        let (root, config, state_path) = promote_gate_project(dir.path(), "");
+        let compact = write_plan(
+            &root,
+            PlanKind::Compact,
+            &serde_json::json!({ "plans": [{ "target_table": "a.b.c" }] }),
+        )
+        .unwrap();
+        let archive = write_plan(
+            &root,
+            PlanKind::Archive,
+            &serde_json::json!({ "plans": [{ "target_table": "a.b.c" }] }),
+        )
+        .unwrap();
+        let state = pinned_server(root.join("models"), Some(config), &state_path);
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let code = |plan_id: String| {
+            let client = client.clone();
+            let url = format!("{base}/api/v1/jobs/apply");
+            async move {
+                let resp = client
+                    .post(url)
+                    .json(&serde_json::json!({ "plan_id": plan_id }))
+                    .send()
+                    .await
+                    .unwrap();
+                let envelope: ErrorEnvelope = resp.json().await.unwrap();
+                envelope.code
+            }
+        };
+        assert_eq!(code(compact).await, "mutation_in_progress");
+        assert_eq!(code(archive).await, "archive_apply_terminal_only");
+        drop(held);
+    }
+
+    /// Compact plans are planned from the browser but their job sits behind the
+    /// same write gate as every job route.
+    #[tokio::test]
+    async fn compact_route_is_behind_the_write_gate() {
+        assert_routes_behind_the_write_gate(&["compact"]).await;
     }
 }
 
