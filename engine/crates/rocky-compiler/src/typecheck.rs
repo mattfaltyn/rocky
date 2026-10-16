@@ -553,7 +553,7 @@ fn compute_model_typecheck(
                 rocky_sql::lineage::TransformKind::TryCast => (RockyType::Unknown, true),
                 rocky_sql::lineage::TransformKind::Aggregation(func) => {
                     let func_upper = func.to_uppercase();
-                    infer_aggregation_type(&func_upper, &upstream_type.0)
+                    infer_aggregation_type(&func_upper, &upstream_type.0, target)
                 }
                 rocky_sql::lineage::TransformKind::Expression => (RockyType::Unknown, true),
             }
@@ -2699,19 +2699,54 @@ fn collect_refs_from_expr(expr: &Expr, file_path: &str, ref_map: &mut ReferenceM
     }
 }
 
-/// Infer the result type of an aggregate function.
-fn infer_aggregation_type(func: &str, input_type: &RockyType) -> (RockyType, bool) {
+/// Whether `SUM` over `DECIMAL(p,s)` is a decimal of scale `s` on every
+/// warehouse the model runs on (#2398).
+///
+/// DuckDB, Snowflake, Databricks, Trino, SQL Server and Redshift return
+/// `DECIMAL(_, s)`. BigQuery does not: it drops the digits of a parameterized
+/// `NUMERIC(p,s)` column in an expression, so the sum is a plain `NUMERIC`
+/// (scale 9). PostgreSQL returns an unconstrained `numeric`, which states no
+/// scale; it counts as not keeping one until a live run settles it. With no
+/// known warehouse the model may run on either, so the scale is not claimed:
+/// a claimed scale turns a contract mismatch into `E011`, and a false `E011`
+/// on a correct contract is worse than `I003`.
+fn sum_keeps_decimal_scale(target: &OperandTarget) -> bool {
+    let dialects = target.known_dialects();
+    !dialects.is_empty()
+        && dialects.iter().all(|dialect| match dialect {
+            OperandDialect::BigQuery | OperandDialect::Postgres => false,
+            OperandDialect::DuckDb
+            | OperandDialect::Snowflake
+            | OperandDialect::Databricks
+            | OperandDialect::Trino
+            | OperandDialect::SqlServer
+            | OperandDialect::Redshift => true,
+        })
+}
+
+/// Infer the result type of an aggregate function on the warehouses of
+/// `target`.
+fn infer_aggregation_type(
+    func: &str,
+    input_type: &RockyType,
+    target: &OperandTarget,
+) -> (RockyType, bool) {
     match func {
         "COUNT" => (RockyType::Int64, false), // COUNT is never null
         "SUM" => {
             // Nullable: an empty group sums to NULL. A DECIMAL sum is wider
             // than its input by a warehouse-dependent amount (DuckDB
             // `DECIMAL(38, s)`, Databricks `DECIMAL(p + 10, s)`), so it is a
-            // decimal whose digits Rocky does not claim (#2356).
+            // decimal whose precision Rocky does not claim (#2356). The scale
+            // `s` is kept only where every target warehouse keeps it (#2398).
             let ty = if input_type.is_integer() {
                 RockyType::Int64
             } else if input_type.is_decimal() {
-                RockyType::DecimalUnsized
+                RockyType::DecimalUnsized {
+                    scale: input_type
+                        .decimal_scale()
+                        .filter(|_| sum_keeps_decimal_scale(target)),
+                }
             } else {
                 input_type.clone()
             };
@@ -2824,7 +2859,7 @@ fn nullability_is_proven(
 /// the target is stated in the SQL. Its nullability is not guessed non-null —
 /// an unknown input keeps the column nullable, since a non-null guess would
 /// pass a NULL under a `nullable = false` contract. A bare `DECIMAL` target
-/// names no digits and stays `Unknown` (#1721).
+/// names no digits, so it is a decimal that claims none (#1721, #2398).
 fn enhanced_inference(
     model_name: &str,
     graph: &SemanticGraph,
@@ -3236,11 +3271,11 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         "COUNT" => (RockyType::Int64, false),
         "SUM" => {
             let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("SUM", &arg_type)
+            infer_aggregation_type("SUM", &arg_type, &scope.target)
         }
         "AVG" => {
             let arg_type = first_arg_type(func, scope);
-            infer_aggregation_type("AVG", &arg_type)
+            infer_aggregation_type("AVG", &arg_type, &scope.target)
         }
         "MIN" | "MAX" => {
             let arg_type = first_arg_type(func, scope);
@@ -3441,6 +3476,10 @@ fn cast_can_fail(
             let target_int_digits = i16::from(*tp) - i16::from(*ts);
             !source_exact || target_int_digits < source_int_digits || ts < ss
         }
+        // A bare `DECIMAL` target has a precision that differs by warehouse
+        // (DuckDB 18, Databricks 10), so any number may overflow it, even
+        // another value of unknown precision (#2398).
+        (_, T::DecimalUnsized { .. }) => true,
         (a, b) if a == b => false,
         // An integer fits a DECIMAL with as many integer digits as the
         // integer's widest value: 10 for a 32-bit one, 19 for a 64-bit one.
@@ -3466,7 +3505,7 @@ fn cast_can_fail(
         (T::Int32, T::Int64 | T::Float32 | T::Float64) => false,
         (T::Int64, T::Float32 | T::Float64) => false,
         (T::Float32, T::Float64) => false,
-        (T::Decimal { .. } | T::DecimalUnsized, T::Float32 | T::Float64) => false,
+        (T::Decimal { .. } | T::DecimalUnsized { .. }, T::Float32 | T::Float64) => false,
         (T::Date, T::Timestamp | T::TimestampNtz) => false,
         (T::Timestamp | T::TimestampNtz, T::Date | T::Timestamp | T::TimestampNtz) => false,
         _ => true,
@@ -3659,17 +3698,23 @@ fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
                     None => RockyType::Unknown,
                 }
             }
-            // A bare `DECIMAL` / `NUMERIC` names no digits, so Rocky does
-            // not know the type — the same answer `warehouse_type_to_rocky`
-            // gives for the bare string since #1646. Guessing (38,0) here
-            // was the third normaliser reading one column differently from
-            // the other two, and it is what made a CAST able to manufacture
-            // a passing contract check (#1721).
+            // A bare `DECIMAL` / `NUMERIC` names no digits: its precision
+            // and scale differ by warehouse (DuckDB `DECIMAL(18,3)`,
+            // Databricks `DECIMAL(10,0)`, Snowflake `NUMBER(38,0)`), so it is
+            // a decimal whose digits Rocky does not claim (#2398). Guessing
+            // (38,0) here is what made a CAST able to manufacture a passing
+            // contract check (#1721); `DecimalUnsized` passes only a bare
+            // `Decimal` contract and leaves `Decimal(p,s)` unchecked.
+            //
+            // This reading is for SQL type names in the model's SELECT.
+            // `warehouse_type_to_rocky` still reads the bare string as
+            // `Unknown` (#1646): it also reads the type a person wrote in a
+            // `.contract.toml`, where a bare `DECIMAL` is a different claim.
             //
             // `Precision(p)` above is NOT a guess: SQL defines DECIMAL(p) as
             // DECIMAL(p, 0), so the scale is stated by the standard rather
             // than invented here.
-            ast::ExactNumberInfo::None => RockyType::Unknown,
+            ast::ExactNumberInfo::None => RockyType::DecimalUnsized { scale: None },
         },
         ast::DataType::Varchar(_)
         | ast::DataType::Char(_)
@@ -3844,17 +3889,20 @@ impl SelectInference {
 /// The list: BOOLEAN; DOUBLE / DOUBLE PRECISION / FLOAT64 (every warehouse
 /// that accepts one of these spellings means a 64-bit float; BigQuery has no
 /// `DOUBLE` and rejects it); DECIMAL / NUMERIC with `1 <= p <= 38` and
-/// `0 <= s <= p`; VARCHAR, CHAR, TEXT, STRING; BINARY, VARBINARY, BLOB; DATE.
+/// `0 <= s <= p`, and a bare DECIMAL / NUMERIC, typed as a decimal of unknown
+/// digits; VARCHAR, CHAR, TEXT, STRING; BINARY, VARBINARY, BLOB; DATE.
 ///
 /// Snowflake's `FLOAT` is 64-bit, its `INTEGER` and `BIGINT` are
 /// `NUMBER(38,0)`, PostgreSQL's `FLOAT` is `DOUBLE PRECISION`, and Snowflake's
 /// bare `TIMESTAMP` follows a session parameter. Those names, and any name
 /// not listed here, are typed only for a known warehouse
-/// ([`dialect_cast_type`]); a bare `DECIMAL` never is.
+/// ([`dialect_cast_type`]).
 fn data_type_is_warehouse_independent(dt: &ast::DataType) -> bool {
     match dt {
+        // A bare `DECIMAL` is a decimal on every warehouse; only its digits
+        // differ, and its type (`DecimalUnsized`) claims none (#2398).
         ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => {
-            decimal_digits(info).is_some()
+            matches!(info, ast::ExactNumberInfo::None) || decimal_digits(info).is_some()
         }
         _ => matches!(
             dt,
@@ -4012,10 +4060,13 @@ fn branches_agree(branches: &[&Expr], result: &RockyType, scope: &TypeScope) -> 
             return false;
         }
         let branch_type = infer_expr_type(branch, scope).0;
-        // A decimal branch agrees with a decimal result whose digits are
+        // A decimal branch agrees with a decimal result whose precision is
         // unknown: `COALESCE(SUM(d), CAST(0 AS DECIMAL(10,2)))` is a decimal,
-        // and `DecimalUnsized` claims no digits for it (#2356).
-        let decimal_into_unsized = *result == RockyType::DecimalUnsized && branch_type.is_decimal();
+        // and `DecimalUnsized` claims no precision for it (#2356). The
+        // result's scale is already one every branch shares, or `None`
+        // (`common_supertype`, #2398).
+        let decimal_into_unsized =
+            matches!(result, RockyType::DecimalUnsized { .. }) && branch_type.is_decimal();
         if branch_type != *result && !decimal_into_unsized {
             return false;
         }
@@ -4815,18 +4866,19 @@ mod tests {
     /// issues about it. Stated as a table so a future edit has to disagree
     /// with the standard explicitly.
     #[test]
-    fn bare_decimal_is_unknown_while_stated_digits_stay_concrete() {
+    fn bare_decimal_is_unsized_while_stated_digits_stay_concrete() {
         use sqlparser::ast::{DataType, ExactNumberInfo};
 
-        // A bare name states no digits, so it is not a type Rocky knows.
+        // A bare name states no digits, so it is a decimal whose digits
+        // Rocky does not claim (#2398), never a made-up `Decimal(p,s)`.
         assert_eq!(
             sql_type_to_rocky(&DataType::Numeric(ExactNumberInfo::None)),
-            RockyType::Unknown,
+            RockyType::DecimalUnsized { scale: None },
             "bare NUMERIC must not become a made-up decimal"
         );
         assert_eq!(
             sql_type_to_rocky(&DataType::Decimal(ExactNumberInfo::None)),
-            RockyType::Unknown,
+            RockyType::DecimalUnsized { scale: None },
             "bare DECIMAL must not become a made-up decimal"
         );
 
@@ -5767,8 +5819,13 @@ mod tests {
                 ("h".to_string(), RockyType::Int64, true),
                 // old: (Int64, true) — y's integer type. SUM widens a
                 // DECIMAL by a dialect-dependent amount: a decimal with no
-                // digits claimed (#2356; Unknown before it).
-                ("i".to_string(), RockyType::DecimalUnsized, true),
+                // precision claimed (#2356; Unknown before it), scale kept
+                // (#2398).
+                (
+                    "i".to_string(),
+                    RockyType::DecimalUnsized { scale: Some(2) },
+                    true,
+                ),
             ];
             assert_eq!(typecheck_over_t(source, &sql), expected, "FROM {source}");
         }
@@ -5777,6 +5834,14 @@ mod tests {
     /// Typecheck `sql` as model `m` over a source `t` with `d DECIMAL(10,2)
     /// NOT NULL`, `x INT NOT NULL` and `n STRING NOT NULL`.
     fn typecheck_over_decimal_t(sql: &str) -> Vec<(String, RockyType, bool)> {
+        typecheck_over_decimal_t_on(sql, duckdb())
+    }
+
+    /// [`typecheck_over_decimal_t`] for a model that runs on `target`.
+    fn typecheck_over_decimal_t_on(
+        sql: &str,
+        target: OperandTarget,
+    ) -> Vec<(String, RockyType, bool)> {
         let sources = HashMap::from([(
             "t".to_string(),
             source_schema(&[
@@ -5799,12 +5864,91 @@ mod tests {
             &sources,
             &project.models,
             None,
-            &TargetDialects::uniform(duckdb()),
+            &TargetDialects::uniform(target),
         );
         result.typed_models["m"]
             .iter()
             .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
             .collect()
+    }
+
+    /// #2398: where the model may run on BigQuery or PostgreSQL, or its
+    /// warehouse is not known, a decimal sum claims no scale, on the lineage
+    /// path (the bare aggregate) and on the expression path (windowed, inside
+    /// `COALESCE`, through a CTE) alike. On DuckDB it keeps scale 2.
+    #[test]
+    fn sum_over_a_decimal_claims_no_scale_without_a_scale_keeping_warehouse() {
+        let sqls = [
+            ("SELECT SUM(d) AS s FROM t", true),
+            ("SELECT SUM(t.d) OVER (PARTITION BY n) AS s FROM t", true),
+            ("SELECT COALESCE(SUM(d), 0) AS s FROM t", false),
+            (
+                "WITH c AS (SELECT n, SUM(d) AS s FROM t GROUP BY n) SELECT s FROM c",
+                true,
+            ),
+        ];
+        let targets: [(&str, OperandTarget, Option<u8>); 5] = [
+            ("unconfigured", OperandTarget::Unconfigured, None),
+            ("bigquery", Some(OperandDialect::BigQuery).into(), None),
+            ("postgres", Some(OperandDialect::Postgres).into(), None),
+            (
+                "duckdb and bigquery",
+                OperandTarget::Targets {
+                    dialects: vec![OperandDialect::DuckDb, OperandDialect::BigQuery],
+                    unruled: Vec::new(),
+                },
+                None,
+            ),
+            ("duckdb", duckdb(), Some(2)),
+        ];
+        for (label, target, scale) in targets {
+            for (sql, nullable) in sqls {
+                assert_eq!(
+                    typecheck_over_decimal_t_on(sql, target.clone()),
+                    vec![(
+                        "s".to_string(),
+                        RockyType::DecimalUnsized { scale },
+                        nullable
+                    )],
+                    "{label}: {sql}"
+                );
+            }
+        }
+
+        // Expression inference alone, with no target in the scope.
+        let scope = TypeScope::new();
+        let (ty, _) = infer_expr_type(&parse_expr("SUM(CAST(1 AS DECIMAL(10,2)))"), &scope);
+        assert_eq!(ty, RockyType::DecimalUnsized { scale: None });
+    }
+
+    /// #2398: each warehouse's answer, so flipping any one arm fails.
+    #[test]
+    fn sum_keeps_decimal_scale_per_dialect() {
+        use OperandDialect as D;
+        let expected = [
+            (D::DuckDb, true),
+            (D::Snowflake, true),
+            (D::Databricks, true),
+            (D::Trino, true),
+            (D::SqlServer, true),
+            (D::Redshift, true),
+            (D::BigQuery, false),
+            (D::Postgres, false),
+        ];
+        assert_eq!(expected.len(), OperandDialect::ALL.len());
+        for (dialect, keeps) in expected {
+            assert_eq!(
+                sum_keeps_decimal_scale(&Some(dialect).into()),
+                keeps,
+                "{dialect:?}"
+            );
+        }
+        assert!(!sum_keeps_decimal_scale(&OperandTarget::Unconfigured));
+        // A target this crate has no rules for (ClickHouse) is not known.
+        assert!(!sum_keeps_decimal_scale(&OperandTarget::Targets {
+            dialects: vec![D::DuckDb],
+            unruled: vec!["clickhouse".to_string()],
+        }));
     }
 
     /// #2356: `SUM` over a DECIMAL is a decimal whose digits Rocky does not
@@ -5823,28 +5967,28 @@ mod tests {
             // The bare aggregate (lineage `Aggregation` edge).
             (
                 "SELECT SUM(d) AS s FROM t",
-                vec![("s", RockyType::DecimalUnsized, true)],
+                vec![("s", RockyType::DecimalUnsized { scale: Some(2) }, true)],
             ),
             // Windowed and qualified forms.
             (
                 "SELECT SUM(t.d) OVER (PARTITION BY n) AS s FROM t",
-                vec![("s", RockyType::DecimalUnsized, true)],
+                vec![("s", RockyType::DecimalUnsized { scale: Some(2) }, true)],
             ),
             // Through a CTE: the CTE column is exact, so the read keeps it.
             (
                 "WITH c AS (SELECT n, SUM(d) AS s FROM t GROUP BY n) SELECT s FROM c",
-                vec![("s", RockyType::DecimalUnsized, true)],
+                vec![("s", RockyType::DecimalUnsized { scale: Some(2) }, true)],
             ),
             // COALESCE over an integer literal: still a decimal, now NOT NULL.
             (
                 "SELECT COALESCE(SUM(d), 0) AS s FROM t",
-                vec![("s", RockyType::DecimalUnsized, false)],
+                vec![("s", RockyType::DecimalUnsized { scale: Some(2) }, false)],
             ),
             // COALESCE with a sized decimal branch: the sum's digits are
             // still unknown, so the result is unsized, not Decimal(10,2).
             (
                 "SELECT COALESCE(SUM(d), CAST(0 AS DECIMAL(10,2))) AS s FROM t",
-                vec![("s", RockyType::DecimalUnsized, false)],
+                vec![("s", RockyType::DecimalUnsized { scale: Some(2) }, false)],
             ),
             // A cast back to DECIMAL(10,2) can overflow, and a non-ANSI cast
             // returns NULL: nullable (#2299), unchanged.
@@ -5864,6 +6008,30 @@ mod tests {
                 "SELECT COALESCE(CAST(SUM(d) AS DECIMAL(10,2)), CAST(0 AS DECIMAL(10,2))) AS s \
                  FROM t",
                 vec![("s", d10_2.clone(), false)],
+            ),
+            // #2398: a branch with another scale drops the sum's scale,
+            // since a warehouse that caps the precision may cut it.
+            (
+                "SELECT COALESCE(SUM(d), CAST(0 AS DECIMAL(10,4))) AS s FROM t",
+                vec![("s", RockyType::DecimalUnsized { scale: None }, false)],
+            ),
+            // A sum over a bare-DECIMAL cast has no scale to keep.
+            (
+                "SELECT SUM(CAST(d AS DECIMAL)) AS s FROM t",
+                vec![("s", RockyType::DecimalUnsized { scale: None }, true)],
+            ),
+            // A cast of the sum to a bare DECIMAL can overflow: nullable
+            // even with a non-null default inside.
+            (
+                "SELECT CAST(COALESCE(SUM(d), 0) AS DECIMAL) AS s FROM t",
+                vec![("s", RockyType::DecimalUnsized { scale: None }, true)],
+            ),
+            // The same when the source is itself a decimal of unknown digits:
+            // the sum (DuckDB `DECIMAL(38,3)`) may not fit a bare DECIMAL
+            // (DuckDB `DECIMAL(18,3)`), though both types are unsized.
+            (
+                "SELECT CAST(COALESCE(SUM(CAST(d AS DECIMAL)), 0) AS DECIMAL) AS s FROM t",
+                vec![("s", RockyType::DecimalUnsized { scale: None }, true)],
             ),
             // Integer and non-decimal sums keep their rules.
             (
@@ -7139,16 +7307,24 @@ mod tests {
     }
 
     #[test]
-    fn test_cast_to_a_bare_decimal_stays_unknown_without_a_schema() {
-        // A bare `DECIMAL` names no digits, so the target is not a type
-        // (#1721). The cast must not manufacture one.
+    fn test_cast_to_a_bare_decimal_is_an_unsized_decimal_without_a_schema() {
+        // A bare `DECIMAL` names no digits (#1721): the cast must not
+        // manufacture them. It is still a decimal on every warehouse, so it
+        // is typed as one with no digits claimed (#2398), and nullable: its
+        // precision differs by warehouse, so the cast can overflow.
         for projection in [
             "CAST(id AS DECIMAL) AS id",
             "id::NUMERIC AS id",
             "TRY_CAST(id AS DECIMAL) AS id",
+            "CAST(id AS NUMERIC) AS id",
         ] {
             let col = first_column_over(projection, None);
-            assert_eq!(col.data_type, RockyType::Unknown, "{projection}");
+            assert_eq!(
+                col.data_type,
+                RockyType::DecimalUnsized { scale: None },
+                "{projection}"
+            );
+            assert!(col.nullable, "{projection}");
         }
     }
 
@@ -9963,10 +10139,11 @@ mod tests {
             }
         );
         assert_eq!(column(&result, "m", "id_big").data_type, RockyType::Int64);
-        // A bare DECIMAL names no precision: still Unknown.
+        // A bare DECIMAL names no digits: a decimal that claims none
+        // (#2398).
         assert_eq!(
             column(&result, "m", "bare_decimal").data_type,
-            RockyType::Unknown
+            RockyType::DecimalUnsized { scale: None }
         );
         // With no known warehouse, BIGINT has no single width (#2333): a
         // known input does not change that.
@@ -9992,9 +10169,10 @@ mod tests {
         );
         // BIGINT is Decimal(38,0) on Snowflake: no target without an input.
         assert_eq!(column(&result, "m", "id_big").data_type, RockyType::Unknown);
+        // A bare DECIMAL is a decimal on every warehouse (#2398).
         assert_eq!(
             column(&result, "m", "bare_decimal").data_type,
-            RockyType::Unknown
+            RockyType::DecimalUnsized { scale: None }
         );
         assert!(column(&result, "m", "amount").nullable);
     }
