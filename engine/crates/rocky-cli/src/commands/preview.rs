@@ -155,30 +155,14 @@ pub async fn run_preview_create(
     // partial failure (model didn't exist in base, schema mismatch),
     // the per-model `copy_strategy = "failed"` and the rest of the
     // copy set still runs.
-    let copy_set = execute_copy_from_base(
+    let copy_set = copy_step(
         config_path,
         models_dir,
         &branch_schema,
         &copy_names,
+        &prune_set,
     )
-    .await
-    .unwrap_or_else(|e| {
-        // A registry-build failure means we never even tried — surface
-        // the plan with `copy_strategy = "planning_only"` so the
-        // PR-comment surface still ships the prune-set decision.
-        tracing::warn!(
-            "preview create: copy-from-base step skipped — {e}. Falling back to planning-only output."
-        );
-        copy_names
-            .iter()
-            .map(|name| PreviewCopiedModel {
-                model_name: name.clone(),
-                source_schema: "<unresolved>".to_string(),
-                target_schema: branch_schema.clone(),
-                copy_strategy: "planning_only".to_string(),
-            })
-            .collect()
-    });
+    .await;
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -2212,78 +2196,156 @@ fn branch_schema_create_sql(
     ))
 }
 
-/// Execute the copy-from-base step against the configured adapter.
-///
-/// Builds the adapter registry from `rocky.toml`, resolves each
-/// copy-set model's source schema from its sidecar (`target.schema`),
-/// then issues:
-///
-/// 1. `CREATE SCHEMA IF NOT EXISTS branch_schema` (once per distinct schema).
-/// 2. For each model, `CREATE OR REPLACE TABLE branch_schema.<model> AS
-///    SELECT * FROM <source_schema>.<model>`.
-///
-/// Per-model failures are surfaced as `copy_strategy = "failed"` on the
-/// returned `PreviewCopiedModel` rather than aborting — the rest of the
-/// copy set still runs so the PR-comment surface is informative.
-///
-/// **DuckDB note.** DuckDB CTAS doesn't accept the catalog prefix on
-/// every dialect path; the default trait impl writes the SQL without a
-/// catalog qualifier (just `schema.table`), which works for DuckDB and
-/// the cloud warehouses. Adapters that ship native warehouse clones
-/// (Databricks `SHALLOW CLONE`, Snowflake `CLONE`, BigQuery
-/// `CREATE TABLE ... COPY`) override
-/// [`WarehouseAdapter::clone_table_for_branch`] in their own crates;
-/// this function only calls the trait method.
-async fn execute_copy_from_base(
+/// Run the copy-from-base step, falling back to planning-only entries when
+/// it cannot start (a config or registry failure). The prune set goes along
+/// so its models' catalogs get the branch schema too.
+async fn copy_step(
     config_path: &Path,
     models_dir: &Path,
     branch_schema: &str,
     copy_names: &[String],
-) -> Result<Vec<PreviewCopiedModel>> {
-    if copy_names.is_empty() {
-        return Ok(Vec::new());
+    prune_set: &[PreviewPrunedModel],
+) -> Vec<PreviewCopiedModel> {
+    let prune_names: Vec<String> = prune_set.iter().map(|m| m.model_name.clone()).collect();
+    execute_copy_from_base(config_path, models_dir, branch_schema, copy_names, &prune_names)
+        .await
+        .unwrap_or_else(|e| {
+            // A registry-build failure means we never even tried — surface
+            // the plan with `copy_strategy = "planning_only"` so the
+            // PR-comment surface still ships the prune-set decision.
+            tracing::warn!(
+                "preview create: copy-from-base step skipped — {e}. Falling back to planning-only output."
+            );
+            copy_names
+                .iter()
+                .map(|name| PreviewCopiedModel {
+                    model_name: name.clone(),
+                    source_schema: "<unresolved>".to_string(),
+                    target_schema: branch_schema.to_string(),
+                    copy_strategy: "planning_only".to_string(),
+                })
+                .collect()
+        })
+}
+
+/// The `CREATE SCHEMA` for the branch schema in one target catalog.
+///
+/// Which dialects write the clone into the model's catalog
+/// ([`SqlDialect::branch_clone_uses_catalog`](rocky_core::traits::SqlDialect::branch_clone_uses_catalog)):
+///
+/// | Warehouse | Clone target | Schema created |
+/// |---|---|---|
+/// | Databricks, Snowflake, BigQuery, Spark | `{catalog}.{branch}.{table}` | `{catalog}.{branch}`, both parts quoted through the dialect |
+/// | DuckDB, Postgres, Trino, ClickHouse, SQL Server | `{branch}.{table}`, catalog ignored | `{branch}` in the connection default |
+///
+/// Quoting through the dialect matches how the clones quote their target,
+/// so the schema exists under the exact name the clone writes to
+/// (Snowflake folds an unquoted name to upper case). The catalog is
+/// validated by the dialect's own `create_schema_sql`, which for BigQuery
+/// accepts hyphenated project IDs. An empty catalog gets the unqualified
+/// statement.
+fn branch_schema_statement(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+    branch_schema: &str,
+    catalog: &str,
+) -> Result<String> {
+    if catalog.is_empty() || !dialect.branch_clone_uses_catalog() {
+        return branch_schema_create_sql(dialect, branch_schema);
     }
+    // The dialect's own schema statement is the name check; a dialect that
+    // clones into the catalog but has no such statement cannot vouch for the
+    // names, so refuse rather than interpolate them unchecked.
+    match dialect.create_schema_sql(catalog, branch_schema) {
+        Some(check) => {
+            check.map_err(|e| {
+                anyhow::anyhow!("branch schema '{branch_schema}' in catalog '{catalog}': {e}")
+            })?;
+        }
+        None => anyhow::bail!(
+            "branch schema '{branch_schema}' in catalog '{catalog}': this warehouse clones into the catalog but has no schema statement to validate the names"
+        ),
+    }
+    Ok(format!(
+        "CREATE SCHEMA IF NOT EXISTS {}.{}",
+        dialect.quote_identifier(catalog),
+        dialect.quote_identifier(branch_schema)
+    ))
+}
 
-    // Load the config + build the adapter registry. A failure here is
-    // a hard skip: the caller's `unwrap_or_else` falls back to
-    // planning-only output.
-    let cfg = rocky_core::config::load_rocky_config(config_path)
-        .with_context(|| format!("loading config from {}", config_path.display()))?;
+/// Create the branch schema once per distinct target catalog.
+///
+/// Returns the catalogs whose schema could not be created, with the
+/// error. One failure does not stop the others, so a role that may create
+/// schemas in only some catalogs still gets those copies. Catalogs that
+/// map to the same statement run it once. Callers run this before any
+/// copy.
+async fn create_branch_schemas(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    branch_schema: &str,
+    catalogs: &BTreeSet<&str>,
+) -> BTreeMap<String, String> {
+    let dialect = adapter.dialect();
+    let mut outcomes: BTreeMap<String, std::result::Result<(), String>> = BTreeMap::new();
+    let mut failed = BTreeMap::new();
+    for catalog in catalogs {
+        let sql = match branch_schema_statement(dialect, branch_schema, catalog) {
+            Ok(sql) => sql,
+            Err(e) => {
+                failed.insert((*catalog).to_string(), e.to_string());
+                continue;
+            }
+        };
+        if !outcomes.contains_key(&sql) {
+            let outcome = adapter
+                .execute_statement(&sql)
+                .await
+                .map_err(|e| format!("{sql}: {e}"));
+            outcomes.insert(sql.clone(), outcome);
+        }
+        if let Some(Err(e)) = outcomes.get(&sql) {
+            failed.insert((*catalog).to_string(), e.clone());
+        }
+    }
+    failed
+}
 
-    let registry = crate::registry::AdapterRegistry::from_config(&cfg)
-        .context("building adapter registry from config")?;
-
-    // Pick the warehouse adapter. Mirrors `rocky cost`'s resolution:
-    // prefer `default`; fall back to first-declared.
-    let adapter_names = registry.warehouse_adapter_names();
-    let adapter_name = if adapter_names.iter().any(|n| n == "default") {
-        "default".to_string()
-    } else {
-        adapter_names
-            .into_iter()
-            .next()
-            .context("no warehouse adapters configured for preview create")?
-    };
-    let adapter = registry.warehouse_adapter(&adapter_name)?;
-    let adapter_type = registry
-        .adapter_config(&adapter_name)
-        .map(|c| c.adapter_type.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    // Load the model sidecars to resolve each model's source schema.
-    let models = crate::models_loader::load_project_models(models_dir, Some(&cfg.freshness))?;
-    let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
-        models.iter().map(|m| (m.config.name.clone(), m)).collect();
-
-    // Create the branch schema once (idempotent across both DuckDB and
-    // cloud warehouses).
-    let create_schema_sql = branch_schema_create_sql(adapter.dialect(), branch_schema)?;
-    if let Err(e) = adapter.execute_statement(&create_schema_sql).await {
-        // A schema-create failure on a writeable adapter is unrecoverable
-        // for the copy step — bail to planning-only.
-        return Err(anyhow::anyhow!(
-            "creating branch schema '{branch_schema}' on adapter '{adapter_name}' ({adapter_type}): {e}"
-        ));
+/// Copy every `copy_names` model into `branch_schema` on `adapter`.
+///
+/// First creates the branch schema in each distinct target catalog of the
+/// copy set **and** the prune set (`rocky run --branch` writes the pruned
+/// models to `{their catalog}.{branch_schema}`), before any clone. The
+/// role needs `CREATE SCHEMA` in every model catalog, not only the
+/// connection default. If a catalog's schema cannot be created, only that
+/// catalog's models are marked `failed`; the rest still copy.
+async fn copy_into_branch(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    model_by_name: &BTreeMap<String, &rocky_core::models::Model>,
+    branch_schema: &str,
+    copy_names: &[String],
+    prune_names: &[String],
+) -> Vec<PreviewCopiedModel> {
+    let catalogs: BTreeSet<&str> = copy_names
+        .iter()
+        .chain(prune_names)
+        .filter_map(|n| model_by_name.get(n))
+        .map(|m| m.config.target.catalog.as_str())
+        .collect();
+    let failed_catalogs = create_branch_schemas(adapter, branch_schema, &catalogs).await;
+    // A catalog used only by the prune set has no copy entry to mark
+    // `failed`. The output has no warnings field, so log it.
+    let copy_catalogs: BTreeSet<&str> = copy_names
+        .iter()
+        .filter_map(|n| model_by_name.get(n))
+        .map(|m| m.config.target.catalog.as_str())
+        .collect();
+    for (catalog, err) in &failed_catalogs {
+        if !copy_catalogs.contains(catalog.as_str()) {
+            tracing::warn!(
+                "preview create: branch schema '{branch_schema}' could not be created in \
+                 catalog '{catalog}', which only the prune set writes to; \
+                 `rocky run --branch` will fail for those models: {err}"
+            );
+        }
     }
 
     let mut results = Vec::with_capacity(copy_names.len());
@@ -2302,6 +2364,22 @@ async fn execute_copy_from_base(
         let source_schema = model.config.target.schema.clone();
         let table = model.config.target.table.clone();
         let source_catalog = model.config.target.catalog.clone();
+
+        if let Some(err) = failed_catalogs.get(&source_catalog) {
+            tracing::warn!(
+                "preview create: branch schema '{branch_schema}' could not be created in \
+                 catalog '{source_catalog}', skipping '{model_name}' \
+                 (the role needs CREATE SCHEMA in every model catalog): {err}"
+            );
+            results.push(PreviewCopiedModel {
+                model_name: model_name.clone(),
+                source_schema,
+                target_schema: branch_schema.to_string(),
+                copy_strategy: "failed".to_string(),
+            });
+            continue;
+        }
+
         let source_ref = rocky_ir::TableRef {
             catalog: source_catalog,
             schema: source_schema.clone(),
@@ -2332,7 +2410,75 @@ async fn execute_copy_from_base(
             }
         }
     }
-    Ok(results)
+    results
+}
+
+/// Execute the copy-from-base step against the configured adapter.
+///
+/// Builds the adapter registry from `rocky.toml`, resolves each
+/// copy-set model's source schema from its sidecar (`target.schema`),
+/// then runs [`copy_into_branch`]:
+///
+/// 1. `CREATE SCHEMA IF NOT EXISTS` for the branch schema, once per
+///    distinct target catalog of the copy and prune sets.
+/// 2. For each copy-set model, the adapter's
+///    [`WarehouseAdapter::clone_table_for_branch`].
+///
+/// Per-model failures are surfaced as `copy_strategy = "failed"` on the
+/// returned `PreviewCopiedModel` rather than aborting — the rest of the
+/// copy set still runs so the PR-comment surface is informative.
+///
+/// **Clone targets.** Databricks (`SHALLOW CLONE`) and Snowflake (`CLONE`)
+/// write to `{source.catalog}.{branch_schema}.{table}`, and the schema is
+/// created there. The default trait clone (DuckDB and others) writes
+/// `branch_schema.table` and ignores `source.catalog`, so for those
+/// dialects the schema is created once against the connection default.
+async fn execute_copy_from_base(
+    config_path: &Path,
+    models_dir: &Path,
+    branch_schema: &str,
+    copy_names: &[String],
+    prune_names: &[String],
+) -> Result<Vec<PreviewCopiedModel>> {
+    if copy_names.is_empty() && prune_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Load the config + build the adapter registry. A failure here is
+    // a hard skip: the caller's `unwrap_or_else` falls back to
+    // planning-only output.
+    let cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
+
+    let registry = crate::registry::AdapterRegistry::from_config(&cfg)
+        .context("building adapter registry from config")?;
+
+    // Pick the warehouse adapter. Mirrors `rocky cost`'s resolution:
+    // prefer `default`; fall back to first-declared.
+    let adapter_names = registry.warehouse_adapter_names();
+    let adapter_name = if adapter_names.iter().any(|n| n == "default") {
+        "default".to_string()
+    } else {
+        adapter_names
+            .into_iter()
+            .next()
+            .context("no warehouse adapters configured for preview create")?
+    };
+    let adapter = registry.warehouse_adapter(&adapter_name)?;
+
+    // Load the model sidecars to resolve each model's source schema.
+    let models = crate::models_loader::load_project_models(models_dir, Some(&cfg.freshness))?;
+    let model_by_name: BTreeMap<String, &rocky_core::models::Model> =
+        models.iter().map(|m| (m.config.name.clone(), m)).collect();
+
+    Ok(copy_into_branch(
+        &*adapter,
+        &model_by_name,
+        branch_schema,
+        copy_names,
+        prune_names,
+    )
+    .await)
 }
 
 #[cfg(test)]
@@ -3999,6 +4145,322 @@ mod tests {
         assert!(md.contains("rocky run --branch feature_x"));
     }
 
+    /// Records every statement and clone, in order, so tests can assert the
+    /// schema creates run before the first clone.
+    struct Recorder {
+        dialect: Box<dyn rocky_core::traits::SqlDialect>,
+        log: std::sync::Mutex<Vec<String>>,
+        /// Statements containing this text fail.
+        fail_on: Option<&'static str>,
+    }
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for Recorder {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            &*self.dialect
+        }
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.log.lock().unwrap().push(sql.to_string());
+            if self.fail_on.is_some_and(|f| sql.contains(f)) {
+                return Err(rocky_core::traits::AdapterError::msg("permission denied"));
+            }
+            Ok(())
+        }
+        async fn execute_query(
+            &self,
+            _sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            unimplemented!("schema creation never queries")
+        }
+        async fn describe_table(
+            &self,
+            _t: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            unimplemented!("schema creation never describes")
+        }
+        async fn clone_table_for_branch(
+            &self,
+            source: &rocky_ir::TableRef,
+            branch_schema: &str,
+        ) -> rocky_core::traits::AdapterResult<()> {
+            self.log.lock().unwrap().push(format!(
+                "CLONE {}.{}.{}",
+                source.catalog, branch_schema, source.table
+            ));
+            Ok(())
+        }
+    }
+
+    impl Recorder {
+        fn new(dialect: impl rocky_core::traits::SqlDialect + 'static) -> Self {
+            Self {
+                dialect: Box::new(dialect),
+                log: std::sync::Mutex::new(Vec::new()),
+                fail_on: None,
+            }
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    /// Write `(name, catalog)` models and load them.
+    fn load_models_in(models_dir: &Path, specs: &[(&str, &str)]) -> Vec<rocky_core::models::Model> {
+        std::fs::create_dir_all(models_dir).unwrap();
+        for (name, catalog) in specs {
+            std::fs::write(models_dir.join(format!("{name}.sql")), "SELECT 1 AS id").unwrap();
+            let catalog_line = format!("catalog = \"{catalog}\"\n");
+            std::fs::write(
+                models_dir.join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n[target]\n{catalog_line}schema = \"demo\"\ntable = \"{name}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        crate::models_loader::load_project_models(models_dir, None).unwrap()
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(ToString::to_string).collect()
+    }
+
+    fn index_by_name(
+        models: &[rocky_core::models::Model],
+    ) -> BTreeMap<String, &rocky_core::models::Model> {
+        models.iter().map(|m| (m.config.name.clone(), m)).collect()
+    }
+
+    /// The branch schema is created in every catalog the copies write to,
+    /// before the first clone (#2389). The prune set counts too: `rocky run
+    /// --branch` writes the pruned models there.
+    #[tokio::test]
+    async fn branch_schema_is_created_in_each_target_catalog_before_any_clone() {
+        let tmp = TempDir::new().unwrap();
+        let models = load_models_in(
+            &tmp.path().join("models"),
+            &[
+                ("a", "cat_one"),
+                ("b", "cat_two"),
+                ("c", "cat_two"),
+                ("p", "cat_three"),
+            ],
+        );
+        let by_name = index_by_name(&models);
+        let adapter = Recorder::new(rocky_databricks::dialect::DatabricksSqlDialect);
+
+        let out = copy_into_branch(
+            &adapter,
+            &by_name,
+            "branch__x",
+            &names(&["a", "b", "c"]),
+            &names(&["p"]),
+        )
+        .await;
+
+        assert!(out.iter().all(|m| m.copy_strategy == "ctas"));
+        assert_eq!(
+            adapter.log(),
+            vec![
+                "CREATE SCHEMA IF NOT EXISTS `cat_one`.`branch__x`",
+                "CREATE SCHEMA IF NOT EXISTS `cat_three`.`branch__x`",
+                "CREATE SCHEMA IF NOT EXISTS `cat_two`.`branch__x`",
+                "CLONE cat_one.branch__x.a",
+                "CLONE cat_two.branch__x.b",
+                "CLONE cat_two.branch__x.c",
+            ]
+        );
+    }
+
+    /// Snowflake folds an unquoted schema to upper case, but its clone
+    /// writes the quoted name. The create must quote both parts the same
+    /// way, or the clone misses the schema.
+    #[tokio::test]
+    async fn branch_schema_create_is_quoted_like_the_snowflake_clone() {
+        let tmp = TempDir::new().unwrap();
+        let models = load_models_in(&tmp.path().join("models"), &[("a", "analytics")]);
+        let by_name = index_by_name(&models);
+        let adapter = Recorder::new(rocky_snowflake::dialect::SnowflakeSqlDialect);
+
+        copy_into_branch(&adapter, &by_name, "branch__x", &names(&["a"]), &[]).await;
+
+        assert_eq!(
+            adapter.log()[0],
+            "CREATE SCHEMA IF NOT EXISTS \"analytics\".\"branch__x\""
+        );
+    }
+
+    /// BigQuery and Spark clones write into the model's catalog, so the
+    /// schema is created there. BigQuery project IDs may contain hyphens.
+    #[tokio::test]
+    async fn branch_schema_is_created_in_the_catalog_for_bigquery_and_spark() {
+        let tmp = TempDir::new().unwrap();
+        let models = load_models_in(
+            &tmp.path().join("models"),
+            &[("a", "my-project-1"), ("b", "lake")],
+        );
+        let by_name = index_by_name(&models);
+
+        let bq = Recorder::new(rocky_bigquery::dialect::BigQueryDialect);
+        let out = copy_into_branch(&bq, &by_name, "branch__x", &names(&["a"]), &[]).await;
+        assert_eq!(out[0].copy_strategy, "ctas");
+        assert_eq!(
+            bq.log()[0],
+            "CREATE SCHEMA IF NOT EXISTS `my-project-1`.`branch__x`"
+        );
+
+        let spark = Recorder::new(rocky_spark::dialect::SparkDialect::default());
+        copy_into_branch(&spark, &by_name, "branch__x", &names(&["b"]), &[]).await;
+        assert_eq!(
+            spark.log()[0],
+            "CREATE SCHEMA IF NOT EXISTS `lake`.`branch__x`"
+        );
+    }
+
+    /// Dialects whose clone ignores the catalog get one unqualified create.
+    #[tokio::test]
+    async fn branch_schema_ignores_the_catalog_when_the_clone_does() {
+        let tmp = TempDir::new().unwrap();
+        let models = load_models_in(
+            &tmp.path().join("models"),
+            &[("a", "cat_one"), ("b", "cat_two")],
+        );
+        let by_name = index_by_name(&models);
+        let pg = Recorder::new(rocky_postgres::dialect::PostgresDialect::default());
+        copy_into_branch(&pg, &by_name, "branch__x", &names(&["a", "b"]), &[]).await;
+        let creates: Vec<_> = pg
+            .log()
+            .into_iter()
+            .filter(|l| l.starts_with("CREATE SCHEMA"))
+            .collect();
+        assert_eq!(creates.len(), 1);
+        assert!(!creates[0].contains("cat_"), "{creates:?}");
+    }
+
+    /// `copy_step` must hand the prune set to the copy step: with an empty
+    /// copy set, a pruned model's branch schema is still created.
+    #[tokio::test]
+    async fn copy_step_creates_the_schema_for_the_prune_set() {
+        use rocky_duckdb::DuckDbConnector;
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("preview.duckdb");
+        let models_dir = tmp.path().join("models");
+        load_models_in(&models_dir, &[("p", "poc")]);
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.default]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.demo]\ntype = \"transformation\"\nmodels = \"models/**\"\n[pipeline.demo.target]\nadapter = \"default\"\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let prune = vec![PreviewPrunedModel {
+            model_name: "p".into(),
+            reason: "changed".into(),
+            changed_columns: vec![],
+        }];
+
+        let out = copy_step(&config_path, &models_dir, "branch__pr9", &[], &prune).await;
+        assert!(out.is_empty());
+
+        let conn = DuckDbConnector::open(&db_path).unwrap();
+        let q = conn
+            .execute_sql(
+                "SELECT schema_name FROM information_schema.schemata \
+                 WHERE schema_name = 'branch__pr9'",
+            )
+            .unwrap();
+        assert_eq!(q.rows.len(), 1, "prune-set schema must exist");
+    }
+
+    /// Models with no catalog get the old unqualified statement, once. A
+    /// mix of empty and set catalogs creates both. A dialect without
+    /// catalogs ignores the catalog (its clone does too).
+    #[tokio::test]
+    async fn branch_schema_handles_empty_and_mixed_catalogs() {
+        let tmp = TempDir::new().unwrap();
+        let models = load_models_in(
+            &tmp.path().join("models"),
+            &[("a", ""), ("b", ""), ("c", "cat_two")],
+        );
+        let by_name = index_by_name(&models);
+
+        let only_empty = Recorder::new(rocky_databricks::dialect::DatabricksSqlDialect);
+        copy_into_branch(&only_empty, &by_name, "branch__x", &names(&["a", "b"]), &[]).await;
+        assert_eq!(
+            &only_empty.log()[..1],
+            ["CREATE SCHEMA IF NOT EXISTS `branch__x`"]
+        );
+        assert_eq!(only_empty.log().len(), 3);
+
+        let mixed = Recorder::new(rocky_databricks::dialect::DatabricksSqlDialect);
+        copy_into_branch(&mixed, &by_name, "branch__x", &names(&["a", "c"]), &[]).await;
+        assert_eq!(
+            &mixed.log()[..2],
+            [
+                "CREATE SCHEMA IF NOT EXISTS `branch__x`",
+                "CREATE SCHEMA IF NOT EXISTS `cat_two`.`branch__x`",
+            ]
+        );
+
+        #[cfg(feature = "duckdb")]
+        {
+            let duck = Recorder::new(rocky_duckdb::dialect::DuckDbSqlDialect);
+            copy_into_branch(&duck, &by_name, "branch__x", &names(&["a", "c"]), &[]).await;
+            assert_eq!(
+                &duck.log()[..1],
+                ["CREATE SCHEMA IF NOT EXISTS \"branch__x\""]
+            );
+            assert_eq!(duck.log().len(), 3, "one create, two clones");
+        }
+    }
+
+    /// With every model pruned, the copy set is empty, but the pruned
+    /// models still need their branch schema.
+    #[tokio::test]
+    async fn branch_schema_is_created_for_the_prune_set_when_nothing_is_copied() {
+        let tmp = TempDir::new().unwrap();
+        let models = load_models_in(&tmp.path().join("models"), &[("p", "cat_one")]);
+        let by_name = index_by_name(&models);
+        let adapter = Recorder::new(rocky_databricks::dialect::DatabricksSqlDialect);
+
+        let out = copy_into_branch(&adapter, &by_name, "branch__x", &[], &names(&["p"])).await;
+
+        assert!(out.is_empty());
+        assert_eq!(
+            adapter.log(),
+            vec!["CREATE SCHEMA IF NOT EXISTS `cat_one`.`branch__x`"]
+        );
+    }
+
+    /// A failed schema create marks only that catalog's models `failed`.
+    #[tokio::test]
+    async fn a_failed_schema_create_fails_only_that_catalogs_models() {
+        let tmp = TempDir::new().unwrap();
+        let models = load_models_in(
+            &tmp.path().join("models"),
+            &[("a", "cat_one"), ("b", "cat_two")],
+        );
+        let by_name = index_by_name(&models);
+        let mut adapter = Recorder::new(rocky_databricks::dialect::DatabricksSqlDialect);
+        adapter.fail_on = Some("`cat_one`");
+
+        let out = copy_into_branch(&adapter, &by_name, "branch__x", &names(&["a", "b"]), &[]).await;
+
+        let strategy = |n: &str| {
+            out.iter()
+                .find(|m| m.model_name == n)
+                .unwrap()
+                .copy_strategy
+                .clone()
+        };
+        assert_eq!(strategy("a"), "failed");
+        assert_eq!(strategy("b"), "ctas");
+        assert!(!adapter.log().iter().any(|l| l.starts_with("CLONE cat_one")));
+    }
+
     // ---------------------- Phase 1.5 — copy-step execution ----------------------
 
     /// End-to-end smoke test for `execute_copy_from_base` on DuckDB. Drives
@@ -4061,9 +4523,10 @@ mod tests {
         .unwrap();
 
         let copy_names = vec!["raw_orders".to_string(), "missing_in_base".to_string()];
-        let result = execute_copy_from_base(&config_path, &models_dir, "branch__pr1", &copy_names)
-            .await
-            .expect("registry build + branch schema must succeed on DuckDB");
+        let result =
+            execute_copy_from_base(&config_path, &models_dir, "branch__pr1", &copy_names, &[])
+                .await
+                .expect("registry build + branch schema must succeed on DuckDB");
         assert_eq!(result.len(), 2);
 
         let by_name: HashMap<&str, &PreviewCopiedModel> =
@@ -4092,7 +4555,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("rocky.toml"); // doesn't need to exist
         let models_dir = tmp.path().join("models");
-        let result = execute_copy_from_base(&config_path, &models_dir, "branch__x", &[])
+        let result = execute_copy_from_base(&config_path, &models_dir, "branch__x", &[], &[])
             .await
             .unwrap();
         assert!(result.is_empty());
