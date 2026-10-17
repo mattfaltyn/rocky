@@ -2359,9 +2359,11 @@ async fn commit_verify_after_custody(
 
 /// Evaluate the agent-policy plane over a plan's touched `(model, capability)`
 /// set and aggregate the most-restrictive effect. Records one
-/// [`PolicyDecisionRecord`] per evaluation to the ledger (best-effort — an
-/// audit-write failure never fails the caller; the *gate* is the safety
-/// boundary, the ledger is the trail).
+/// [`PolicyDecisionRecord`] per evaluation to the ledger. Fail-closed on the
+/// trail for an agent: a decision row that cannot be recorded turns an
+/// `allow` or `require_review` verdict into a `deny`, so no governed mutation
+/// proceeds without its audit row. A `deny` stays a `deny`. A human is never
+/// gated in v0, so a lost human row only logs a warning.
 ///
 /// Shared by the mutating enforcement points — `rocky apply`, promote, and the
 /// MCP `propose` gate — so each evaluates the same per-model rules with the same
@@ -2658,7 +2660,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
                 // ordinary audit-row hiccup never blocks the apply. So an
                 // UNRELATED budget rule for a different target no longer forces a
                 // false-deny.
-                owned_ledger = open_ledger_with_retry(state_path).ok();
+                owned_ledger = open_ledger_for_gate(state_path, principal).ok();
 
                 // Rare fallback: the read-only open lost a transient redb open
                 // race but a write handle succeeded — snapshot through it rather
@@ -2713,6 +2715,9 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     // Tracks a failed budget-relevant decision-row write so we can fail closed
     // after the evaluation loop (the record sink returns `()`).
     let budget_write_failed = std::cell::Cell::new(false);
+    // Tracks ANY failed decision-row write. A governed mutation must not
+    // proceed without its audit row, so this also fails closed below.
+    let audit_write_failed = std::cell::Cell::new(false);
 
     let gate = evaluate_apply_policy_core(
         &policy,
@@ -2739,26 +2744,25 @@ fn evaluate_apply_policy_with_policy_matching_dual(
             match ledger {
                 Some(store) => {
                     if let Err(e) = store.record_policy_decision(record) {
+                        audit_write_failed.set(true);
                         if rec_budget_relevant {
                             budget_write_failed.set(true);
-                            warn!(
-                                target: "rocky::policy",
-                                error = %e,
-                                "fail-closed: could not persist a budget-relevant decision row"
-                            );
-                        } else {
-                            warn!(
-                                target: "rocky::policy",
-                                error = %e,
-                                "failed to record policy decision to the ledger (continuing)"
-                            );
                         }
+                        warn!(
+                            target: "rocky::policy",
+                            error = %e,
+                            budget_relevant = rec_budget_relevant,
+                            "fail-closed: could not record a policy decision to the ledger"
+                        );
                     }
                 }
-                // No write handle: fail closed only if this winning rule is
-                // itself budget / verify_after-relevant.
-                None if rec_budget_relevant => budget_write_failed.set(true),
-                None => {}
+                // No write handle: the row cannot be recorded at all.
+                None => {
+                    audit_write_failed.set(true);
+                    if rec_budget_relevant {
+                        budget_write_failed.set(true);
+                    }
+                }
             }
         },
     );
@@ -2769,6 +2773,7 @@ fn evaluate_apply_policy_with_policy_matching_dual(
             "a budget-relevant decision row could not be persisted",
         );
     }
+    let gate = refuse_unrecorded_gate(gate, audit_write_failed.get(), principal, touched);
     if !pre_image_won {
         return gate;
     }
@@ -2803,15 +2808,68 @@ fn evaluate_apply_policy_with_policy_matching_dual(
     }
 }
 
+/// How long an agent's policy gate waits for the ledger writer lock before it
+/// gives up and the gate denies. A `rocky run` holds that lock for seconds to
+/// minutes, so the short default wait would deny almost every agent apply
+/// made during a run.
+#[cfg(not(test))]
+const AGENT_LEDGER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Shorter under test, so the tests that hold the writer lock on purpose do
+/// not each wait the full production bound.
+#[cfg(test)]
+const AGENT_LEDGER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// The longest single sleep between ledger open attempts under
+/// [`AGENT_LEDGER_LOCK_WAIT`].
+const AGENT_LEDGER_RETRY_MAX_SLEEP: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Open the decision ledger for writing with a bounded retry on transient
 /// advisory-lock contention (a concurrent run briefly holding the writer lock).
 /// Mirrors the download-publish lock retry. Fail-closed: propagates the last
 /// error after the retries are exhausted.
 fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::state::StateError> {
+    open_ledger_with_retry_schedule(state_path, |attempt, _elapsed| {
+        // Five attempts, sleeping 20, 40, 60 and 80 ms between them.
+        (attempt < 5).then(|| std::time::Duration::from_millis(20 * u64::from(attempt)))
+    })
+}
+
+/// [`open_ledger_with_retry`] with the wait the policy gate gives
+/// `principal`. An agent waits up to [`AGENT_LEDGER_LOCK_WAIT`], with
+/// doubling sleeps, because a lost decision row denies its apply. A human
+/// keeps the short wait: a lost human row only logs a warning.
+fn open_ledger_for_gate(
+    state_path: &Path,
+    principal: PolicyPrincipal,
+) -> Result<StateStore, rocky_core::state::StateError> {
+    match principal {
+        PolicyPrincipal::Human => open_ledger_with_retry(state_path),
+        PolicyPrincipal::Agent => {
+            open_ledger_with_retry_schedule(state_path, |attempt, elapsed| {
+                let remaining = AGENT_LEDGER_LOCK_WAIT.checked_sub(elapsed)?;
+                if remaining.is_zero() {
+                    return None;
+                }
+                let backoff = std::time::Duration::from_millis(50)
+                    .saturating_mul(1 << attempt.min(5))
+                    .min(AGENT_LEDGER_RETRY_MAX_SLEEP);
+                Some(backoff.min(remaining))
+            })
+        }
+    }
+}
+
+/// The retry loop behind [`open_ledger_with_retry`] and
+/// [`open_ledger_for_gate`]. `next_sleep(attempt, elapsed)` returns the sleep
+/// before the next attempt, or `None` to stop. `attempt` counts from 1.
+fn open_ledger_with_retry_schedule(
+    state_path: &Path,
+    next_sleep: impl Fn(u32, std::time::Duration) -> Option<std::time::Duration>,
+) -> Result<StateStore, rocky_core::state::StateError> {
     use rocky_core::state::StateError;
-    const MAX_ATTEMPTS: u32 = 5;
-    let mut last: Option<StateError> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
+    let started = std::time::Instant::now();
+    let mut attempt: u32 = 1;
+    loop {
         match StateStore::open(state_path) {
             Ok(store) => return Ok(store),
             Err(e) => {
@@ -2824,15 +2882,17 @@ fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::s
                     e,
                     StateError::LockHeldByOther { .. } | StateError::Busy { .. }
                 );
-                last = Some(e);
-                if !transient || attempt == MAX_ATTEMPTS {
-                    break;
+                if !transient {
+                    return Err(e);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)));
+                let Some(sleep) = next_sleep(attempt, started.elapsed()) else {
+                    return Err(e);
+                };
+                std::thread::sleep(sleep);
+                attempt = attempt.saturating_add(1);
             }
         }
     }
-    Err(last.expect("retry loop runs at least once"))
 }
 
 /// A fail-closed `Deny` for a budget-relevant decision whose ledger row could
@@ -2846,6 +2906,52 @@ fn open_ledger_with_retry(state_path: &Path) -> Result<StateStore, rocky_core::s
 /// older binary on a shared ledger. Do not reword it.
 pub(crate) const FAIL_CLOSED_FLOOR_MARKER: &str =
     "(fail-closed deny; a review marker cannot satisfy it)";
+
+/// Fail closed when a governed (agent) decision row could not be recorded
+/// (`write_failed`).
+///
+/// The ledger row is the audit trail for a governed mutation. An `allow` or a
+/// `require_review` (which a review marker can satisfy) would let the mutation
+/// proceed with no row, so either becomes a `deny`. A `deny` already refuses
+/// and keeps its own reason. Gates that record no rows pass through.
+fn refuse_unrecorded_gate(
+    gate: PolicyGate,
+    write_failed: bool,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+) -> PolicyGate {
+    // A human is never gated in v0, so a human apply is not governed: its
+    // verdict stands and the lost row is only the warning above.
+    let governed = match principal {
+        PolicyPrincipal::Agent => true,
+        PolicyPrincipal::Human => false,
+    };
+    if !write_failed || !governed {
+        return gate;
+    }
+    let (model, rule_id) = match gate {
+        PolicyGate::Allow => (
+            touched
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "*".to_string()),
+            None,
+        ),
+        PolicyGate::RequireReview { model, rule_id, .. } => (model, rule_id),
+        PolicyGate::NotConfigured | PolicyGate::Unloadable { .. } | PolicyGate::Deny { .. } => {
+            return gate;
+        }
+    };
+    PolicyGate::Deny {
+        model,
+        rule_id,
+        reason: "fail-closed: the policy decision could not be recorded to the state store \
+                 ledger, so this governed mutation is refused rather than run without its \
+                 audit row. Retry when the state store is writable and not contended."
+            .to_string(),
+    }
+}
 
 fn fail_closed_budget_gate(touched: &BTreeMap<String, PolicyCapability>, why: &str) -> PolicyGate {
     PolicyGate::Deny {
@@ -2902,7 +3008,8 @@ pub(crate) fn evaluate_apply_policy_with_store(
     let snapshot_unreadable = prior.is_err();
     let prior_decisions = prior.unwrap_or_default();
 
-    evaluate_apply_policy_core(
+    let write_failed = std::cell::Cell::new(false);
+    let gate = evaluate_apply_policy_core(
         &policy,
         plan_id,
         principal,
@@ -2915,14 +3022,16 @@ pub(crate) fn evaluate_apply_policy_with_store(
         snapshot_unreadable,
         |record| {
             if let Err(e) = ledger.record_policy_decision(record) {
+                write_failed.set(true);
                 warn!(
                     target: "rocky::policy",
                     error = %e,
-                    "failed to record policy decision to the ledger (continuing)"
+                    "fail-closed: could not record a policy decision to the ledger"
                 );
             }
         },
-    )
+    );
+    refuse_unrecorded_gate(gate, write_failed.get(), principal, touched)
 }
 
 /// Given an ALREADY-RESOLVED `[policy]` block, compile the per-model attributes,
@@ -11150,6 +11259,124 @@ autonomy_budget = { failures = 3, window = "7d" }
         Ok(())
     }
 
+    /// An agent's gate waits out a writer lock that a concurrent run holds
+    /// for longer than the short human retry. Before, the gate gave up after
+    /// about a second and the agent apply was denied.
+    #[test]
+    fn agent_gate_waits_for_a_briefly_held_writer_lock() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state.redb");
+        drop(StateStore::open(&state)?);
+        let lock = rocky_core::state::try_acquire_writer_lock(&state)?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            drop(lock);
+        });
+
+        let started = std::time::Instant::now();
+        let opened = super::open_ledger_for_gate(&state, PolicyPrincipal::Agent);
+        let waited = started.elapsed();
+        release
+            .join()
+            .expect("the lock holder thread must not panic");
+
+        assert!(
+            opened.is_ok(),
+            "the agent gate must wait out a lock held for 1.5 s: {:?}",
+            opened.err()
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(1400),
+            "the open must have waited for the holder: {waited:?}"
+        );
+        Ok(())
+    }
+
+    /// The agent wait is bounded: a lock that is never released still ends
+    /// in an error, after about [`AGENT_LEDGER_LOCK_WAIT`].
+    #[test]
+    fn agent_gate_wait_is_bounded() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state.redb");
+        drop(StateStore::open(&state)?);
+        let _lock = rocky_core::state::try_acquire_writer_lock(&state)?;
+
+        let started = std::time::Instant::now();
+        let opened = super::open_ledger_for_gate(&state, PolicyPrincipal::Agent);
+        let waited = started.elapsed();
+
+        assert!(opened.is_err(), "a lock that is never released must fail");
+        assert!(
+            waited >= super::AGENT_LEDGER_LOCK_WAIT,
+            "the agent waits the full bound: {waited:?}"
+        );
+        assert!(
+            waited < super::AGENT_LEDGER_LOCK_WAIT + std::time::Duration::from_secs(2),
+            "the wait stays bounded: {waited:?}"
+        );
+        Ok(())
+    }
+
+    /// RD-034: a governed decision whose audit row cannot be recorded must not
+    /// let the mutation proceed. Before the fix a plain `allow` (no budget, no
+    /// `verify_after`) logged a warning and returned `Allow`, so the apply ran
+    /// with no ledger row. A `require_review` is refused too, because a review
+    /// marker would otherwise unblock it without a row. A `deny` keeps its reason.
+    #[test]
+    fn unrecorded_decision_row_refuses_a_governed_mutation() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state.redb");
+        // Seed the store so the read-only snapshot succeeds, then hold only the
+        // writer lock: the snapshot reads, the decision-row write cannot open.
+        drop(StateStore::open(&state)?);
+        let _lock = rocky_core::state::try_acquire_writer_lock(&state)?;
+        let models = dir.path().join("models");
+        let mut touched = BTreeMap::new();
+        touched.insert("orders".to_string(), PolicyCapability::Apply);
+
+        let gate_for = |effect: &str| -> anyhow::Result<PolicyGate> {
+            let cfg = write_config(
+                dir.path(),
+                &format!(
+                    r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = {{ any = true }}
+effect = "{effect}"
+"#
+                ),
+            )?;
+            let policy = rocky_core::config::load_rocky_config(&cfg)?.policy;
+            Ok(super::evaluate_apply_policy_with_policy(
+                policy.as_ref(),
+                "p",
+                PolicyPrincipal::Agent,
+                &rocky_core::config::PrincipalRef::unnamed(),
+                &touched,
+                crate::commands::apply::EmptyTouched::NoOp,
+                &models,
+                &state,
+                &[],
+            ))
+        };
+
+        for effect in ["allow", "require_review"] {
+            let gate = gate_for(effect)?;
+            assert!(
+                matches!(&gate, PolicyGate::Deny { model, reason, .. }
+                    if model == "orders" && reason.contains("could not be recorded")),
+                "an unrecorded `{effect}` decision must fail closed; got {gate:?}"
+            );
+        }
+        let gate = gate_for("deny")?;
+        assert!(
+            matches!(&gate, PolicyGate::Deny { reason, .. } if !reason.contains("could not be recorded")),
+            "a `deny` keeps its own reason; got {gate:?}"
+        );
+        Ok(())
+    }
+
     /// Finding 6 (round-6 false-deny fix) — the true kill-check. Hold ONLY the
     /// writer lock (not a full `StateStore`), so `open_read_only` still succeeds
     /// (readable snapshot) while the ledger WRITE open fails — the real
@@ -11200,10 +11427,15 @@ effect = "allow"
             &state,
             &[],
         );
+        // The unrelated budget rule must not drive the verdict. The winner's own
+        // audit row still cannot be recorded, so the gate refuses on that ground
+        // instead (RD-034) — never with the budget-pair reason.
         assert!(
-            !matches!(&gate_a, PolicyGate::Deny { reason, .. } if reason.contains("fail-closed")),
-            "a NON-budget winner must not be fail-closed-denied because an unrelated budget rule \
-             exists for a different target; got {gate_a:?}"
+            matches!(&gate_a, PolicyGate::Deny { reason, .. }
+                if reason.contains("could not be recorded") && !reason.contains("budget")),
+            "a NON-budget winner must not be budget-denied because an unrelated budget rule \
+             exists for a different target; it is refused only for its own unrecorded audit row; \
+             got {gate_a:?}"
         );
 
         // (b) `orders` wins under a BUDGET `any` rule whose decision row can't be
