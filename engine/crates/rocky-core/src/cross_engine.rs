@@ -556,6 +556,7 @@ mod tests {
             merge_keys_fallback: None,
             metadata_columns: vec![],
             source: PipelineSourceConfig {
+                region: None,
                 adapter: source_adapter.into(),
                 catalog: Some("raw_catalog".into()),
                 schema_pattern: SchemaPatternConfig {
@@ -566,6 +567,7 @@ mod tests {
                 discovery: None,
             },
             target: PipelineTargetConfig {
+                region: None,
                 adapter: target_adapter.into(),
                 catalog_template: "{client}_warehouse".into(),
                 schema_template: "raw__{source}".into(),
@@ -586,6 +588,7 @@ mod tests {
         PipelineConfig::Transformation(Box::new(TransformationPipelineConfig {
             models: "models/**".into(),
             target: TransformationTargetConfig {
+                region: None,
                 adapter: target_adapter.into(),
                 governance: GovernanceConfig::default(),
             },
@@ -608,6 +611,7 @@ mod tests {
             pipeline_map.insert(name.to_owned(), pipeline);
         }
         RockyConfig {
+            residency: None,
             contracts: Default::default(),
             state: Default::default(),
             adapters: adapter_map,
@@ -741,6 +745,7 @@ mod tests {
                     "quality",
                     PipelineConfig::Quality(Box::new(QualityPipelineConfig {
                         target: QualityTargetConfig {
+                            region: None,
                             adapter: "db".into(),
                         },
                         tables: vec![],
@@ -901,12 +906,14 @@ mod tests {
                     updated_at: "updated_at".into(),
                     invalidate_hard_deletes: false,
                     source: SnapshotSourceConfig {
+                        region: None,
                         adapter: "db".into(),
                         catalog: "raw".into(),
                         schema: "shopify".into(),
                         table: "customers".into(),
                     },
                     target: SnapshotTargetConfig {
+                        region: None,
                         adapter: "sf".into(),
                         catalog: "warehouse".into(),
                         schema: "scd".into(),
