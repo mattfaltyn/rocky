@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- DuckDB `MERGE` inserts map source columns by name, preventing data corruption when the source column order differs from the target (#2460).
+
 ### Added
 
 - `rocky run` records what each model build read from each upstream table, on DuckDB. Each materialization gains an optional `upstream_reads`: per upstream table, `rows_scanned`, `projected_columns` (the scan's output columns; columns used only in filters are not included) and `est_bytes`, plus `unattributed_scans` for scans that name no table (a Parquet file, `range`). `est_bytes` is an estimate: rows times the summed width of the projected columns, set only when every projected column is fixed-width and the scan has no pushed-down filter. Rocky reads it from the DuckDB query profile of each statement. It is a measurement only: no cost, no split across consumers. `rows_scanned` can be far below the table's row count (DuckDB skips row groups). A read through a view is credited to the view's base table. On a first-run `merge`, rows are counted twice: the populating CTAS, then the MERGE.
