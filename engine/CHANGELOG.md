@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A product spec can declare a volume range: `[product.output.volume]` with `min_rows`, `max_rows` (at least one; `min_rows = 0` alone counts) and `severity` (`warning` by default, or `error`). The range is the output table's total rows after a load, so the output model must be a full-refresh table.
+  - New reject codes: `volume-missing-bound`, `volume-min-above-max`, `volume-severity-unknown`. `rocky product verify` refuses a volume on a model that is not full refresh with `volume-strategy-unsupported`. It checks this only once the model exists (`.sql` or `.rocky`), because the spec does not name the strategy.
+  - The lowering emits one `row_count_range` test with the same bounds and severity, marked `generated_by = "product.output.volume"` (`rocky test` ignores the key). Removing the volume block removes that test on the next lowering. A worker `row_count_range` with no `filter` is replaced; a filtered one is kept. The manifest gains a `product.output.volume` row.
+  - After a successful production build of the output model, `rocky run` counts the rows once. Out of range at `warning`: a line in the new `volume_warnings`, and delivery is recorded as usual. Out of range at `error`: the model is marked failed after its write, the `on_model_error` hook fires (not `on_after_model_run`), downstream models are withheld as for any failed model, the run is partial, and the build records no `due_at`. A count that fails, a cancelled run or a non-full-refresh output is `not_evaluated`, never a failure. Shadow, branch and backfill runs count nothing.
+  - Each materialization gains an optional `volume` (`VolumeCheckOutput`). Each `ModelExecution` gains an optional `row_count`, separate from `rows_affected` (rows written). The state schema stays at v33.
+  - `rocky product status` gains an optional `volume`: the range, the newest production count, and its verdict against the range.
+
 ## [1.88.0] — 2026-10-21
 
 ### Upgrade notes
