@@ -875,14 +875,14 @@ mod tests {
             .execute_sql("SELECT id, amount, note FROM tgt ORDER BY id")
             .expect("query post-MERGE");
         assert_eq!(after.rows.len(), 3, "MERGE should leave 3 rows in target");
-        assert_eq!(after.rows[0][0].as_i64(), Some(1));
-        assert_eq!(after.rows[0][1].as_i64(), Some(110));
+        assert_eq!(after.rows[0][0].as_str(), Some("1"));
+        assert_eq!(after.rows[0][1].as_str(), Some("110"));
         assert_eq!(after.rows[0][2].as_str(), Some("preserve this"));
-        assert_eq!(after.rows[1][0].as_i64(), Some(2));
-        assert_eq!(after.rows[1][1].as_i64(), Some(20));
+        assert_eq!(after.rows[1][0].as_str(), Some("2"));
+        assert_eq!(after.rows[1][1].as_str(), Some("20"));
         assert_eq!(after.rows[1][2].as_str(), Some("untouched"));
-        assert_eq!(after.rows[2][0].as_i64(), Some(3));
-        assert_eq!(after.rows[2][1].as_i64(), Some(300));
+        assert_eq!(after.rows[2][0].as_str(), Some("3"));
+        assert_eq!(after.rows[2][1].as_str(), Some("300"));
         assert_eq!(after.rows[2][2].as_str(), Some("inserted"));
 
         conn.execute_sql(&merge_sql)
