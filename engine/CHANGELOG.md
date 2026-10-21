@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each materialization gains an optional `volume` (`VolumeCheckOutput`). Each `ModelExecution` gains an optional `row_count`, separate from `rows_affected` (rows written). The state schema stays at v33.
   - `rocky product status` gains an optional `volume`: the range, the newest production count, and its verdict against the range.
 
+### Fixed
+
+- DuckDB `MERGE` inserts map source columns by name, preventing data corruption when the source column order differs from the target (#2460). For unmatched rows, omitted target columns receive their declared defaults, or `NULL` when no default exists, subject to target constraints.
+
 ## [1.88.0] — 2026-10-21
 
 ### Upgrade notes
@@ -55,10 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `rocky validate` reports a `V062` warning for each pipeline label that differs from `[ai] region` with no `allow` entry. It is a hint: it does not check that any AI feature carries that data.
   - `rocky validate` reports `V060` and `V061` offline. Every command that loads the config (`plan`, `run`, `apply`, `discover`) refuses them.
   - A project that sets none of these keys serializes as before, so its plan ids and config routing identity do not change. `rocky apply` reloads the config and runs the same checks, so removing an `allow` entry also refuses a plan made before.
-
-### Fixed
-
-- DuckDB `MERGE` inserts map source columns by name, preventing data corruption when the source column order differs from the target (#2460). For unmatched rows, omitted target columns receive their declared defaults, or `NULL` when no default exists, subject to target constraints.
 
 ### Changed
 
