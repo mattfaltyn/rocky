@@ -847,6 +847,8 @@ mod tests {
     /// Live regression: DuckDB's positional `INSERT *` corrupts values when
     /// the source projection orders same-typed columns differently from the
     /// target. `INSERT BY NAME` must preserve the column mapping and retries.
+    /// Executing the generated SQL also covers DuckDB's parser rejection of
+    /// qualified update assignments.
     #[test]
     fn test_merge_insert_by_name_executes_against_live_duckdb() {
         use crate::DuckDbConnector;
