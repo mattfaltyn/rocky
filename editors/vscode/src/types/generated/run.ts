@@ -122,6 +122,11 @@ export type VolumeVerdict = "in_range" | "below_min" | "above_max" | "not_evalua
  */
 export type ModelDecision = "build" | "skip" | "reused";
 /**
+ * How the wait for one connector ended.
+ */
+export type SourceSyncOutcome =
+  "succeeded" | "failed" | "timeout" | "unknown" | "interrupted" | "error" | "paused" | "trigger_failed";
+/**
  * Status of a pipeline run.
  *
  * `Success` / `PartialFailure` / `Failure` cover the terminal outcomes of a run that actually executed. `SkippedIdempotent` / `SkippedInFlight` are the short-circuit outcomes of `rocky run --idempotency-key` — see [`crate::idempotency`].
@@ -232,6 +237,10 @@ export interface RunOutput {
    * Prior run whose idempotency key deflected this call, or the run currently holding the in-flight claim. Populated only when `status` is `skipped_idempotent` or `skipped_in_flight`.
    */
   skipped_by_run_id?: string | null;
+  /**
+   * One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per connector it started a sync on or found paused under `trigger = true`. A connector that was not syncing when a wait-only run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.
+   */
+  source_syncs?: SourceSyncOutput[];
   /**
    * Terminal status of the run. `success` / `partial_failure` / `failure` match the lifecycle semantics callers already understand; the two `skipped_*` variants short-circuit via the idempotency key (see `idempotency_key` below). Always populated — non-skipped runs derive this field from `tables_failed` / materialization counts, so JSON consumers no longer need to re-derive status from counts themselves.
    */
@@ -557,6 +566,12 @@ export interface MaterializationOutput {
    */
   tenant?: string | null;
   /**
+   * What this build read from each upstream table, measured from the DuckDB query profile. Each read carries the rows scanned, the columns read and an estimated byte count (`est_bytes`, fixed-width columns only). Scans that name no table (a file, a table function) are counted in `unattributed_scans`.
+   *
+   * Absent when nothing was measured: a non-DuckDB adapter, a shadow, branch or backfill run, a snapshot or time-interval model, or a profile that could not be read. Absent never means zero reads. [`RunOutput::to_run_record`] copies it onto the persisted [`rocky_core::state::ModelExecution::upstream_reads`].
+   */
+  upstream_reads?: UpstreamReads | null;
+  /**
    * The product volume check on this output, when a product declares `[product.output.volume]` for the model and this was a production build. Absent otherwise.
    */
   volume?: VolumeCheckOutput | null;
@@ -631,6 +646,44 @@ export interface PartitionInfo {
   end: string;
   key: string;
   start: string;
+  [k: string]: unknown;
+}
+/**
+ * The upstream reads of one model execution.
+ */
+export interface UpstreamReads {
+  /**
+   * One entry per upstream table, sorted by `table`. The model's own target is left out.
+   */
+  reads?: UpstreamRead[];
+  /**
+   * Scans that name no table: a file (Parquet, CSV, Iceberg) or a table function such as `range`. They are counted, not attributed.
+   */
+  unattributed_scans?: number;
+  [k: string]: unknown;
+}
+/**
+ * What one model execution read from one upstream table.
+ *
+ * A measurement of the scan, not a price: a later step may use it to split the upstream's cost across its consumers.
+ */
+export interface UpstreamRead {
+  /**
+   * Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a scan has pushed-down filters (their columns are unknown, so the width would be biased), a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.
+   */
+  est_bytes?: number | null;
+  /**
+   * The output columns of the scans, first seen first, with no repeats. Columns used only in filters are not included: DuckDB lists those under the scan's pushed-down filters, not its projections. Empty when the profile did not name them.
+   */
+  projected_columns?: string[];
+  /**
+   * Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned. It can be far below the table's row count: DuckDB skips row groups its zone maps rule out. A read through a view is credited to the view's base table. On a first-run `merge`, the rows count twice: the populating CTAS reads them, then the MERGE reads them again.
+   */
+  rows_scanned: number;
+  /**
+   * The upstream table as `catalog.schema.table`, in the names the warehouse reports. On DuckDB the catalog is the database name (`memory` for an in-memory database).
+   */
+  table: string;
   [k: string]: unknown;
 }
 /**
@@ -867,5 +920,39 @@ export interface TableCompareResult {
   shadow_count?: number | null;
   shadow_table: string;
   verdict: string;
+  [k: string]: unknown;
+}
+/**
+ * What `rocky run` did on one source connector: waited for a sync that was running when the run began, started a sync (`triggered`), or found the connector paused.
+ */
+export interface SourceSyncOutput {
+  /**
+   * The error text behind an `error` or `trigger_failed` outcome, or the note on an `interrupted` row whose sync request may have been sent. Absent for every other outcome.
+   */
+  detail?: string | null;
+  /**
+   * Source connector id.
+   */
+  id: string;
+  /**
+   * The connector's last successful sync after the wait.
+   */
+  last_sync_at?: string | null;
+  /**
+   * How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal), `error` (the status reads failed; `detail` names the error), `paused` (the connector is paused, so no sync was started) or `trigger_failed` (the sync request failed; `detail` names the cause).
+   */
+  outcome: SourceSyncOutcome;
+  /**
+   * The connector's schema name in the source destination.
+   */
+  schema: string;
+  /**
+   * Rocky started this sync (`[...discovery.sync] trigger = true`): the source took the request, or a signal came while it was in flight and it may have been sent (the `detail` says so). Absent when the row is a sync Rocky only waited for, and when the source refused the request.
+   */
+  triggered?: boolean;
+  /**
+   * Whole seconds from the start of the wait to this outcome.
+   */
+  waited_secs: number;
   [k: string]: unknown;
 }

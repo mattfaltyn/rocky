@@ -830,6 +830,17 @@
             "null"
           ]
         },
+        "upstream_reads": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UpstreamReads"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this build read from each upstream table, measured from the DuckDB query profile. Each read carries the rows scanned, the columns read and an estimated byte count (`est_bytes`, fixed-width columns only). Scans that name no table (a file, a table function) are counted in `unattributed_scans`.\n\nAbsent when nothing was measured: a non-DuckDB adapter, a shadow, branch or backfill run, a snapshot or time-interval model, or a profile that could not be read. Absent never means zero reads. [`RunOutput::to_run_record`] copies it onto the persisted [`rocky_core::state::ModelExecution::upstream_reads`]."
+        },
         "volume": {
           "anyOf": [
             {
@@ -1352,6 +1363,120 @@
       ],
       "type": "object"
     },
+    "SourceSyncOutcome": {
+      "description": "How the wait for one connector ended.",
+      "oneOf": [
+        {
+          "description": "The sync ended and `succeeded_at` moved.",
+          "enum": [
+            "succeeded"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The sync ended and `failed_at` moved.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The connector was still syncing when the wait ran out.",
+          "enum": [
+            "timeout"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The sync ended but neither timestamp moved, or the connector vanished.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A shutdown signal ended the wait first.",
+          "enum": [
+            "interrupted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The status reads failed, so the wait was abandoned. The result's `detail` names the error.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The connector is paused, so no sync was started. Not a failure: a person paused it on purpose, and Rocky never unpauses.",
+          "enum": [
+            "paused"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Rocky could not start the sync. The result's `detail` names the cause.",
+          "enum": [
+            "trigger_failed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "SourceSyncOutput": {
+      "description": "What `rocky run` did on one source connector: waited for a sync that was running when the run began, started a sync (`triggered`), or found the connector paused.",
+      "properties": {
+        "detail": {
+          "description": "The error text behind an `error` or `trigger_failed` outcome, or the note on an `interrupted` row whose sync request may have been sent. Absent for every other outcome.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Source connector id.",
+          "type": "string"
+        },
+        "last_sync_at": {
+          "description": "The connector's last successful sync after the wait.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceSyncOutcome"
+            }
+          ],
+          "description": "How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when `wait_timeout_secs` ran out), `unknown` (the sync ended but no timestamp moved), `interrupted` (a shutdown signal), `error` (the status reads failed; `detail` names the error), `paused` (the connector is paused, so no sync was started) or `trigger_failed` (the sync request failed; `detail` names the cause)."
+        },
+        "schema": {
+          "description": "The connector's schema name in the source destination.",
+          "type": "string"
+        },
+        "triggered": {
+          "description": "Rocky started this sync (`[...discovery.sync] trigger = true`): the source took the request, or a signal came while it was in flight and it may have been sent (the `detail` says so). Absent when the row is a sync Rocky only waited for, and when the source refused the request.",
+          "type": "boolean"
+        },
+        "waited_secs": {
+          "description": "Whole seconds from the start of the wait to this outcome.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "outcome",
+        "schema",
+        "waited_secs"
+      ],
+      "type": "object"
+    },
     "TableCheckOutput": {
       "properties": {
         "asset_key": {
@@ -1496,6 +1621,64 @@
           "type": "string"
         }
       ]
+    },
+    "UpstreamRead": {
+      "description": "What one model execution read from one upstream table.\n\nA measurement of the scan, not a price: a later step may use it to split the upstream's cost across its consumers.",
+      "properties": {
+        "est_bytes": {
+          "description": "Estimate: `rows_scanned` times the summed fixed width of the projected columns, per scan. `None` when a scan has pushed-down filters (their columns are unknown, so the width would be biased), a projected column is variable-width (text, blob, list, struct), a column type could not be read, or no columns were named. It is in-memory width, not bytes on disk.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "projected_columns": {
+          "default": [],
+          "description": "The output columns of the scans, first seen first, with no repeats. Columns used only in filters are not included: DuckDB lists those under the scan's pushed-down filters, not its projections. Empty when the profile did not name them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rows_scanned": {
+          "description": "Rows the scan operators of this execution read from the table, summed over every scan of it (a self-join counts both). Not rows returned. It can be far below the table's row count: DuckDB skips row groups its zone maps rule out. A read through a view is credited to the view's base table. On a first-run `merge`, the rows count twice: the populating CTAS reads them, then the MERGE reads them again.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "table": {
+          "description": "The upstream table as `catalog.schema.table`, in the names the warehouse reports. On DuckDB the catalog is the database name (`memory` for an in-memory database).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rows_scanned",
+        "table"
+      ],
+      "type": "object"
+    },
+    "UpstreamReads": {
+      "description": "The upstream reads of one model execution.",
+      "properties": {
+        "reads": {
+          "default": [],
+          "description": "One entry per upstream table, sorted by `table`. The model's own target is left out.",
+          "items": {
+            "$ref": "#/definitions/UpstreamRead"
+          },
+          "type": "array"
+        },
+        "unattributed_scans": {
+          "default": 0,
+          "description": "Scans that name no table: a file (Parquet, CSV, Iceberg) or a table function such as `range`. They are counted, not attributed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "VolumeCheckOutput": {
       "description": "The row count `rocky run` took on a product output after its build, judged against the product's `[product.output.volume]`.\n\nThe count is the table's total rows (`SELECT COUNT(*)`), not the rows this load wrote. Only a full-refresh output is counted.",
@@ -1813,6 +1996,13 @@
         "string",
         "null"
       ]
+    },
+    "source_syncs": {
+      "description": "One row per source connector the run waited for under `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per connector it started a sync on or found paused under `trigger = true`. A connector that was not syncing when a wait-only run began is not listed. Empty (and omitted) when no `sync` table is configured or nothing was running.",
+      "items": {
+        "$ref": "#/definitions/SourceSyncOutput"
+      },
+      "type": "array"
     },
     "status": {
       "allOf": [

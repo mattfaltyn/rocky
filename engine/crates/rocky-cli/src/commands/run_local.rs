@@ -1767,6 +1767,7 @@ pub async fn run_snapshot(
         .await;
         output.materializations.push(MaterializationOutput {
             volume: None,
+            upstream_reads: None,
             attempts: Vec::new(),
             notes: vec![],
             asset_key: vec![
@@ -2082,6 +2083,8 @@ mod tests {
             no_reuse: false,
             no_prune: false,
             full_refresh: false,
+            no_sync_trigger: false,
+            no_source_sync: false,
         };
         super::super::run::run(
             config_path,

@@ -1,7 +1,7 @@
 //! Adapter traits for Rocky's pluggable architecture.
 //!
 //! Rocky separates concerns through adapter traits:
-//! - [`DiscoveryAdapter`] — finds what schemas/tables are available (metadata only)
+//! - [`DiscoveryAdapter`] — finds what schemas/tables are available (metadata only; may start a vendor sync when both opt-ins are set)
 //! - [`WarehouseAdapter`] — executes SQL against a warehouse
 //! - [`SqlDialect`] — generates warehouse-specific SQL syntax
 //! - [`GovernanceAdapter`] — manages catalog/schema lifecycle, tags, permissions, isolation
@@ -221,6 +221,40 @@ pub trait DiscoveryAdapter: Send + Sync {
         _connectors: &mut [DiscoveredConnector],
     ) -> AdapterResult<()> {
         Ok(())
+    }
+
+    /// Current sync state of every connector whose schema starts with the
+    /// prefix: one status read, no side effect on the source.
+    ///
+    /// Default: `Ok(None)`, meaning this adapter does not report sync state.
+    /// `rocky run` uses it for `[...discovery.sync] wait = true`. It warns and
+    /// runs without a wait when the adapter returns `None`, and `rocky
+    /// validate` refuses the key for a known adapter type that cannot report.
+    async fn source_sync_states(
+        &self,
+        _schema_prefix: &str,
+    ) -> AdapterResult<Option<Vec<crate::source_sync::SourceSyncState>>> {
+        Ok(None)
+    }
+
+    /// Ask the source to start one sync on one connector: a single request,
+    /// never forced, never a resync, unpause or cancel.
+    ///
+    /// Default: [`SourceSyncTriggerError::Unsupported`]. An adapter that
+    /// implements it must also refuse unless its owner opted in (the Fivetran
+    /// adapter checks `allow_sync_trigger`), because `rocky validate` is only
+    /// one funnel into this call. `rocky run` calls it for
+    /// `[...discovery.sync] trigger = true`.
+    ///
+    /// `Ok` carries the source server's clock from the answer (the HTTP `Date`
+    /// header) when it sent one. The sync cannot have started before that
+    /// time, so it is the lower bound for the sync's end.
+    async fn trigger_source_sync(
+        &self,
+        _connector_id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::source_sync::SourceSyncTriggerError>
+    {
+        Err(crate::source_sync::SourceSyncTriggerError::Unsupported)
     }
 
     /// Cheap connectivity check for the discovery API.
@@ -506,6 +540,33 @@ pub trait WarehouseAdapter: Send + Sync {
         self.execute_statement(sql)
             .await
             .map(|()| ExecutionStats::default())
+    }
+
+    /// Whether [`Self::execute_statement_with_upstream_reads`] can measure.
+    /// The runner asks before it routes a model's statements through it, so
+    /// an adapter that cannot measure keeps its ordinary statement path.
+    /// Default: `false`. DuckDB: `true`.
+    fn measures_upstream_reads(&self) -> bool {
+        false
+    }
+
+    /// Run one statement like [`Self::execute_statement_with_stats`] and also
+    /// report what the statement read from each table.
+    ///
+    /// The second value is `None` when the adapter cannot say, or when its
+    /// measurement failed. It is never an empty-looking guess: `None` means
+    /// not measured. A failed measurement never fails the statement; only a
+    /// failed statement is an `Err`.
+    ///
+    /// - **DuckDB:** profiles the statement and reads its table scans.
+    /// - **Every other adapter:** the default, which measures nothing.
+    async fn execute_statement_with_upstream_reads(
+        &self,
+        sql: &str,
+    ) -> AdapterResult<(ExecutionStats, Option<crate::state::UpstreamReads>)> {
+        self.execute_statement_with_stats(sql)
+            .await
+            .map(|stats| (stats, None))
     }
 
     /// Execute a kind switch in one transaction when supported. `None` means

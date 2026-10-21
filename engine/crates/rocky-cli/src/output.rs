@@ -120,6 +120,15 @@ pub struct DiscoverOutput {
     /// omitted from the wire format) otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collision_candidates: Vec<CollisionCandidateOutput>,
+    /// `true` when the pipeline starts its own source syncs
+    /// (`[pipeline.<name>.source.discovery.sync] trigger = true`). Rocky then
+    /// advances each connector's `last_sync_at` itself, so an orchestrator
+    /// that runs the pipeline whenever `last_sync_at` moves (the Dagster
+    /// source sensor) would start a second run per sync, and should stand
+    /// down. Read from config, not from run state, so it does not change with
+    /// `rocky run --no-sync-trigger`. Omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sync_trigger: bool,
 }
 
 /// A cross-source collision: one external object id mapped to more than one
@@ -445,6 +454,14 @@ pub struct RunOutput {
     /// rules are declared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_match_counts: Vec<OverrideMatchCountOutput>,
+    /// One row per source connector the run waited for under
+    /// `[pipeline.<name>.source.discovery.sync] wait = true`, plus one per
+    /// connector it started a sync on or found paused under `trigger = true`.
+    /// A connector that was not syncing when a wait-only run began is not
+    /// listed. Empty (and omitted) when no `sync` table is configured or
+    /// nothing was running.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_syncs: Vec<SourceSyncOutput>,
     /// Problems in the project's `consumers/` records (`E060`): a file that
     /// does not load, a duplicate name, a `depends_on` entry that names no
     /// model, or an unreadable directory. A consumer is metadata about readers
@@ -494,6 +511,40 @@ impl OverrideMatchCountOutput {
             )
             .collect()
     }
+}
+
+/// What `rocky run` did on one source connector: waited for a sync that was
+/// running when the run began, started a sync (`triggered`), or found the
+/// connector paused.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SourceSyncOutput {
+    /// Source connector id.
+    pub id: String,
+    /// The connector's schema name in the source destination.
+    pub schema: String,
+    /// How the wait ended: `succeeded`, `failed`, `timeout` (still syncing when
+    /// `wait_timeout_secs` ran out), `unknown` (the sync ended but no
+    /// timestamp moved), `interrupted` (a shutdown signal), `error` (the
+    /// status reads failed; `detail` names the error), `paused` (the
+    /// connector is paused, so no sync was started) or `trigger_failed` (the
+    /// sync request failed; `detail` names the cause).
+    pub outcome: rocky_core::source_sync::SourceSyncOutcome,
+    /// Whole seconds from the start of the wait to this outcome.
+    pub waited_secs: u64,
+    /// The connector's last successful sync after the wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sync_at: Option<DateTime<Utc>>,
+    /// The error text behind an `error` or `trigger_failed` outcome, or the
+    /// note on an `interrupted` row whose sync request may have been sent.
+    /// Absent for every other outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Rocky started this sync (`[...discovery.sync] trigger = true`): the
+    /// source took the request, or a signal came while it was in flight and it
+    /// may have been sent (the `detail` says so). Absent when the row is a
+    /// sync Rocky only waited for, and when the source refused the request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub triggered: bool,
 }
 
 /// Soft warning surfaced on
@@ -1427,6 +1478,19 @@ pub struct MaterializationOutput {
     /// build. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<VolumeCheckOutput>,
+    /// What this build read from each upstream table, measured from the
+    /// DuckDB query profile. Each read carries the rows scanned, the columns
+    /// read and an estimated byte count (`est_bytes`, fixed-width columns
+    /// only). Scans that name no table (a file, a table function) are counted
+    /// in `unattributed_scans`.
+    ///
+    /// Absent when nothing was measured: a non-DuckDB adapter, a shadow,
+    /// branch or backfill run, a snapshot or time-interval model, or a
+    /// profile that could not be read. Absent never means zero reads.
+    /// [`RunOutput::to_run_record`] copies it onto the persisted
+    /// [`rocky_core::state::ModelExecution::upstream_reads`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_reads: Option<rocky_core::state::UpstreamReads>,
 }
 
 /// The row count `rocky run` took on a product output after its build,
@@ -5996,7 +6060,15 @@ impl DiscoverOutput {
             schemas_cached: 0,
             new_sources: vec![],
             collision_candidates: vec![],
+            sync_trigger: false,
         }
+    }
+
+    /// Set whether the pipeline starts its own source syncs and return self.
+    #[must_use]
+    pub fn with_sync_trigger(mut self, sync_trigger: bool) -> Self {
+        self.sync_trigger = sync_trigger;
+        self
     }
 
     /// Attach the projected pipeline checks config and return self.
@@ -6350,6 +6422,7 @@ impl RunOutput {
             budget_breaches: vec![],
             override_warnings: vec![],
             override_match_counts: vec![],
+            source_syncs: vec![],
             consumer_diagnostics: vec![],
         }
     }
@@ -6646,6 +6719,7 @@ impl RunOutput {
                 // site right after the write. `None` is unknown.
                 stored_bytes: mat.stored_bytes,
                 row_count: mat.volume.as_ref().and_then(|v| v.row_count),
+                upstream_reads: mat.upstream_reads.clone(),
             });
         }
 
@@ -6703,6 +6777,7 @@ impl RunOutput {
                 // recorded"); it may have written nothing at all.
                 output_version: None,
                 stored_bytes: None,
+                upstream_reads: None,
                 output_target: None,
                 due_at: None,
                 wait_for_upstream_ms: None,
@@ -8534,6 +8609,7 @@ mod cost_finalize_tests {
             consumed_column_baseline: None,
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
         }
     }
@@ -8834,6 +8910,7 @@ mod run_record_tests {
             consumed_column_baseline: None,
             output_version: None,
             stored_bytes: None,
+            upstream_reads: None,
             output_target: None,
         }
     }
@@ -9110,6 +9187,53 @@ mod run_record_tests {
             Some("acme"),
             "tenant on the materialization must flow onto the persisted ModelExecution"
         );
+    }
+
+    /// The upstream reads ride from the materialization onto the persisted
+    /// execution, and a materialization without them has no `upstream_reads`
+    /// key in its JSON.
+    #[test]
+    fn to_run_record_carries_upstream_reads_and_the_key_is_omitted_when_none() {
+        let mut out = RunOutput::new(String::new(), 1_000, 1);
+        out.tables_copied = 2;
+        let started = fixed_start();
+        let mut measured = mat(&["orders"], 1_000, Some("h"), started);
+        measured.upstream_reads = Some(rocky_core::state::UpstreamReads {
+            reads: vec![rocky_core::state::UpstreamRead {
+                table: "memory.raw.events".into(),
+                rows_scanned: 5000,
+                projected_columns: vec!["id".into()],
+                est_bytes: Some(40_000),
+            }],
+            unattributed_scans: 0,
+        });
+        out.materializations.push(measured);
+        out.materializations
+            .push(mat(&["customers"], 1_000, Some("h"), started));
+
+        let json = serde_json::to_value(&out.materializations).unwrap();
+        assert_eq!(json[0]["upstream_reads"]["reads"][0]["rows_scanned"], 5000);
+        assert!(json[1].get("upstream_reads").is_none());
+
+        let record = out.to_run_record(
+            "run-reads",
+            started,
+            started + chrono::Duration::seconds(1),
+            String::new(),
+            RunTrigger::Manual,
+            out.derive_run_status(),
+            RunRecordAudit::test_sentinels(),
+        );
+        assert_eq!(
+            record.models_executed[0]
+                .upstream_reads
+                .as_ref()
+                .unwrap()
+                .reads[0]
+                .table,
+            "memory.raw.events"
+        );
+        assert_eq!(record.models_executed[1].upstream_reads, None);
     }
 
     #[test]
@@ -12340,6 +12464,16 @@ pub struct PerModelCostHistorical {
     /// overstates a small table). Present exactly when `stored_bytes` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stored_bytes_basis: Option<rocky_core::state::StoredBytesBasis>,
+    /// What the execution read from each upstream table, read back from the
+    /// persisted `rocky_core::state::ModelExecution::upstream_reads`. It is a
+    /// measurement, not a cost: `est_bytes` is an estimate from fixed-width
+    /// column types, and nothing here splits an upstream's cost.
+    ///
+    /// Omitted when not measured: a non-DuckDB adapter, a shadow, branch or
+    /// backfill run, a failed profile read, or a run recorded before this
+    /// field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_reads: Option<rocky_core::state::UpstreamReads>,
 }
 
 // ---------------------------------------------------------------------------
